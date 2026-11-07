@@ -1,0 +1,23 @@
+{
+  "name": "codeharbor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13.0 <23" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "dev": "tsx src/main.ts",
+    "test": "tsx --test tests/*.test.ts tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@colbymchenry/codegraph": "1.6.2",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

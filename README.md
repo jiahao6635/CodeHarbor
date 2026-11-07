@@ -1,5 +1,87 @@
 # CodeHarbor
 
-CodeHarbor 是一个面向 Agent 的代码知识服务，计划将云效代码仓库接入 CodeGraph，并通过统一的 MCP 地址提供仓库级权限控制与代码查询。
+CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库，分别构建 CodeGraph 索引，并通过统一 MCP 入口提供按用户和仓库鉴权的查询。当前实现为单节点最小可用版本，技术设计见 [设计文档](docs/CodeHarbor-技术设计方案.md)。
 
-项目目前处于设计阶段，具体方案见 [CodeHarbor 技术设计方案](docs/CodeHarbor-技术设计方案.md)。
+## 当前范围
+
+- 用户使用云效个人访问令牌（PAT）绑定身份，创建只读或平台读写 CodeHarbor Key。
+- 使用 Codeup 仓库 ID 接入仓库，首次及变化后以独立目录全量构建 CodeGraph 1.6.2 索引；相同 commit 不重复构建。
+- Codeup Push Webhook、手动同步和 15 分钟对账；保留上次成功索引，报告 commit 和新鲜度。
+- 单个 `/mcp` 地址，提供 `list_repositories`、`get_repository_status`、`codegraph_explore`；每次调用按用户云效权限及 Key 仓库范围鉴权。
+- `write` Key 仅允许平台管理及触发索引，不能写云效代码。
+
+**使用边界**：此版本使用单进程 Node.js 内置 SQLite、进程内任务队列和本地加密密钥，不能多副本运行，尚未提供设计中的 PostgreSQL、跨进程租约与 fencing、KMS 集成或自动清理旧索引。它尚未通过真实云效账号和企业权限策略联调；部署前需验证云效身份、克隆/下载管控、继承权限和浏览者实际代码访问权。未经这些验证不要用于生产多租户环境。Index Worker 和共享 CodeGraph 进程还需要部署级文件系统及网络隔离；源码和索引须按源码等级保护。
+
+## 开发运行
+
+需要 Node.js 22.13+（本项目限定 Node 22）、Git 和可访问的云效 Codeup；CodeGraph npm 包版本已固定，`npm ci` 会安装对应平台的可执行文件。
+
+```sh
+npm ci
+npm run build
+```
+
+在受控的密钥管理系统创建 32 字节随机主密钥，以 Base64 编码提供给进程，确保重启后保持不变并备份；主密钥丢失将无法解密已绑定 PAT。通过服务管理器或容器密钥机制设置以下环境变量（示例值不含实际凭证）：
+
+| 变量 | 说明 |
+|---|---|
+| `CODEHARBOR_MASTER_KEY` | 必填，Base64 编码的 32 字节 PAT 加密密钥；与数据目录分开保存 |
+| `YUNXIAO_ENDPOINT` | 必填，可信云效 API HTTPS 源，例如 `https://example.yunxiao.example` |
+| `YUNXIAO_ORGANIZATION_ID` | 云效中心版组织 ID；Region 版按实际 API 配置 |
+| `CODEHARBOR_GIT_HOSTS` | 必填，允许拉取的 HTTPS Git 主机，逗号分隔；包含非标准端口时写 `host:port` |
+| `CODEHARBOR_WRITE_USERS` | 允许申请平台 write Key 的云效用户 ID，逗号分隔；默认无人可写 |
+| `CODEHARBOR_DATA_DIR` | 持久化目录，默认 `./data` |
+| `CODEHARBOR_BIND`、`PORT` | 默认 `127.0.0.1:8080` |
+| `CODEHARBOR_ALLOWED_HOSTS` | 允许的 HTTP Host，逗号分隔；默认允许本地 `127.0.0.1` 和 `localhost` 带端口 |
+| `CODEHARBOR_ALLOWED_ORIGINS` | 允许的浏览器 Origin；默认不允许携带 Origin 的请求 |
+| `CODEGRAPH_BIN` | 可选，覆盖 CodeGraph 可执行文件路径 |
+
+运行 `npm start`。本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者还检查上游 MCP 工具 schema。
+
+## 初次绑定与使用
+
+使用可信终端中的交互 CLI 绑定 PAT；不要将 PAT 写入命令参数、聊天消息或 shell 历史。令牌需要云效用户、仓库只读和 HTTPS Git 读取的必要权限，具体 scope 以企业云效版本为准：
+
+```sh
+node dist/cli.js bind --url http://127.0.0.1:8080 --scope read
+# 要创建 write Key：先将自己的云效用户 ID 加入 CODEHARBOR_WRITE_USERS 并重启，随后使用 --scope write
+```
+
+CLI 隐藏 PAT 输入；CodeHarbor Key 明文只返回一次，使用者应自行安全保存。也可调用 `POST /api/v1/auth/yunxiao/bind` 和 `POST /api/v1/auth/bootstrap/keys`；PAT 只能经可信 TLS 或本机回环传输，首次引导凭证有效 5 分钟且只能使用一次。重新绑定同一用户的 PAT 可更新凭证，不应在未验证云效权限状态时认为其他用户的索引可访问。
+
+管理端点需要 Bearer Key：
+
+| 方法 | 路径 | 功能 |
+|---|---|---|
+| GET | `/api/v1/me` | 当前用户和 Key 权限 |
+| GET | `/api/v1/codeup/repositories?page=1` | 查询云效可见仓库；仅适用于不限定仓库范围的 Key |
+| GET / POST | `/api/v1/repositories` | 列出有权索引仓库 / 接入云效仓库 |
+| GET | `/api/v1/repositories/{id}` | 仓库索引状态 |
+| POST | `/api/v1/repositories/{id}/sync` | 异步更新索引 |
+| PUT | `/api/v1/repositories/{id}/sync-credential` | 仓库负责人或现同步凭证持有人明确授权自己的当前 PAT 用于同步 |
+| GET | `/api/v1/jobs/{id}` | 任务状态 |
+| GET / POST | `/api/v1/api-keys` | 查看 / 创建本人下级 Key |
+| DELETE | `/api/v1/api-keys/{prefix}` | 撤销本人 Key |
+| POST | `/api/v1/hooks/codeup/{id}` | Codeup Webhook，使用 `X-Codeup-Token` |
+
+接入需要 write Key，JSON 包含 `codeup_repository_id`、`branch` 和 `authorize_automatic_sync: true`。成功响应包含 CodeHarbor 仓库 ID、任务 ID，以及仅返回一次的 `webhook_path` 和 `webhook_token`。将该路径配置到 Codeup 普通 Webhook，填写 Secret Token 并选择 Push 事件；无法配置 Webhook 时仍可手动同步，后台定期对账也会补偿。不要记录或公开 Webhook Token。平台仅使用接入者已授权的 PAT 自动同步，不自动借用其他用户的令牌。
+
+当同步凭证持有人重新绑定 PAT 时，已有仓库不会自动使用新令牌：仓库进入 `credential_required`，该用户或仓库负责人需使用自己的 write Key 请求 `PUT /api/v1/repositories/{id}/sync-credential`，提交 `{"authorize_automatic_sync":true}`，明确授权当前 PAT 并重新排队。未发布索引和旧索引仍按各自的仓库权限保护。
+
+Agent 配置 MCP URL `https://<trusted-host>/mcp` 和 `Authorization: Bearer <CodeHarbor Key>`；具体配置格式取决于 MCP 客户端。先调用 `list_repositories`，然后在 `codegraph_explore` 中传入 `repo_id` 和 `query`。不要向 Agent 暴露云效 PAT。
+
+## 测试
+
+```sh
+CODEGRAPH_TEST_BIN="$PWD/node_modules/.bin/codegraph" npm test
+```
+
+测试包括虚拟 Codeup 权限、MCP 隔离、Webhook、任务及真实 CodeGraph 多仓库查询；虚拟云效测试不代表真实云效端到端验证。
+
+## 容器
+
+```sh
+docker build -t codeharbor:dev .
+```
+
+容器以非 root 用户运行，数据保存在 `/data`。通过受控方式提供必填配置和密钥，并挂载持久化目录；本机试用应仅将端口绑定到 `127.0.0.1`。生产使用前还需要 TLS、密钥管理、单实例约束、备份及安全隔离。

@@ -5,6 +5,8 @@
 - 目标 CodeGraph：[colbymchenry/codegraph](https://github.com/colbymchenry/codegraph)
 - 适用范围：云效 Codeup 托管的 Git 仓库，默认分支的代码索引和查询
 
+> 实现验证记录：首期原型固定 CodeGraph 1.6.2；该版本实际使用 `init <path> --yes` 和 `status <path> --json`，不支持本文示意中的 `--local-only` / `--strict`。首期以单进程 SQLite 实现任务持久化，部署与安全限制详见项目 README；PostgreSQL、租约和 fencing 属于后续工作。
+
 ## 1. 背景与目标
 
 WeKnora 已覆盖文档知识，CodeHarbor 用来补充代码结构知识，使 Agent 能基于代码仓库查询符号、源码片段和调用关系。系统只提供后端接口，不建设管理前端。
