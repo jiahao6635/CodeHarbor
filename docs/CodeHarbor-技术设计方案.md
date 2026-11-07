@@ -390,7 +390,7 @@ API/MCP 与 Worker 当前是同进程逻辑模块；任务记录保存在 SQLite
 CODEHARBOR_PUBLIC_URL              # 管理 API 和 MCP 对外根地址
 YUNXIAO_ENDPOINT                   # 配置允许访问的云效 API 实例
 YUNXIAO_ORGANIZATION_ID            # 企业组织 ID；按部署版本使用
-CODEHARBOR_DATABASE_URL            # 引用数据库连接密钥，不写入代码库
+CODEHARBOR_DATABASE_URL_FILE       # 数据库连接串所在的受保护文件；或使用 DATABASE_URL
 CODEHARBOR_DATA_DIR                # 持久化数据目录
 CODEHARBOR_SECRET_BACKEND          # 企业密钥管理配置引用
 CODEGRAPH_VERSION                  # 已验证并锁定的版本
