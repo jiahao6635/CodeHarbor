@@ -1,6 +1,6 @@
 # CodeHarbor
 
-CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库，分别构建 CodeGraph 索引，并通过统一 MCP 入口提供按用户和仓库鉴权的查询。当前实现为单节点最小可用版本，技术设计见 [设计文档](docs/CodeHarbor-技术设计方案.md)。
+CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库，分别构建 CodeGraph 索引，并通过统一 MCP 入口提供按用户和仓库鉴权的查询。当前实现提供单节点生产化基础，技术设计见 [设计文档](docs/CodeHarbor-技术设计方案.md)。
 
 ## 当前范围
 
@@ -10,7 +10,7 @@ CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库
 - 单个 `/mcp` 地址，提供 `list_repositories`、`get_repository_status`、`codegraph_explore`；每次调用按用户云效权限及 Key 仓库范围鉴权。
 - `write` Key 仅允许平台管理及触发索引，不能写云效代码。
 
-**使用边界**：此版本使用单进程 Node.js 内置 SQLite、进程内任务队列和本地加密密钥，不能多副本运行，尚未提供设计中的 PostgreSQL、跨进程租约与 fencing 或 KMS 集成。它尚未通过真实云效账号和企业权限策略联调；部署前需验证云效身份、克隆/下载管控、继承权限和浏览者实际代码访问权。未经这些验证不要用于生产多租户环境。Index Worker 和共享 CodeGraph 进程还需要部署级文件系统及网络隔离；源码和索引须按源码等级保护。发布后保留当前及上一个受管理的索引版本；未知或无所有权标记的旧目录不会自动删除。
+**使用边界**：此版本在生产模式使用 PostgreSQL 和 Vault Transit；仍是单进程 Worker，不支持多副本或跨进程租约与 fencing。它尚未通过真实云效账号和企业权限策略联调；部署前需验证云效身份、克隆/下载管控、继承权限和浏览者实际代码访问权。未经这些验证不要用于生产多租户环境。Index Worker 和共享 CodeGraph 进程还需要部署级文件系统及网络隔离；源码和索引须按源码等级保护。发布后保留当前及上一个受管理的索引版本；未知或无所有权标记的旧目录不会自动删除。
 
 ## 开发运行
 
@@ -23,11 +23,14 @@ npm run build
 
 索引任务会执行位于临时目录和数据目录中的 Git 凭证助手，因此这两个目录须允许执行文件；若挂载为 `noexec`，任务会失败。测试也会在临时目录运行测试夹具。生产部署应将这两个目录限制为服务专用。
 
-在受控的密钥管理系统创建 32 字节随机主密钥，以 Base64 编码提供给进程，确保重启后保持不变并备份；主密钥丢失将无法解密已绑定 PAT。通过服务管理器或容器密钥机制设置以下环境变量（示例值不含实际凭证）：
+开发环境可使用本地主密钥；生产必须使用 PostgreSQL 和 Vault Transit。确保主密钥重启后保持不变并备份：主密钥丢失将无法解密已绑定 PAT。通过服务管理器或容器密钥机制设置以下环境变量（示例值不含实际凭证）：
 
 | 变量 | 说明 |
 |---|---|
-| `CODEHARBOR_MASTER_KEY` | 必填，Base64 编码的 32 字节 PAT 加密密钥；与数据目录分开保存 |
+| `CODEHARBOR_MASTER_KEY` | 本地开发模式使用的 Base64 编码 32 字节密钥；与数据目录分开保存；生产不使用此模式 |
+| `DATABASE_URL` 或 `CODEHARBOR_DATABASE_URL_FILE` | PostgreSQL 连接串或受保护的连接串文件，二者只能设置一个；生产必须启用 `sslmode=verify-full` |
+| `CODEHARBOR_KEY_PROVIDER` | 生产设为 `vault-transit`；Vault 配置见 [Vault Transit 文档](docs/vault-transit.md) |
+| `CODEHARBOR_METRICS_TOKEN_FILE` | 可选，独立监控 Bearer 密钥文件；未配置时 `/metrics` 不开放 |
 | `YUNXIAO_ENDPOINT` | 必填，可信云效 API HTTPS 源，例如 `https://example.yunxiao.example` |
 | `YUNXIAO_ORGANIZATION_ID` | 云效中心版组织 ID；Region 版按实际 API 配置 |
 | `CODEHARBOR_GIT_HOSTS` | 必填，允许拉取的 HTTPS Git 主机，逗号分隔；包含非标准端口时写 `host:port` |
@@ -38,7 +41,9 @@ npm run build
 | `CODEHARBOR_ALLOWED_ORIGINS` | 允许的浏览器 Origin；默认不允许携带 Origin 的请求 |
 | `CODEGRAPH_BIN` | 可选，覆盖 CodeGraph 可执行文件路径 |
 
-运行 `npm start`。本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者还检查上游 MCP 工具 schema。
+运行 `npm start`。`NODE_ENV=production` 会强制要求 PostgreSQL 验证服务端证书和 Vault Transit，不能退回 SQLite/本地密钥。其他模式若不配置 PostgreSQL 则使用 SQLite。生产数据库连接应直连或使用 session pooling，不可使用事务池，因为实例互斥锁依赖持续的数据库会话；会话断开后拒绝读写，需由 supervisor 重启。业务进程与 Worker 同实例运行，仍不能横向扩容。
+
+本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者还检查数据库和上游 MCP 工具 schema。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 计数与延迟，不包含源码、仓库或用户标签；仅限内网采集。结构化 HTTP 和审计事件输出到 stdout，生产环境须配置访问受控的日志采集、留存和告警。
 
 ## 初次绑定与使用
 
@@ -78,7 +83,7 @@ Agent 配置 MCP URL `https://<trusted-host>/mcp` 和 `Authorization: Bearer <Co
 CODEGRAPH_TEST_BIN="$PWD/node_modules/.bin/codegraph" npm test
 ```
 
-测试包括虚拟 Codeup 权限、MCP 隔离、Webhook、任务及真实 CodeGraph 多仓库查询；虚拟云效测试不代表真实云效端到端验证。
+测试包括虚拟 Codeup 权限、MCP 隔离、Webhook、任务及真实 CodeGraph 多仓库查询。设置 `CODEHARBOR_TEST_DATABASE_URL` 后还执行真实 PostgreSQL 的迁移、实例锁和 HTTP/MCP 集成测试；该测试需要可创建和删除测试数据库的独立测试账号。虚拟云效测试不代表真实云效端到端验证。
 
 ## 容器
 
@@ -86,4 +91,4 @@ CODEGRAPH_TEST_BIN="$PWD/node_modules/.bin/codegraph" npm test
 docker build -t codeharbor:dev .
 ```
 
-容器以非 root 用户运行，数据保存在 `/data`。通过受控方式提供必填配置和密钥，并挂载持久化目录；本机试用应仅将端口绑定到 `127.0.0.1`。生产使用前还需要 TLS、密钥管理、单实例约束、备份及安全隔离。
+容器以非 root 用户运行，数据保存在 `/data`。生产部署模板见 [部署指南](docs/production-deployment.md) 和 [Compose 配置](deploy/compose.yaml)；模板使用外部 PostgreSQL、Vault Transit 和 HTTPS 反向代理，不会创建企业凭证或自动部署服务。生产使用前仍须验证实际云效权限、备份恢复和运行隔离。

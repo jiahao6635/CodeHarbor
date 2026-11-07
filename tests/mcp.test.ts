@@ -74,3 +74,43 @@ test('MCP routes authorized repositories without exposing server paths or mixing
     http.close();
   }
 });
+
+test('MCP does not return source if access or key is revoked while a query runs', async () => {
+  let validKey = true;
+  let permitted = true;
+  let releaseQuery: (() => void) | undefined;
+  let queryStarted: (() => void) | undefined;
+  const codegraph = {
+    async withQuery<T>(fn: (explore: (path: string, query: string) => Promise<string>) => Promise<T>): Promise<T> {
+      return fn(async () => {
+        queryStarted?.();
+        await new Promise<void>(resolve => { releaseQuery = resolve; });
+        return 'sensitive-source-code';
+      });
+    },
+  } as CodeGraphClient;
+  const http = createServer(); http.listen(0, '127.0.0.1'); await once(http, 'listening');
+  const address = http.address(); assert.ok(address && typeof address !== 'string');
+  const host = `127.0.0.1:${address.port}`;
+  const handle = createMcpHandler({
+    allowedHosts: [host], codegraph,
+    async authenticate() { return validKey ? 'alpha' : null; },
+    async listRepositories() { return permitted ? [repos[0]] : []; },
+    async getRepository(_user, id) { return permitted && id === 'alpha' ? repos[0] : null; },
+  });
+  http.on('request', (req, res) => { void handle(req, res); });
+  const client = new Client({ name: 'race-test', version: '1' });
+  const transport = new StreamableHTTPClientTransport(new URL(`http://${host}/mcp`), { requestInit: { headers: { Authorization: 'Bearer alpha' } } });
+  try {
+    await client.connect(transport);
+    for (const revoke of [() => { permitted = false; }, () => { validKey = false; }]) {
+      validKey = true; permitted = true;
+      const started = new Promise<void>(resolve => { queryStarted = resolve; });
+      const running = client.callTool({ name: 'codegraph_explore', arguments: { repo_id: 'alpha', query: 'x' } });
+      await started; revoke(); releaseQuery!();
+      const result = await running;
+      assert.equal(result.isError, true);
+      assert.doesNotMatch(JSON.stringify(result), /sensitive-source-code/);
+    }
+  } finally { await client.close(); http.close(); }
+});

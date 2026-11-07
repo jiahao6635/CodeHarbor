@@ -26,6 +26,7 @@ export interface McpDependencies<Principal> {
   allowedOrigins?: string[];
   /** Exact Host values accepted by the endpoint; configure behind a reverse proxy. */
   allowedHosts: string[];
+  onToolResult?: (req: IncomingMessage, event: { tool: string; outcome: 'success' | 'error'; repo_id?: string }) => void;
 }
 
 function publicRepository(repo: McpRepository) {
@@ -109,18 +110,27 @@ export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
     }));
     server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const args = request.params.arguments ?? {};
+      const allowed = ['list_repositories', 'get_repository_status', 'codegraph_explore'];
+      const tool = allowed.includes(request.params.name) ? request.params.name : '<unknown>';
+      let outcome: 'success' | 'error' = 'error';
+      let authorizedRepo: string | undefined;
+      const success = (value: unknown) => { outcome = 'success'; return textResult(value); };
       try {
         if (request.params.name === 'list_repositories') {
           if (!hasExactKeys(args, ['cursor', 'limit']) || (args.cursor !== undefined && (typeof args.cursor !== 'string' || !/^[0-9]{1,9}$/.test(args.cursor))) || (args.limit !== undefined && (typeof args.limit !== 'number' || !Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100))) return toolError('Invalid arguments');
           const offset = args.cursor === undefined ? 0 : Number(args.cursor);
           const limit = args.limit === undefined ? 50 : args.limit as number;
           const repositories = await deps.listRepositories(caller);
-          return textResult({ repositories: repositories.slice(offset, offset + limit).map(publicRepository), next_cursor: offset + limit < repositories.length ? String(offset + limit) : null });
+          if (await deps.authenticate(req) === null) return toolError('Authentication required');
+          return success({ repositories: repositories.slice(offset, offset + limit).map(publicRepository), next_cursor: offset + limit < repositories.length ? String(offset + limit) : null });
         }
         if (request.params.name === 'get_repository_status') {
           if (!hasExactKeys(args, ['repo_id']) || !validRepoId(args.repo_id)) return toolError('Invalid arguments');
           const repo = await deps.getRepository(caller, args.repo_id);
-          return repo ? textResult(publicRepository(repo)) : toolError('Repository not found');
+          if (await deps.authenticate(req) === null) return toolError('Authentication required');
+          if (!repo) return toolError('Repository not found');
+          authorizedRepo = repo.id;
+          return success(publicRepository(repo));
         }
         if (request.params.name === 'codegraph_explore') {
           if (!hasExactKeys(args, ['repo_id', 'query']) || !validRepoId(args.repo_id) || typeof args.query !== 'string' || !args.query.trim() || args.query.length > 2000) return toolError('Invalid arguments');
@@ -131,15 +141,21 @@ export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
             if (current === null) return toolError('Authentication required');
             const repo = await deps.getRepository(current, repoId);
             if (!repo) return toolError('Repository not found');
+            authorizedRepo = repo.id;
             if (!repo.projectPath || !repo.indexedCommit) return toolError('Repository index is not available');
             const result = await explore(repo.projectPath, query, extra.signal);
-            if (await deps.authenticate(req) === null) return toolError('Authentication required');
-            return textResult({ ...publicRepository(repo), result });
+            const confirmed = await deps.authenticate(req);
+            if (confirmed === null) return toolError('Authentication required');
+            const currentRepo = await deps.getRepository(confirmed, repoId);
+            if (!currentRepo || currentRepo.projectPath !== repo.projectPath || currentRepo.indexedCommit !== repo.indexedCommit) return toolError('Repository not found or index changed');
+            return success({ ...publicRepository(repo), result });
           });
         }
         return toolError('Unknown tool');
       } catch {
         return toolError('Request failed or upstream unavailable');
+      } finally {
+        try { deps.onToolResult?.(req, { tool, outcome, ...(authorizedRepo ? { repo_id: authorizedRepo } : {}) }); } catch { /* Audit observers cannot alter a response. */ }
       }
     });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true, maxRequestBodySize: 64 * 1024 });

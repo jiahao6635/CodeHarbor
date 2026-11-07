@@ -119,6 +119,18 @@ export class Store {
     }
   }
 
+  async transactionAsync<T>(fn: () => Promise<T>): Promise<T> {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const value = await fn();
+      this.db.exec('COMMIT');
+      return value;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   createUser(user: UserRecord): void {
     this.db.prepare('INSERT INTO users (id, username, credential, credential_version) VALUES (?, ?, ?, ?)')
       .run(user.id, user.username, user.credential, user.credential_version);

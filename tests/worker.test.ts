@@ -8,6 +8,7 @@ import { CredentialCipher } from '../src/auth.js';
 import type { CodeupClient } from '../src/codeup.js';
 import type { CodeGraphClient } from '../src/codegraph.js';
 import { Store } from '../src/store.js';
+import { AsyncSqliteStore } from '../src/async-store.js';
 import { IndexWorker } from '../src/worker.js';
 import { IndexError } from '../src/indexer.js';
 
@@ -29,7 +30,7 @@ function fixture() {
     getCloneUsername: async () => 'user',
   } as unknown as CodeupClient;
   const graph = { withExclusive: async (fn: (explore: () => Promise<string>) => Promise<void>) => fn(async () => 'ok') } as unknown as CodeGraphClient;
-  return { store, cipher, codeup, graph };
+  return { store, workerStore: new AsyncSqliteStore(store), cipher, codeup, graph };
 }
 
 test('coalesces queued work while preserving events during a build', async () => {
@@ -37,19 +38,19 @@ test('coalesces queued work while preserving events during a build', async () =>
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
   let builds = 0;
-  const worker = new IndexWorker({ ...f, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => 'b'.repeat(40),
     healthy: async () => true,
     build: async () => { builds++; await blocked; return { path: '/candidate', commit: 'b'.repeat(40), generation: 'v1' }; },
   });
   try {
-    const first = worker.enqueue('repo_1', 'initial');
-    assert.equal(worker.enqueue('repo_1', 'duplicate').id, first.id);
-    worker.start();
+    const first = await worker.enqueue('repo_1', 'initial');
+    assert.equal((await worker.enqueue('repo_1', 'duplicate')).id, first.id);
+    await worker.start();
     await waitFor(() => builds === 1);
-    const next = worker.enqueue('repo_1', 'push');
+    const next = await worker.enqueue('repo_1', 'push');
     assert.notEqual(next.id, first.id);
-    assert.equal(worker.enqueue('repo_1', 'duplicate').id, next.id);
+    assert.equal((await worker.enqueue('repo_1', 'duplicate')).id, next.id);
     release();
     await waitFor(() => f.store.getJob(next.id)?.status === 'succeeded');
     assert.equal(builds, 1, 'unchanged remote HEAD does not rebuild');
@@ -65,12 +66,12 @@ test('coalesces queued work while preserving events during a build', async () =>
 test('failed builds preserve the previous published index', async () => {
   const f = fixture();
   f.store.updateRepository('repo_1', { path: '/old', commit: 'a'.repeat(40), status: 'ready' });
-  const worker = new IndexWorker({ ...f, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => 'b'.repeat(40), build: async () => { throw new Error('secret internal error'); },
   });
   try {
-    const job = worker.enqueue('repo_1', 'manual');
-    worker.start();
+    const job = await worker.enqueue('repo_1', 'manual');
+    await worker.start();
     await waitFor(() => f.store.getJob(job.id)?.status === 'failed');
     assert.equal(f.store.getRepository('repo_1')?.path, '/old');
     assert.equal(f.store.getRepository('repo_1')?.commit, 'a'.repeat(40));
@@ -92,13 +93,13 @@ test('branch deletion prevents in-flight candidate publication and removes it', 
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
   let building = false;
-  const worker = new IndexWorker({ ...f, dataDir, allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir, allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => 'b'.repeat(40),
     build: async () => { building = true; await blocked; return { path: candidate, commit: 'b'.repeat(40), generation }; },
   });
   try {
-    const job = worker.enqueue('repo_1', 'push');
-    worker.start();
+    const job = await worker.enqueue('repo_1', 'push');
+    await worker.start();
     await waitFor(() => building);
     f.store.updateRepository('repo_1', { status: 'branch_deleted' });
     release();
@@ -107,7 +108,7 @@ test('branch deletion prevents in-flight candidate publication and removes it', 
     await worker.stop();
     assert.equal(f.store.getRepository('repo_1')?.path, '/old');
     await assert.rejects(access(candidate));
-    const recovery = worker.enqueue('repo_1', 'push');
+    const recovery = await worker.enqueue('repo_1', 'push');
     assert.equal(recovery.status, 'queued');
     assert.equal(f.store.getRepository('repo_1')?.status, 'updating');
   } finally {
@@ -120,15 +121,15 @@ test('branch deletion prevents in-flight candidate publication and removes it', 
 
 test('new push after branch deletion reuses queued work and resumes the repository', async () => {
   const f = fixture();
-  const worker = new IndexWorker({ ...f, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => 'a'.repeat(40), build: async () => ({ path: '/candidate', commit: 'a'.repeat(40), generation: 'v1' }),
   });
   try {
-    const job = worker.enqueue('repo_1', 'push');
+    const job = await worker.enqueue('repo_1', 'push');
     f.store.updateRepository('repo_1', { status: 'branch_deleted', error: 'BRANCH_DELETED' });
-    assert.equal(worker.enqueue('repo_1', 'webhook').id, job.id);
+    assert.equal((await worker.enqueue('repo_1', 'webhook')).id, job.id);
     assert.equal(f.store.getRepository('repo_1')?.status, 'pending');
-    worker.start();
+    await worker.start();
     await waitFor(() => f.store.getJob(job.id)?.status === 'succeeded');
     assert.equal(f.store.getRepository('repo_1')?.status, 'ready');
   } finally {
@@ -144,18 +145,18 @@ test('new PAT version requires explicit authorization before use for synchroniza
     getRepository: async () => { calls++; return { id: '123', name: 'repo', path: 'repo', accessLevel: 30, cloneDownloadRestricted: false, httpUrlToRepo: 'https://git.example.com/repo' }; },
     getCloneUsername: async () => 'user',
   } as unknown as CodeupClient;
-  const worker = new IndexWorker({ ...f, codeup, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+  const worker = new IndexWorker({ ...f, store: f.workerStore, codeup, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => 'a'.repeat(40), build: async () => ({ path: '/candidate', commit: 'a'.repeat(40), generation: 'v1' }),
   });
   try {
     f.store.updateUserCredential('user', 'user', f.cipher.encrypt('new-secret', 'user'));
-    const job = worker.enqueue('repo_1', 'push');
-    worker.start();
+    const job = await worker.enqueue('repo_1', 'push');
+    await worker.start();
     await waitFor(() => f.store.getJob(job.id)?.status === 'failed');
     assert.equal(calls, 0);
     assert.equal(f.store.getRepository('repo_1')?.status, 'credential_required');
     f.store.updateRepository('repo_1', { sync_credential_version: 2 });
-    const retry = worker.enqueue('repo_1', 'reauthorized');
+    const retry = await worker.enqueue('repo_1', 'reauthorized');
     await waitFor(() => f.store.getJob(retry.id)?.status === 'succeeded');
     assert.equal(calls, 1);
     assert.equal(f.store.getRepository('repo_1')?.status, 'ready');
@@ -170,12 +171,12 @@ test('PAT rotation during indexing blocks publication', async () => {
   let release!: () => void;
   let building = false;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
-  const worker = new IndexWorker({ ...f, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => 'b'.repeat(40), build: async () => { building = true; await blocked; return { path: '/candidate', commit: 'b'.repeat(40), generation: 'v1' }; },
   });
   try {
-    const job = worker.enqueue('repo_1', 'push');
-    worker.start();
+    const job = await worker.enqueue('repo_1', 'push');
+    await worker.start();
     await waitFor(() => building);
     f.store.updateUserCredential('user', 'user', f.cipher.encrypt('new-secret', 'user'));
     release();
@@ -196,13 +197,13 @@ test('unchanged HEAD rebuilds when the published index is missing', async () => 
   const missing = join(dataDir, 'repositories', 'repo_1', 'versions', randomUUID(), 'worktree');
   f.store.updateRepository('repo_1', { path: missing, commit, status: 'ready' });
   let builds = 0;
-  const worker = new IndexWorker({ ...f, dataDir, allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir, allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => commit,
     build: async () => { builds++; return { path: '/replacement', commit, generation: 'v1' }; },
   });
   try {
-    const job = worker.enqueue('repo_1', 'reconcile');
-    worker.start();
+    const job = await worker.enqueue('repo_1', 'reconcile');
+    await worker.start();
     await waitFor(() => f.store.getJob(job.id)?.status === 'succeeded');
     assert.equal(builds, 1);
     assert.equal(f.store.getRepository('repo_1')?.path, '/replacement');
@@ -220,17 +221,17 @@ test('branch deletion is retained while old work runs and later reconciliation r
   let missing = false;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
   const commit = 'a'.repeat(40);
-  const worker = new IndexWorker({ ...f, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => { if (missing) throw new IndexError('BRANCH_NOT_FOUND', 'Remote branch does not exist'); return commit; },
     build: async () => { building = true; await blocked; return { path: '/candidate', commit, generation: 'v1' }; },
   });
   try {
-    const oldJob = worker.enqueue('repo_1', 'initial');
-    worker.start();
+    const oldJob = await worker.enqueue('repo_1', 'initial');
+    await worker.start();
     await waitFor(() => building);
     f.store.updateRepository('repo_1', { status: 'branch_deleted' });
     missing = true;
-    const check = worker.enqueue('repo_1', 'reconcile');
+    const check = await worker.enqueue('repo_1', 'reconcile');
     assert.equal(f.store.getRepository('repo_1')?.status, 'branch_deleted');
     release();
     await waitFor(() => f.store.getJob(check.id)?.status === 'failed');
@@ -238,7 +239,7 @@ test('branch deletion is retained while old work runs and later reconciliation r
     assert.equal(f.store.getRepository('repo_1')?.status, 'branch_deleted');
     assert.equal(f.store.getRepository('repo_1')?.path, null);
     missing = false;
-    const retry = worker.enqueue('repo_1', 'reconcile');
+    const retry = await worker.enqueue('repo_1', 'reconcile');
     await waitFor(() => f.store.getJob(retry.id)?.status === 'succeeded');
     assert.equal(f.store.getRepository('repo_1')?.status, 'ready');
     assert.equal(f.store.getRepository('repo_1')?.commit, commit);
@@ -275,13 +276,13 @@ test('publishing retains current and previous owned versions after draining quer
       await access(current.path);
     },
   } as unknown as CodeGraphClient;
-  const worker = new IndexWorker({ ...f, graph, dataDir, allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+  const worker = new IndexWorker({ ...f, store: f.workerStore, graph, dataDir, allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => 'b'.repeat(40),
     build: async () => ({ path: current.path, commit: 'b'.repeat(40), generation: current.id }),
   });
   try {
-    const job = worker.enqueue('repo_1', 'push');
-    worker.start();
+    const job = await worker.enqueue('repo_1', 'push');
+    await worker.start();
     await waitFor(() => f.store.getJob(job.id)?.status === 'succeeded');
     await worker.stop();
     assert.equal(validatedUnderExclusive, true);

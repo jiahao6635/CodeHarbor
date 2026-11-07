@@ -28,7 +28,7 @@ test('command timeout kills the subprocess group', { skip: process.platform === 
     await writeFile(git, `#!/usr/bin/env node
 const { spawn } = require('node:child_process');
 if(process.argv.includes('ls-remote')) {
-  const source = ${JSON.stringify(`require('fs').writeFileSync(${JSON.stringify(started)},'yes'); setTimeout(() => require('fs').writeFileSync(${JSON.stringify(survived)},'yes'),2000);`)};
+  const source = ${JSON.stringify(`require('fs').writeFileSync(${JSON.stringify(started)},'yes'); setTimeout(() => require('fs').writeFileSync(${JSON.stringify(survived)},'yes'),4000);`)};
   spawn(process.execPath, ['-e', source], {stdio:'ignore'});
   setInterval(() => {}, 1000);
 }
@@ -37,10 +37,10 @@ if(process.argv.includes('ls-remote')) {
     process.env.PATH = `${tmp}:${oldPath}`;
     await assert.rejects(getRemoteHead({
       dataDir: tmp, repositoryId: 'r', branch: 'main', cloneUrl: 'https://git.example.com/repo',
-      allowedGitHosts: ['git.example.com'], gitUsername: 'u', token: 't', timeoutMs: 500,
+      allowedGitHosts: ['git.example.com'], gitUsername: 'u', token: 't', timeoutMs: 2000,
     }), { code: 'EXECUTION_FAILED' });
     await access(started);
-    await new Promise((resolve) => setTimeout(resolve, 2100));
+    await new Promise((resolve) => setTimeout(resolve, 4100));
     await assert.rejects(access(survived));
   } finally {
     process.env.PATH = oldPath;

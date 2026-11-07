@@ -5,7 +5,7 @@ import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { createApp, type AppConfig } from '../src/server.js';
+import { createApp, type AppConfig, type AuditEvent } from '../src/server.js';
 import { CodeupError } from '../src/codeup.js';
 
 test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundaries', async () => {
@@ -45,17 +45,19 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     async withQuery(fn: (explore: (path: string, query: string) => Promise<unknown>) => Promise<unknown>) {
       return fn(async (path, query) => { graphCalls.push({ path, query }); return { result: 'matching code' }; });
     },
+    async probe() {},
     async close() {},
   };
   let kickCount = 0;
+  const audit: AuditEvent[] = [];
   let app: ReturnType<typeof createApp>;
   const fakeWorker = {
     start() {},
     async stop() {},
     kick() { kickCount++; },
-    enqueue(repoId: string, reason: string) {
+    async enqueue(repoId: string, reason: string) {
       const job = { id: randomUUID(), repo_id: repoId, status: 'queued' as const, reason, created_at: Date.now(), error: null };
-      app.store.createJob(job);
+      await app.store.createJob(job);
       return job;
     },
   };
@@ -64,8 +66,8 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     codeupEndpoint: 'https://devops.example', organizationId: 'org', allowedGitHosts: ['git.example'],
     allowedHosts, writeUsers: ['alice'], codegraphBin: 'codegraph',
   };
-  app = createApp(config, { codeup: fakeCodeup as never, graph: fakeGraph as never, worker: fakeWorker as never });
-  await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  app = createApp(config, { codeup: fakeCodeup as never, graph: fakeGraph as never, worker: fakeWorker as never, audit: event => audit.push(event) });
+  await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
   assert.ok(address && typeof address === 'object');
   allowedHosts.push(`127.0.0.1:${address.port}`);
@@ -104,6 +106,11 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
   }
 
   try {
+    assert.equal((await request('GET', '/health/live')).status, 200);
+    assert.equal((await request('GET', '/health/ready')).status, 200);
+    assert.equal((await request('GET', '/metrics')).status, 404);
+    assert.equal((await request('GET', '/health/live', undefined, undefined, { origin: 'https://untrusted.example' })).status, 403);
+    assert.equal((await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'x'.repeat(70_000) })).status, 413);
     const invalid = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'wrong-secret' });
     assert.equal(invalid.status, 401);
     assert.ok(!JSON.stringify(invalid.body).includes('wrong-secret'));
@@ -138,7 +145,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     allowedByToken['bob-pat'].add('11');
     assert.equal((await request('GET', `/api/v1/repositories/${repo}`, bob)).status, 200);
     assert.equal((await request('POST', `/api/v1/repositories/${repo}/sync`, bob)).status, 403);
-    app.store.updateRepository(repo, { path: '/private/index', commit: 'a'.repeat(40), indexed_at: Date.now(), status: 'ready' });
+    await app.store.updateRepository(repo, { path: '/private/index', commit: 'a'.repeat(40), indexed_at: Date.now(), status: 'ready' });
 
     const mcp = (token: string, name: string, args: Record<string, unknown>) => request('POST', '/mcp', token,
       { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } },
@@ -170,11 +177,11 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     const payload = { object_kind: 'push', project_id: 11, ref: 'refs/heads/main', after: 'b'.repeat(40) };
     const hookPath = created.body.webhook_path;
     assert.equal((await request('POST', hookPath, undefined, payload, { 'x-codeup-token': 'incorrect', 'codeup-event': 'Push Hook' })).status, 404);
-    const before = app.store.listJobs(repo).length;
+    const before = (await app.store.listJobs(repo)).length;
     assert.equal((await request('POST', hookPath, undefined, { ...payload, ref: 'refs/heads/feature' }, { 'x-codeup-token': created.body.webhook_token, 'codeup-event': 'Push Hook' })).status, 202);
-    assert.equal(app.store.listJobs(repo).length, before);
+    assert.equal((await app.store.listJobs(repo)).length, before);
     assert.equal((await request('POST', hookPath, undefined, payload, { 'x-codeup-token': created.body.webhook_token, 'codeup-event': 'Push Hook' })).status, 202);
-    assert.equal(app.store.listJobs(repo).length, before + 1);
+    assert.equal((await app.store.listJobs(repo)).length, before + 1);
 
     const restrictedWrite = await request('POST', '/api/v1/api-keys', alice, { scope: 'write', repos: [repo], expires_in: 3600 });
     assert.equal(restrictedWrite.status, 201);
@@ -194,14 +201,14 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal((await request('GET', '/api/v1/me', alice)).status, 401);
     assert.equal((await request('GET', '/api/v1/me', restrictedToken)).status, 401);
     revokedTokens.delete('alice-pat');
-    const previousVersion = app.store.getUser('alice')!.credential_version;
-    const originalSyncVersion = app.store.getRepository(repo)!.sync_credential_version;
+    const previousVersion = (await app.store.getUser('alice'))!.credential_version;
+    const originalSyncVersion = (await app.store.getRepository(repo))!.sync_credential_version;
     const rebound = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat' });
     assert.equal(rebound.status, 200);
-    assert.equal(app.store.getUser('alice')!.credential_version, previousVersion + 1);
-    assert.equal(app.store.getRepository(repo)!.sync_credential_version, originalSyncVersion);
-    assert.equal(app.store.getRepository(repo)!.status, 'credential_required');
-    assert.equal(app.store.getRepository(second.body.repository.repo_id)!.status, 'credential_required');
+    assert.equal((await app.store.getUser('alice'))!.credential_version, previousVersion + 1);
+    assert.equal((await app.store.getRepository(repo))!.sync_credential_version, originalSyncVersion);
+    assert.equal((await app.store.getRepository(repo))!.status, 'credential_required');
+    assert.equal((await app.store.getRepository(second.body.repository.repo_id))!.status, 'credential_required');
     assert.equal((await request('GET', '/api/v1/me', alice)).status, 401);
     const fresh = await request('POST', '/api/v1/auth/bootstrap/keys', rebound.body.bootstrap_token, { scope: 'write' });
     assert.equal(fresh.status, 201);
@@ -216,13 +223,13 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal((await request('PUT', syncCredentialPath, bobWrite.body.token, { authorize_automatic_sync: true })).status, 404);
     assert.equal((await request('PUT', syncCredentialPath, fresh.body.token, {})).status, 400);
     assert.equal((await request('PUT', syncCredentialPath, fresh.body.token, { authorize_automatic_sync: false })).status, 400);
-    assert.equal(app.store.getRepository(repo)!.sync_credential_version, originalSyncVersion);
+    assert.equal((await app.store.getRepository(repo))!.sync_credential_version, originalSyncVersion);
     const credentialRefresh = await request('PUT', syncCredentialPath, fresh.body.token, { authorize_automatic_sync: true });
     assert.equal(credentialRefresh.status, 202);
-    assert.equal(app.store.getRepository(repo)!.sync_credential_version, previousVersion + 1);
-    assert.equal(app.store.getJob(credentialRefresh.body.job_id)?.reason, 'credential_changed');
-    assert.equal(app.store.getJob(credentialRefresh.body.job_id)?.status, 'queued');
-    assert.equal(app.store.getRepository(second.body.repository.repo_id)!.status, 'credential_required');
+    assert.equal((await app.store.getRepository(repo))!.sync_credential_version, previousVersion + 1);
+    assert.equal((await app.store.getJob(credentialRefresh.body.job_id))?.reason, 'credential_changed');
+    assert.equal((await app.store.getJob(credentialRefresh.body.job_id))?.status, 'queued');
+    assert.equal((await app.store.getRepository(second.body.repository.repo_id))!.status, 'credential_required');
 
     // A delayed rejection for an old credential cannot revoke a newer binding's keys.
     let releaseOld!: () => void;
@@ -250,11 +257,11 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     // Authorization must still hold after waiting for a slow request body.
     const slowSync = partialRequest('PUT', syncCredentialPath, newer.body.token, '{"authorize_automatic_sync":');
     await new Promise(resolve => setTimeout(resolve, 50));
-    const repoVersionBefore = app.store.getRepository(repo)!.sync_credential_version;
+    const repoVersionBefore = (await app.store.getRepository(repo))!.sync_credential_version;
     const reboundDuringRequest = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat' });
     assert.equal(reboundDuringRequest.status, 200);
     assert.equal((await slowSync.finish('true}')).status, 401);
-    assert.equal(app.store.getRepository(repo)!.sync_credential_version, repoVersionBefore);
+    assert.equal((await app.store.getRepository(repo))!.sync_credential_version, repoVersionBefore);
     const latestKey = await request('POST', '/api/v1/auth/bootstrap/keys', reboundDuringRequest.body.bootstrap_token, { scope: 'write', expires_in: 7200 });
     assert.equal(latestKey.status, 201);
     const slowParent = await request('POST', '/api/v1/api-keys', latestKey.body.token, { scope: 'write', repos: [repo], expires_in: 3600 });
@@ -263,8 +270,46 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     await new Promise(resolve => setTimeout(resolve, 50));
     assert.equal((await request('DELETE', `/api/v1/api-keys/${slowParent.body.prefix}`, latestKey.body.token)).status, 200);
     assert.equal((await slowKey.finish(',"expires_in":60}')).status, 401);
+    assert.ok(audit.some(event => event.authentication === 'yunxiao_pat' && event.subject === 'alice'));
+    assert.ok(audit.some(event => event.authentication === 'bootstrap' && event.subject === 'alice'));
+    assert.ok(audit.some(event => event.authentication === 'api_key' && event.subject === 'alice' && event.key_prefix === aliceKey.body.prefix));
+    assert.ok(audit.some(event => event.authentication === 'webhook' && event.repo_id === repo));
+    assert.ok(audit.some(event => event.route === '/api/v1/repositories/:id' && event.repo_id === repo));
+    assert.ok(audit.some(event => event.tool === 'codegraph_explore' && event.tool_outcome === 'success' && event.repo_id === repo));
+    assert.ok(audit.some(event => event.tool === 'codegraph_explore' && event.tool_outcome === 'error'));
+    const logged = JSON.stringify(audit);
+    for (const secret of ['alice-pat', 'wrong-secret', alice, created.body.webhook_token, 'order flow', 'matching code']) {
+      assert.ok(!logged.includes(secret));
+    }
   } finally {
     await app.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('metrics use a separate credential and contain only bounded aggregate labels', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codeharbor-metrics-'));
+  const allowedHosts: string[] = [];
+  const metricsToken = 'test-metrics-token-000000000000000000';
+  const app = createApp({ dataDir: dir, databasePath: join(dir, 'state.sqlite'), credentialKey: randomBytes(32),
+    codeupEndpoint: 'https://devops.example', allowedGitHosts: ['git.example'], allowedHosts,
+    writeUsers: [], codegraphBin: 'codegraph', metricsToken },
+  { graph: { async probe() {}, async close() {} } as never, worker: { async stop() {} } as never });
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  const address = app.server.address(); assert.ok(address && typeof address === 'object');
+  allowedHosts.push(`127.0.0.1:${address.port}`);
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    assert.equal((await fetch(`${base}/metrics`)).status, 401);
+    assert.equal((await fetch(`${base}/metrics`, { headers: { authorization: 'Bearer wrong-token' } })).status, 401);
+    assert.equal((await fetch(`${base}/health/live?secret=not-in-metrics`)).status, 200);
+    const result = await fetch(`${base}/metrics`, { headers: { authorization: `Bearer ${metricsToken}` } });
+    assert.equal(result.status, 200);
+    assert.match(result.headers.get('content-type')!, /^text\/plain/);
+    const content = await result.text();
+    assert.match(content, /codeharbor_http_requests_total\{method="GET",status="200"\}/);
+    assert.match(content, /codeharbor_http_request_duration_seconds_bucket/);
+    assert.ok(!content.includes('not-in-metrics') && !content.includes(metricsToken));
+    assert.ok(!content.includes('route=') && !content.includes('user=') && !content.includes('repo='));
+  } finally { await app.close(); rmSync(dir, { recursive: true, force: true }); }
 });
