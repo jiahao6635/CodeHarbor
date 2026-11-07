@@ -31,10 +31,14 @@ services:
         install -o postgres -g postgres -m 0644 /run/secrets/postgres_tls_cert /tmp/codeharbor-postgres-tls/server.crt
         install -o postgres -g postgres -m 0600 /run/secrets/postgres_admin_password /tmp/codeharbor-postgres-tls/admin.password
         install -o postgres -g postgres -m 0600 /run/secrets/postgres_password /tmp/codeharbor-postgres-tls/app.password
-        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/codeharbor-postgres-tls/server.crt -c ssl_key_file=/tmp/codeharbor-postgres-tls/server.key
+        install -o postgres -g postgres -m 0755 /run/codeharbor-init/init-user.sh /docker-entrypoint-initdb.d/10-codeharbor-user.sh
+        printf '%s\n' 'local all all trust' 'hostssl all all 0.0.0.0/0 scram-sha-256' 'hostssl all all ::/0 scram-sha-256' > /tmp/codeharbor-postgres-tls/pg_hba.conf
+        chown postgres:postgres /tmp/codeharbor-postgres-tls/pg_hba.conf
+        chmod 0600 /tmp/codeharbor-postgres-tls/pg_hba.conf
+        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/codeharbor-postgres-tls/server.crt -c ssl_key_file=/tmp/codeharbor-postgres-tls/server.key -c hba_file=/tmp/codeharbor-postgres-tls/pg_hba.conf
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./postgres/init-user.sh:/docker-entrypoint-initdb.d/10-codeharbor-user.sh:ro
+      - ./postgres/init-user.sh:/run/codeharbor-init/init-user.sh:ro
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=16m,mode=1777
     secrets:
