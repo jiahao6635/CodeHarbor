@@ -91,4 +91,4 @@ CODEGRAPH_TEST_BIN="$PWD/node_modules/.bin/codegraph" npm test
 docker build -t codeharbor:dev .
 ```
 
-容器以非 root 用户运行，数据保存在 `/data`。生产部署模板见 [部署指南](docs/production-deployment.md) 和 [Compose 配置](deploy/compose.yaml)；模板使用外部 PostgreSQL、Vault Transit 和 HTTPS 反向代理，不会创建企业凭证或自动部署服务。生产使用前仍须验证实际云效权限、备份恢复和运行隔离。
+容器以非 root 用户运行，数据保存在 `/data`。生产部署可选择外部 PostgreSQL，或叠加 [本地 PostgreSQL Compose 配置](deploy/compose.postgres.yaml) 在 Docker 中运行数据库；两种方式均要求经验证的 PostgreSQL TLS、Vault Transit 和 HTTPS 反向代理。配置及启动步骤见 [部署指南](docs/production-deployment.md)。模板不会创建企业凭证或自动部署服务；生产使用前仍须验证实际云效权限、备份恢复和运行隔离。

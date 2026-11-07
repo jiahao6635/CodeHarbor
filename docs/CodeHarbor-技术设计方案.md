@@ -5,7 +5,7 @@
 - 目标 CodeGraph：[colbymchenry/codegraph](https://github.com/colbymchenry/codegraph)
 - 适用范围：云效 Codeup 托管的 Git 仓库，默认分支的代码索引和查询
 
-> 实现验证记录：首期原型固定 CodeGraph 1.6.2；该版本实际使用 `init <path> --yes` 和 `status <path> --json`，不支持本文示意中的 `--local-only` / `--strict`。首期以单进程 SQLite 实现任务持久化，部署与安全限制详见项目 README；PostgreSQL、租约和 fencing 属于后续工作。
+> 实现状态：本文保留首期方案及后续建议作为设计记录。当前代码已接入 Fastify、PostgreSQL 和 Vault Transit，生产部署可选择本地 Docker PostgreSQL 或远端 PostgreSQL；以 [生产部署指南](production-deployment.md) 为准。系统仍是单实例，跨进程任务租约和 fencing 尚未实现。CodeGraph 固定 1.6.2，实际使用 `init <path> --yes` 和 `status <path> --json`，不支持本文示意中的 `--local-only` / `--strict`。
 
 ## 1. 背景与目标
 

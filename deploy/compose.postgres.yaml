@@ -1,0 +1,71 @@
+# Use alone to start only PostgreSQL, or add this file after compose.yaml
+# to attach the application to a local PostgreSQL instance over verified TLS.
+services:
+  codeharbor:
+    # Makes this file valid on its own; compose.yaml supplies the build config.
+    image: ${CODEHARBOR_APP_IMAGE:-codeharbor:local}
+    environment:
+      NODE_EXTRA_CA_CERTS: /run/secrets/postgres_ca
+    secrets:
+      - postgres_ca
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: ${CODEHARBOR_POSTGRES_IMAGE:-postgres:17}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${CODEHARBOR_POSTGRES_ADMIN_USER:-codeharbor_admin}
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD_FILE: /tmp/codeharbor-postgres-tls/admin.password
+      CODEHARBOR_POSTGRES_APP_USER: ${CODEHARBOR_POSTGRES_USER:-codeharbor}
+      CODEHARBOR_POSTGRES_APP_DB: ${CODEHARBOR_POSTGRES_DB:-codeharbor}
+      CODEHARBOR_POSTGRES_APP_PASSWORD_FILE: /tmp/codeharbor-postgres-tls/app.password
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        install -d -o postgres -g postgres -m 0700 /tmp/codeharbor-postgres-tls
+        install -o postgres -g postgres -m 0600 /run/secrets/postgres_tls_key /tmp/codeharbor-postgres-tls/server.key
+        install -o postgres -g postgres -m 0644 /run/secrets/postgres_tls_cert /tmp/codeharbor-postgres-tls/server.crt
+        install -o postgres -g postgres -m 0600 /run/secrets/postgres_admin_password /tmp/codeharbor-postgres-tls/admin.password
+        install -o postgres -g postgres -m 0600 /run/secrets/postgres_password /tmp/codeharbor-postgres-tls/app.password
+        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/codeharbor-postgres-tls/server.crt -c ssl_key_file=/tmp/codeharbor-postgres-tls/server.key
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init-user.sh:/docker-entrypoint-initdb.d/10-codeharbor-user.sh:ro
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m,mode=1777
+    secrets:
+      - postgres_password
+      - postgres_admin_password
+      - postgres_tls_cert
+      - postgres_tls_key
+    networks: [backend]
+    healthcheck:
+      # Verify that initialization created the application role/database and that
+      # the mounted password matches; pg_isready alone does not authenticate.
+      test: [CMD-SHELL, 'PGPASSWORD="$$(cat "$${CODEHARBOR_POSTGRES_APP_PASSWORD_FILE}")" PGSSLMODE=require psql -w -h 127.0.0.1 -U "$${CODEHARBOR_POSTGRES_APP_USER}" -d "$${CODEHARBOR_POSTGRES_APP_DB}" -v ON_ERROR_STOP=1 -tAc "SELECT 1" >/dev/null']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+networks:
+  backend:
+
+volumes:
+  postgres_data:
+
+secrets:
+  postgres_password:
+    file: ${CODEHARBOR_POSTGRES_PASSWORD_FILE:?set CODEHARBOR_POSTGRES_PASSWORD_FILE}
+  postgres_admin_password:
+    file: ${CODEHARBOR_POSTGRES_ADMIN_PASSWORD_FILE:?set CODEHARBOR_POSTGRES_ADMIN_PASSWORD_FILE}
+  postgres_tls_cert:
+    file: ${CODEHARBOR_POSTGRES_TLS_CERT:?set CODEHARBOR_POSTGRES_TLS_CERT}
+  postgres_tls_key:
+    file: ${CODEHARBOR_POSTGRES_TLS_KEY:?set CODEHARBOR_POSTGRES_TLS_KEY}
+  postgres_ca:
+    file: ${CODEHARBOR_POSTGRES_CA_CERT:?set CODEHARBOR_POSTGRES_CA_CERT}
