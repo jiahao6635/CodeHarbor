@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CredentialCipher } from '../src/auth.js';
@@ -9,6 +9,7 @@ import type { CodeupClient } from '../src/codeup.js';
 import type { CodeGraphClient } from '../src/codegraph.js';
 import { Store } from '../src/store.js';
 import { IndexWorker } from '../src/worker.js';
+import { IndexError } from '../src/indexer.js';
 
 async function waitFor(check: () => boolean): Promise<void> {
   const end = Date.now() + 3000;
@@ -38,6 +39,7 @@ test('coalesces queued work while preserving events during a build', async () =>
   let builds = 0;
   const worker = new IndexWorker({ ...f, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => 'b'.repeat(40),
+    healthy: async () => true,
     build: async () => { builds++; await blocked; return { path: '/candidate', commit: 'b'.repeat(40), generation: 'v1' }; },
   });
   try {
@@ -184,5 +186,113 @@ test('PAT rotation during indexing blocks publication', async () => {
     release();
     await worker.stop();
     f.store.close();
+  }
+});
+
+test('unchanged HEAD rebuilds when the published index is missing', async () => {
+  const f = fixture();
+  const dataDir = await mkdtemp(join(tmpdir(), 'codeharbor-missing-'));
+  const commit = 'a'.repeat(40);
+  const missing = join(dataDir, 'repositories', 'repo_1', 'versions', randomUUID(), 'worktree');
+  f.store.updateRepository('repo_1', { path: missing, commit, status: 'ready' });
+  let builds = 0;
+  const worker = new IndexWorker({ ...f, dataDir, allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+    head: async () => commit,
+    build: async () => { builds++; return { path: '/replacement', commit, generation: 'v1' }; },
+  });
+  try {
+    const job = worker.enqueue('repo_1', 'reconcile');
+    worker.start();
+    await waitFor(() => f.store.getJob(job.id)?.status === 'succeeded');
+    assert.equal(builds, 1);
+    assert.equal(f.store.getRepository('repo_1')?.path, '/replacement');
+  } finally {
+    await worker.stop();
+    f.store.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('branch deletion is retained while old work runs and later reconciliation recovers', async () => {
+  const f = fixture();
+  let release!: () => void;
+  let building = false;
+  let missing = false;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const commit = 'a'.repeat(40);
+  const worker = new IndexWorker({ ...f, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+    head: async () => { if (missing) throw new IndexError('BRANCH_NOT_FOUND', 'Remote branch does not exist'); return commit; },
+    build: async () => { building = true; await blocked; return { path: '/candidate', commit, generation: 'v1' }; },
+  });
+  try {
+    const oldJob = worker.enqueue('repo_1', 'initial');
+    worker.start();
+    await waitFor(() => building);
+    f.store.updateRepository('repo_1', { status: 'branch_deleted' });
+    missing = true;
+    const check = worker.enqueue('repo_1', 'reconcile');
+    assert.equal(f.store.getRepository('repo_1')?.status, 'branch_deleted');
+    release();
+    await waitFor(() => f.store.getJob(check.id)?.status === 'failed');
+    assert.equal(f.store.getJob(oldJob.id)?.status, 'failed');
+    assert.equal(f.store.getRepository('repo_1')?.status, 'branch_deleted');
+    assert.equal(f.store.getRepository('repo_1')?.path, null);
+    missing = false;
+    const retry = worker.enqueue('repo_1', 'reconcile');
+    await waitFor(() => f.store.getJob(retry.id)?.status === 'succeeded');
+    assert.equal(f.store.getRepository('repo_1')?.status, 'ready');
+    assert.equal(f.store.getRepository('repo_1')?.commit, commit);
+  } finally {
+    release();
+    await worker.stop();
+    f.store.close();
+  }
+});
+
+test('publishing retains current and previous owned versions after draining queries', async () => {
+  const f = fixture();
+  const dataDir = await mkdtemp(join(tmpdir(), 'codeharbor-retention-'));
+  const root = join(dataDir, 'repositories', 'repo_1', 'versions');
+  async function version(owned: boolean): Promise<{ id: string; path: string }> {
+    const id = randomUUID();
+    const dir = join(root, id);
+    await mkdir(join(dir, 'worktree'), { recursive: true });
+    if (owned) await writeFile(join(dir, '.codeharbor-generation.json'), JSON.stringify({ version: 1, repositoryId: 'repo_1', generation: id }));
+    return { id, path: join(dir, 'worktree') };
+  }
+  const old = await version(true);
+  const previous = await version(true);
+  const current = await version(true);
+  const unknown = await version(false);
+  f.store.updateRepository('repo_1', { path: previous.path, commit: 'a'.repeat(40), status: 'ready' });
+  let validatedUnderExclusive = false;
+  const graph = {
+    withExclusive: async (fn: (explore: () => Promise<string>) => Promise<void>) => {
+      // Real adapter closes the old shared connection before entering the callback.
+      await fn(async () => { validatedUnderExclusive = true; return 'ok'; });
+      await assert.rejects(access(old.path));
+      await access(previous.path);
+      await access(current.path);
+    },
+  } as unknown as CodeGraphClient;
+  const worker = new IndexWorker({ ...f, graph, dataDir, allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+    head: async () => 'b'.repeat(40),
+    build: async () => ({ path: current.path, commit: 'b'.repeat(40), generation: current.id }),
+  });
+  try {
+    const job = worker.enqueue('repo_1', 'push');
+    worker.start();
+    await waitFor(() => f.store.getJob(job.id)?.status === 'succeeded');
+    await worker.stop();
+    assert.equal(validatedUnderExclusive, true);
+    assert.equal(f.store.getRepository('repo_1')?.path, current.path);
+    await assert.rejects(access(old.path));
+    await access(previous.path);
+    await access(current.path);
+    await access(unknown.path);
+  } finally {
+    await worker.stop();
+    f.store.close();
+    await rm(dataDir, { recursive: true, force: true });
   }
 });

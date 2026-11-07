@@ -55,3 +55,68 @@ test('real CodeGraph queries two independent indexes and switches the published 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('closing a CodeGraph transport kills a stubborn descendant in its process group', { skip: process.platform === 'win32', timeout: 10_000 }, async () => {
+  const { ManagedCodeGraphTransport } = await import('../src/codegraph.js');
+  const { chmod, readFile } = await import('node:fs/promises');
+  const root = await mkdtemp(join(tmpdir(), 'codeharbor-group-'));
+  const executable = join(root, 'fake-codegraph');
+  const pidPath = join(root, 'descendant.pid');
+  await writeFile(executable, `#!/usr/bin/env node\nconst {spawn} = require('node:child_process');\nconst fs = require('node:fs');\nconst child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {stdio:'inherit'});\nfs.writeFileSync(${JSON.stringify(pidPath)}, String(child.pid));\nprocess.on('SIGTERM',()=>{}); setInterval(()=>{},1000);\n`);
+  await chmod(executable, 0o700);
+  const transport = new ManagedCodeGraphTransport(executable, root);
+  transport.onerror = () => {};
+  let pid = 0;
+  try {
+    await transport.start();
+    const end = Date.now() + 3000;
+    while (!existsSync(pidPath) && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
+    pid = Number(await readFile(pidPath, 'utf8'));
+    assert.ok(pid > 0);
+    await transport.close();
+    // On Linux a killed reparented process may linger as a zombie; that state has no open handles.
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+      const result = await run('ps', ['-o', 'stat=', '-p', String(pid)]).catch(() => ({ stdout: '' }));
+      alive = !!result.stdout.trim() && !result.stdout.trim().startsWith('Z');
+    } catch { alive = false; }
+    assert.equal(alive, false, 'descendant must not continue running after close');
+  } finally {
+    await transport.close().catch(() => {});
+    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('closing transport also kills descendants after an early parent exit', { skip: process.platform === 'win32', timeout: 10_000 }, async () => {
+  const { ManagedCodeGraphTransport } = await import('../src/codegraph.js');
+  const { chmod, readFile } = await import('node:fs/promises');
+  const root = await mkdtemp(join(tmpdir(), 'codeharbor-orphan-'));
+  const executable = join(root, 'fake-codegraph');
+  const pidPath = join(root, 'descendant.pid');
+  await writeFile(executable, `#!/usr/bin/env node\nconst {spawn} = require('node:child_process');\nconst fs = require('node:fs');\nconst child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {stdio:'ignore'});\nfs.writeFileSync(${JSON.stringify(pidPath)}, String(child.pid)); child.unref();\n`);
+  await chmod(executable, 0o700);
+  const transport = new ManagedCodeGraphTransport(executable, root);
+  transport.onerror = () => {};
+  let pid = 0;
+  try {
+    await transport.start();
+    const end = Date.now() + 3000;
+    while (!existsSync(pidPath) && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
+    pid = Number(await readFile(pidPath, 'utf8'));
+    await new Promise((r) => setTimeout(r, 100));
+    await transport.close();
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+      const result = await run('ps', ['-o', 'stat=', '-p', String(pid)]).catch(() => ({ stdout: '' }));
+      alive = !!result.stdout.trim() && !result.stdout.trim().startsWith('Z');
+    } catch { alive = false; }
+    assert.equal(alive, false, 'orphan must not continue running after close');
+  } finally {
+    await transport.close().catch(() => {});
+    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    await rm(root, { recursive: true, force: true });
+  }
+});

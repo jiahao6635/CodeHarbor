@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
+import { createRequire } from 'node:module';
 import { createApp } from './server.js';
 
 const dataDir = resolve(process.env.CODEHARBOR_DATA_DIR ?? './data');
@@ -18,6 +18,8 @@ if (!allowedGitHosts.length) throw new Error('CODEHARBOR_GIT_HOSTS must list tru
 const allowedHosts = list(process.env.CODEHARBOR_ALLOWED_HOSTS);
 if (!allowedHosts.length) allowedHosts.push(`127.0.0.1:${port}`, `localhost:${port}`);
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+const require = createRequire(import.meta.url);
+const platformCodegraph = process.env.CODEGRAPH_BIN ?? require.resolve(`@colbymchenry/codegraph-${process.platform}-${process.arch}/bin/codegraph`);
 const app = createApp({
   dataDir,
   databasePath: resolve(dataDir, 'codeharbor.sqlite'),
@@ -28,7 +30,7 @@ const app = createApp({
   allowedHosts,
   allowedOrigins: list(process.env.CODEHARBOR_ALLOWED_ORIGINS),
   writeUsers: list(process.env.CODEHARBOR_WRITE_USERS),
-  codegraphBin: process.env.CODEGRAPH_BIN ?? resolve(dirname(fileURLToPath(import.meta.url)), '../node_modules/.bin/codegraph'),
+  codegraphBin: platformCodegraph,
 });
 app.server.listen(port, host, () => { app.start(); console.log(`CodeHarbor listening on ${host}:${port}`); });
 let stopping = false;

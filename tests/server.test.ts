@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -78,6 +79,28 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
       ...(value !== undefined ? { body: JSON.stringify(value) } : {}),
     });
     return { status: response.status, body: await response.json() as Record<string, any> };
+  }
+
+  function partialRequest(method: string, path: string, token: string, start: string) {
+    let resolveResponse!: (value: { status: number; body: Record<string, any> }) => void;
+    let rejectResponse!: (reason: unknown) => void;
+    const response = new Promise<{ status: number; body: Record<string, any> }>((resolve, reject) => {
+      resolveResponse = resolve; rejectResponse = reject;
+    });
+    const req = httpRequest(`${base}${path}`, { method, headers: {
+      authorization: `Bearer ${token}`, 'content-type': 'application/json',
+    } }, res => {
+      const chunks: Buffer[] = [];
+      res.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      res.on('error', rejectResponse);
+      res.on('end', () => {
+        try { resolveResponse({ status: res.statusCode!, body: JSON.parse(Buffer.concat(chunks).toString()) }); }
+        catch (error) { rejectResponse(error); }
+      });
+    });
+    req.on('error', rejectResponse);
+    req.write(start);
+    return { finish(end: string) { req.end(end); return response; } };
   }
 
   try {
@@ -215,6 +238,31 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     releaseOld();
     assert.equal((await delayedRequest).status, 404);
     assert.equal((await request('GET', '/api/v1/me', newer.body.token)).status, 200);
+
+    // A session accepted before reading a slow body must still be consumed only once.
+    const raceBind = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'bob-pat' });
+    const firstPending = partialRequest('POST', '/api/v1/auth/bootstrap/keys', raceBind.body.bootstrap_token, '{"scope":"read"');
+    const secondPending = partialRequest('POST', '/api/v1/auth/bootstrap/keys', raceBind.body.bootstrap_token, '{"scope":"read"');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const bootstrapResults = await Promise.all([firstPending.finish('}'), secondPending.finish('}')]);
+    assert.deepEqual(bootstrapResults.map(result => result.status).sort(), [201, 401]);
+
+    // Authorization must still hold after waiting for a slow request body.
+    const slowSync = partialRequest('PUT', syncCredentialPath, newer.body.token, '{"authorize_automatic_sync":');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const repoVersionBefore = app.store.getRepository(repo)!.sync_credential_version;
+    const reboundDuringRequest = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat' });
+    assert.equal(reboundDuringRequest.status, 200);
+    assert.equal((await slowSync.finish('true}')).status, 401);
+    assert.equal(app.store.getRepository(repo)!.sync_credential_version, repoVersionBefore);
+    const latestKey = await request('POST', '/api/v1/auth/bootstrap/keys', reboundDuringRequest.body.bootstrap_token, { scope: 'write', expires_in: 7200 });
+    assert.equal(latestKey.status, 201);
+    const slowParent = await request('POST', '/api/v1/api-keys', latestKey.body.token, { scope: 'write', repos: [repo], expires_in: 3600 });
+    assert.equal(slowParent.status, 201);
+    const slowKey = partialRequest('POST', '/api/v1/api-keys', slowParent.body.token, '{"scope":"read","repos":[]');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal((await request('DELETE', `/api/v1/api-keys/${slowParent.body.prefix}`, latestKey.body.token)).status, 200);
+    assert.equal((await slowKey.finish(',"expires_in":60}')).status, 401);
   } finally {
     await app.close();
     rmSync(dir, { recursive: true, force: true });

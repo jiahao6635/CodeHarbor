@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { buildIndexCandidate } from '../src/indexer.js';
+import { buildIndexCandidate, isPublishedIndexHealthy } from '../src/indexer.js';
 
 test('builds a queryable index for a real Git commit with the installed CodeGraph', async () => {
   const root = await mkdtemp(join(tmpdir(), 'codeharbor-codegraph-'));
@@ -31,16 +31,20 @@ process.exit(result.status === null ? 1 : result.status);
 `);
     await chmod(mockGit, 0o700);
     process.env.PATH = `${mockBin}:${previousPath}`;
-    const candidate = await buildIndexCandidate({
+    const request = {
       dataDir: join(root, 'data'), repositoryId: 'r1', branch: 'main',
       cloneUrl: 'https://git.example.com/org/repo.git', allowedGitHosts: ['git.example.com'],
       gitUsername: 'test', token: 'test-token', codegraphBin: codegraph, timeoutMs: 60_000,
-    });
+    };
+    const candidate = await buildIndexCandidate(request);
     assert.equal(candidate.commit, commit);
     const result = execFileSync(codegraph, ['query', 'createOrder', '--json'], {
       cwd: candidate.path, encoding: 'utf8', env: { ...process.env, DO_NOT_TRACK: '1' }, timeout: 60_000,
     });
     assert.match(result, /createOrder/);
+    assert.equal(await isPublishedIndexHealthy(request, candidate.path, commit), true);
+    await rm(join(candidate.path, '.codegraph'), { recursive: true, force: true });
+    assert.equal(await isPublishedIndexHealthy(request, candidate.path, commit), false);
   } finally {
     process.env.PATH = previousPath;
     await rm(root, { recursive: true, force: true });

@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { CredentialCipher } from './auth.js';
 import { CodeupClient, CodeupError, hasRepositoryRole } from './codeup.js';
 import { CodeGraphClient } from './codegraph.js';
-import { buildIndexCandidate, getRemoteHead, IndexError, type IndexCandidate, type IndexRequest } from './indexer.js';
+import { buildIndexCandidate, getRemoteHead, isPublishedIndexHealthy, pruneIndexVersions, IndexError, type IndexCandidate, type IndexRequest } from './indexer.js';
 import { Store, type JobRecord } from './store.js';
 
 export type WorkerOptions = {
@@ -19,6 +19,7 @@ export type WorkerOptions = {
   /** Injected only by tests. */
   build?: (request: IndexRequest) => Promise<IndexCandidate>;
   head?: (request: IndexRequest) => Promise<string>;
+  healthy?: (request: IndexRequest, worktree: string, commit: string) => Promise<boolean>;
 };
 
 /** A single-process worker. Multi-process deployments require durable leases and fencing. */
@@ -41,7 +42,7 @@ export class IndexWorker {
     if (interval > 0) {
       this.timer = setInterval(() => {
         for (const repo of this.options.store.listRepositories()) {
-          if (repo.status !== 'disabled' && repo.status !== 'branch_deleted') this.enqueue(repo.id, 'reconcile');
+          if (repo.status !== 'disabled') this.enqueue(repo.id, 'reconcile');
         }
       }, interval);
       this.timer.unref();
@@ -61,14 +62,16 @@ export class IndexWorker {
     const job = store.transaction(() => {
       const repo = store.getRepository(repoId);
       if (!repo || repo.status === 'disabled') throw new Error('Repository not found');
-      const queued = store.listJobs(repoId).find((item) => item.status === 'queued');
+      const jobs = store.listJobs(repoId);
+      const queued = jobs.find((item) => item.status === 'queued');
+      const preserveDeletion = repo.status === 'branch_deleted' && jobs.some((item) => item.status === 'running');
       if (queued) {
-        if (repo.status === 'branch_deleted') store.updateRepository(repoId, { status: repo.path ? 'updating' : 'pending', error: null });
+        if (repo.status === 'branch_deleted' && !preserveDeletion) store.updateRepository(repoId, { status: repo.path ? 'updating' : 'pending', error: null });
         return queued;
       }
       const created: JobRecord = { id: randomUUID(), repo_id: repoId, status: 'queued', reason, created_at: Date.now(), error: null };
       store.createJob(created);
-      store.updateRepository(repoId, { status: repo.path ? 'updating' : 'pending', error: null });
+      if (!preserveDeletion) store.updateRepository(repoId, { status: repo.path ? 'updating' : 'pending', error: null });
       return created;
     });
     this.kick();
@@ -96,7 +99,7 @@ export class IndexWorker {
   private async execute(job: JobRecord): Promise<void> {
     const { store, cipher, codeup, graph } = this.options;
     const repo = store.getRepository(job.repo_id);
-    if (!repo || repo.status === 'disabled' || repo.status === 'branch_deleted') {
+    if (!repo || repo.status === 'disabled') {
       store.updateJob(job.id, { status: 'failed', error: 'Repository unavailable' });
       return;
     }
@@ -121,7 +124,8 @@ export class IndexWorker {
         gitUsername: username, token, codegraphBin: this.options.codegraphBin,
       };
       const current = await (this.options.head ?? getRemoteHead)(request);
-      candidate = current === repo.commit && repo.path ? null : await (this.options.build ?? buildIndexCandidate)(request);
+      const healthy = current === repo.commit && repo.path && await (this.options.healthy ?? isPublishedIndexHealthy)(request, repo.path, current);
+      candidate = healthy ? null : await (this.options.build ?? buildIndexCandidate)(request);
       const publish = () => {
         store.transaction(() => {
           const latest = store.getRepository(repo.id);
@@ -146,6 +150,7 @@ export class IndexWorker {
         await explore(candidate!.path, 'repository overview');
         publish();
         published = true;
+        await pruneIndexVersions(this.options.dataDir, repo.id, [repo.path, candidate!.path]);
       });
       else publish();
     } catch (error) {
@@ -157,7 +162,9 @@ export class IndexWorker {
         const latest = store.getRepository(repo.id);
         if (latest && latest.status !== 'disabled' && latest.status !== 'branch_deleted') {
           const queued = store.listJobs(repo.id).some((entry) => entry.status === 'queued');
-          store.updateRepository(repo.id, { status: queued ? 'updating' : credentials ? 'credential_required' : latest.path ? 'stale' : 'failed', error: message });
+          const status = error instanceof IndexError && error.code === 'BRANCH_NOT_FOUND' ? 'branch_deleted'
+            : queued ? 'updating' : credentials ? 'credential_required' : latest.path ? 'stale' : 'failed';
+          store.updateRepository(repo.id, { status, error: message });
         }
       });
       const latest = store.getRepository(repo.id);

@@ -177,7 +177,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
         if (scope === 'write' && !config.writeUsers.includes(session.userId)) fail(403, 'FORBIDDEN');
         const seconds = input.expires_in === undefined ? 30 * 86400 : Number(input.expires_in);
         if (!Number.isInteger(seconds) || seconds < 60 || seconds > 90 * 86400) fail(400, 'INVALID_ARGUMENT');
-        sessions.delete(hash);
+        if (sessions.get(hash) !== session || session.expires <= Date.now() || !sessions.delete(hash)) fail(401, 'UNAUTHENTICATED');
         const key = createAccessKey();
         store.createKey({ ...key, owner: session.userId, scope, repos: null, expires_at: Date.now() + seconds * 1000, revoked: 0 });
         return response(res, 201, { token: key.token, prefix: key.prefix, scope, expires_in: seconds });
@@ -194,6 +194,14 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
         return response(res, 202, { accepted: true });
       }
       const key = await authenticate(req); if (!key) fail(401, 'UNAUTHENTICATED');
+      const activeKey: Principal = key;
+      const credentialVersion = store.getUser(key.owner)!.credential_version;
+      function assertActiveWrite() {
+        const current = store.getKey(activeKey.hash);
+        if (!current || current.revoked || (current.expires_at !== null && current.expires_at <= Date.now()) ||
+            store.getUser(activeKey.owner)?.credential_version !== credentialVersion) fail(401, 'UNAUTHENTICATED');
+        requireWrite(current);
+      }
       if (url.pathname === '/api/v1/me' && method === 'GET') {
         const user = store.getUser(key.owner)!;
         return response(res, 200, { id: user.id, username: user.username, key_scope: key.scope });
@@ -206,19 +214,23 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
         let result;
         try { result = await codeup.listRepositories(cipher.decrypt(user.credential, user.id), page, 100); }
         catch (error) { if (error instanceof CodeupError && error.kind === 'invalid_credential' && store.getUser(user.id)?.credential_version === user.credential_version) store.revokeUserKeys(user.id); throw error; }
-        if (store.getUser(user.id)?.credential_version !== user.credential_version || store.getKey(key.hash)?.revoked !== 0) fail(401, 'UNAUTHENTICATED');
+        const currentKey = store.getKey(key.hash);
+        if (store.getUser(user.id)?.credential_version !== user.credential_version || !currentKey || currentKey.revoked ||
+            (currentKey.expires_at !== null && currentKey.expires_at <= Date.now())) fail(401, 'UNAUTHENTICATED');
         return response(res, 200, { repositories: result.repositories.map(({ id, name, path, accessLevel }) => ({ id, name, path, access_level: accessLevel })), next_page: result.nextPage });
       }
       if (url.pathname === '/api/v1/repositories' && method === 'GET') return response(res, 200, { repositories: (await listVisible(key)).map(publicRepo) });
       if (url.pathname === '/api/v1/repositories' && method === 'POST') {
         requireWrite(key);
         const input = await body(req); only(input, ['codeup_repository_id', 'branch', 'authorize_automatic_sync']);
+        assertActiveWrite();
         const codeupId = text(String(input.codeup_repository_id ?? ''), 30);
         if (!/^\d+$/.test(codeupId) || input.authorize_automatic_sync !== true) fail(400, 'INVALID_ARGUMENT');
         const branch = text(input.branch ?? 'main', 255);
         if (branch.startsWith('-') || branch.includes('..') || branch.includes('\\') || branch.includes('@{') || /[ ~^:?*\[]/.test(branch)) fail(400, 'INVALID_ARGUMENT');
         const user = store.getUser(key.owner)!; const pat = cipher.decrypt(user.credential, user.id);
         const remote = await codeup.getRepository(pat, codeupId);
+        assertActiveWrite();
         if (!hasRepositoryRole(remote) || !remote.httpUrlToRepo) fail(404, 'NOT_FOUND');
         const exists = store.getRepositoryByCodeupId(codeupId);
         if (exists) { if (!(await authorize(key, exists))) fail(404, 'NOT_FOUND'); return response(res, 200, { repository: publicRepo(exists) }); }
@@ -234,12 +246,13 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
       if (repoRoute) {
         const repo = await visible(key, repoRoute[1]);
         if (!repoRoute[2] && method === 'GET') return response(res, 200, publicRepo(repo));
-        if (repoRoute[2] === 'sync' && method === 'POST') { requireWrite(key); const job = worker.enqueue(repo.id, 'manual'); return response(res, 202, { job_id: job.id }); }
+        if (repoRoute[2] === 'sync' && method === 'POST') { assertActiveWrite(); const job = worker.enqueue(repo.id, 'manual'); return response(res, 202, { job_id: job.id }); }
         if (repoRoute[2] === 'sync-credential' && method === 'PUT') {
           requireWrite(key);
           if (repo.owner !== key.owner && repo.sync_owner !== key.owner) fail(404, 'NOT_FOUND');
           const input = await body(req); only(input, ['authorize_automatic_sync']);
           if (input.authorize_automatic_sync !== true) fail(400, 'INVALID_ARGUMENT');
+          assertActiveWrite();
           const user = store.getUser(key.owner)!;
           store.updateRepository(repo.id, { sync_owner: user.id, sync_credential_version: user.credential_version });
           const job = worker.enqueue(repo.id, 'credential_changed');
@@ -257,6 +270,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
       }
       if (url.pathname === '/api/v1/api-keys' && method === 'POST') {
         requireWrite(key); const input = await body(req); only(input, ['scope', 'repos', 'expires_in']);
+        assertActiveWrite();
         const scope = input.scope === 'read' || input.scope === 'write' ? input.scope : fail(400, 'INVALID_ARGUMENT');
         const repos = input.repos === null || input.repos === undefined ? null : input.repos;
         if (repos !== null && (!Array.isArray(repos) || repos.length > 100 || !repos.every(r => typeof r === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(r)))) fail(400, 'INVALID_ARGUMENT');
@@ -271,7 +285,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
       }
       const keyRoute = /^\/api\/v1\/api-keys\/(ch_[A-Za-z0-9_-]{8})$/.exec(url.pathname);
       if (keyRoute && method === 'DELETE') {
-        requireWrite(key); const target = store.listKeys(key.owner).find(k => k.prefix === keyRoute[1]);
+        assertActiveWrite(); const target = store.listKeys(key.owner).find(k => k.prefix === keyRoute[1]);
         if (!target || (key.repos !== null && target.hash !== key.hash)) fail(404, 'NOT_FOUND');
         store.revokeKey(target.hash); return response(res, 200, { revoked: true });
       }
