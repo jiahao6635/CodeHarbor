@@ -35,7 +35,6 @@ test('Codeup requests use authenticated API and validate response and pagination
     if (url.pathname === '/oapi/v1/platform/user') return Response.json({ id: 'user-1', username: 'alice', name: 'Alice' });
     if (url.pathname.endsWith('/repositories/7')) return Response.json({ id: 7, name: 'test', accessLevel: 30, httpUrlToRepo: 'https://git.example/test.git', enableCloneDownloadControl: false, openCloneDownloadControl: false });
     if (url.pathname.endsWith('/repositories')) return Response.json([{ id: 7, name: 'test', accessLevel: 30 }], { headers: { 'x-next-page': '2' } });
-    if (url.pathname.endsWith('/httpsCloneUsername')) return Response.json({ httpsCloneUsername: 'clone-alice' });
     return new Response(null, { status: 404 });
   };
   const api = new CodeupClient({ endpoint: 'https://devops.example', organizationId: 'org-1', fetch: fakeFetch });
@@ -48,7 +47,6 @@ test('Codeup requests use authenticated API and validate response and pagination
   assert.equal(hasRepositoryRole({ ...repo, cloneDownloadRestricted: true }), false);
   assert.equal(hasRepositoryRole({ ...repo, cloneDownloadRestricted: undefined }), false);
   assert.equal(hasRepositoryRole({ ...repo, accessLevel: null }), false);
-  assert.equal(await api.getCloneUsername('secret', 'user-1'), 'clone-alice');
   assert.ok(calls[0].options.headers['x-yunxiao-token'] === 'secret');
   assert.ok(calls.every((call) => call.options.redirect === 'error'));
   assert.ok(calls.some((call) => call.url.includes('/organizations/org-1/repositories/7')));

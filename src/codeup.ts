@@ -129,11 +129,4 @@ export class CodeupClient {
     return repo;
   }
 
-  async getCloneUsername(token: string, userId: string): Promise<string> {
-    if (!/^[A-Za-z0-9_-]+$/.test(userId)) throw new Error('Invalid user ID');
-    const { data } = await this.get(`${this.repositoryRoot}/users/${encodeURIComponent(userId)}/httpsCloneUsername`, token);
-    const result = record(data);
-    if (typeof result.httpsCloneUsername !== 'string' || !result.httpsCloneUsername) throw new CodeupError('invalid_response');
-    return result.httpsCloneUsername;
-  }
 }

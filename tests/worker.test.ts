@@ -27,11 +27,30 @@ function fixture() {
   store.createRepository({ id: 'repo_1', codeup_id: '123', name: 'repo', branch: 'main', owner: 'user', sync_owner: 'user', sync_credential_version: 1, hook_hash: 'hash', path: null, commit: null, indexed_at: null, status: 'pending', error: null });
   const codeup = {
     getRepository: async () => ({ id: '123', name: 'repo', path: 'repo', accessLevel: 30, cloneDownloadRestricted: false, httpUrlToRepo: 'https://git.example.com/repo' }),
-    getCloneUsername: async () => 'user',
   } as unknown as CodeupClient;
   const graph = { withExclusive: async (fn: (explore: () => Promise<string>) => Promise<void>) => fn(async () => 'ok') } as unknown as CodeGraphClient;
   return { store, workerStore: new AsyncSqliteStore(store), cipher, codeup, graph };
 }
+
+test('uses the bound login username for Git PAT authentication', async () => {
+  const f = fixture();
+  f.store.updateUserCredential('user', 'login-name', f.cipher.encrypt('secret', 'user'));
+  f.store.updateRepository('repo_1', { sync_credential_version: 2 });
+  let gitUsername: string | undefined;
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+    head: async request => { gitUsername = request.gitUsername; return 'a'.repeat(40); },
+    build: async () => ({ path: '/candidate', commit: 'a'.repeat(40), generation: 'v1' }),
+  });
+  try {
+    const job = await worker.enqueue('repo_1', 'initial');
+    await worker.start();
+    await waitFor(() => f.store.getJob(job.id)?.status === 'succeeded');
+    assert.equal(gitUsername, 'login-name');
+  } finally {
+    await worker.stop();
+    f.store.close();
+  }
+});
 
 test('coalesces queued work while preserving events during a build', async () => {
   const f = fixture();
@@ -143,7 +162,6 @@ test('new PAT version requires explicit authorization before use for synchroniza
   let calls = 0;
   const codeup = {
     getRepository: async () => { calls++; return { id: '123', name: 'repo', path: 'repo', accessLevel: 30, cloneDownloadRestricted: false, httpUrlToRepo: 'https://git.example.com/repo' }; },
-    getCloneUsername: async () => 'user',
   } as unknown as CodeupClient;
   const worker = new IndexWorker({ ...f, store: f.workerStore, codeup, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
     head: async () => 'a'.repeat(40), build: async () => ({ path: '/candidate', commit: 'a'.repeat(40), generation: 'v1' }),

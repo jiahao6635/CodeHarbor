@@ -126,11 +126,10 @@ export class IndexWorker {
       const token = cipher.decrypt(user.credential, user.id);
       const source = await codeup.getRepository(token, repo.codeup_id);
       if (!hasRepositoryRole(source) || !source.httpUrlToRepo) throw new IndexError('CREDENTIAL_REQUIRED', 'Sync credential cannot read the repository');
-      const username = await codeup.getCloneUsername(token, user.id);
       const request: IndexRequest = {
         dataDir: this.options.dataDir, repositoryId: repo.id, branch: repo.branch,
         cloneUrl: source.httpUrlToRepo, allowedGitHosts: this.options.allowedGitHosts,
-        gitUsername: username, token, codegraphBin: this.options.codegraphBin,
+        gitUsername: user.username, token, codegraphBin: this.options.codegraphBin,
       };
       const current = await (this.options.head ?? getRemoteHead)(request);
       const healthy = current === repo.commit && repo.path && await (this.options.healthy ?? isPublishedIndexHealthy)(request, repo.path, current);
