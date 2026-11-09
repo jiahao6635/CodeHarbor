@@ -29,7 +29,7 @@ function fixture() {
     getRepository: async () => ({ id: '123', name: 'repo', path: 'repo', accessLevel: 30, cloneDownloadRestricted: false, httpUrlToRepo: 'https://git.example.com/repo' }),
   } as unknown as CodeupClient;
   const graph = { withExclusive: async (fn: (explore: () => Promise<string>) => Promise<void>) => fn(async () => 'ok') } as unknown as CodeGraphClient;
-  return { store, workerStore: new AsyncSqliteStore(store), cipher, codeup, graph };
+  return { store, workerStore: new AsyncSqliteStore(store), cipher, codeup, graph, probe: async () => true };
 }
 
 test('uses the bound login username for Git PAT authentication', async () => {
@@ -100,6 +100,21 @@ test('failed builds preserve the previous published index', async () => {
     await worker.stop();
     f.store.close();
   }
+});
+
+test('revoked clone permission after indexing blocks publication', async () => {
+  const f = fixture(); let probes = 0;
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+    probe: async request => { assert.equal(request.token, 'secret'); return ++probes === 1; },
+    head: async () => 'b'.repeat(40), build: async () => ({ path: '/candidate', commit: 'b'.repeat(40), generation: 'v1' }),
+  });
+  try {
+    const job = await worker.enqueue('repo_1', 'initial'); await worker.start();
+    await waitFor(() => f.store.getJob(job.id)?.status === 'failed');
+    assert.equal(probes, 2);
+    assert.equal(f.store.getRepository('repo_1')?.path, null);
+    assert.equal(f.store.getRepository('repo_1')?.status, 'credential_required');
+  } finally { await worker.stop(); f.store.close(); }
 });
 
 test('branch deletion prevents in-flight candidate publication and removes it', async () => {
@@ -176,7 +191,7 @@ test('new PAT version requires explicit authorization before use for synchroniza
     f.store.updateRepository('repo_1', { sync_credential_version: 2 });
     const retry = await worker.enqueue('repo_1', 'reauthorized');
     await waitFor(() => f.store.getJob(retry.id)?.status === 'succeeded');
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
     assert.equal(f.store.getRepository('repo_1')?.status, 'ready');
   } finally {
     await worker.stop();

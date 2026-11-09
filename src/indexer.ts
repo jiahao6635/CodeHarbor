@@ -32,7 +32,7 @@ export class IndexError extends Error {
   }
 }
 
-function validateRequest(request: IndexRequest): string {
+export function validateRequest(request: IndexRequest): string {
   if (!/^[a-zA-Z0-9_-]{1,128}$/.test(request.repositoryId)) {
     throw new IndexError('INVALID_REPOSITORY', 'Invalid repository ID');
   }

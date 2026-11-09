@@ -53,9 +53,9 @@ function repository(value: unknown): CodeupRepository {
   };
 }
 
-/** A detail response proves visibility, not necessarily permission to clone. */
+/** A detail response proves a repository role, not permission to clone. */
 export function hasRepositoryRole(repo: CodeupRepository): boolean {
-  return repo.accessLevel !== null && [20, 30, 40].includes(repo.accessLevel) && repo.cloneDownloadRestricted === false;
+  return repo.accessLevel !== null && [20, 30, 40].includes(repo.accessLevel);
 }
 
 export class CodeupClient {

@@ -8,6 +8,8 @@ import { AsyncSqliteStore, type StoreBackend } from './async-store.js';
 import { CodeGraphClient } from './codegraph.js';
 import { createMcpHandler, type McpRepository } from './mcp.js';
 import { IndexError, verifyPushWebhook } from './indexer.js';
+import { checkCloneAccess } from './clone-access.js';
+import type { IndexRequest } from './indexer.js';
 import { IndexWorker } from './worker.js';
 
 export interface AppConfig {
@@ -81,7 +83,7 @@ function publicRepo(repo: RepositoryRecord) {
 function errorResponse(res: ServerResponse, error: unknown) {
   if (res.headersSent) { res.end(); return; }
   if (error instanceof HttpError) return response(res, error.status, { error: error.code });
-  if (error instanceof IndexError) return response(res, 400, { error: 'INVALID_REQUEST' });
+  if (error instanceof IndexError) return response(res, ['AUTH_BUSY', 'AUTH_UNAVAILABLE'].includes(error.code) ? 503 : 400, { error: ['AUTH_BUSY', 'AUTH_UNAVAILABLE'].includes(error.code) ? 'AUTHORIZATION_UNAVAILABLE' : 'INVALID_REQUEST' });
   if (error instanceof CodeupError) {
     if (error.kind === 'invalid_credential') return response(res, 401, { error: 'INVALID_CREDENTIAL' });
     if (error.kind === 'forbidden' || error.kind === 'not_found') return response(res, 404, { error: 'NOT_FOUND' });
@@ -91,7 +93,7 @@ function errorResponse(res: ServerResponse, error: unknown) {
 }
 
 /** One instance only: the worker does not provide distributed coordination. */
-export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; graph?: CodeGraphClient; worker?: IndexWorker; store?: StoreBackend; audit?: (event: AuditEvent) => void } = {}) {
+export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; graph?: CodeGraphClient; worker?: IndexWorker; store?: StoreBackend; audit?: (event: AuditEvent) => void; probe?: (request: IndexRequest) => Promise<boolean> } = {}) {
   if (config.metricsToken !== undefined && (config.metricsToken.length < 32 || /[^\x21-\x7e]/.test(config.metricsToken))) throw new Error('Invalid metrics token');
   const store = deps.store ?? new AsyncSqliteStore(config.databasePath);
   const cipher = new CredentialCipher(config.credentialKey);
@@ -145,36 +147,47 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
   }
   function requireWrite(key: Principal) { if (key.scope !== 'write' || !config.writeUsers.includes(key.owner)) fail(403, 'FORBIDDEN'); }
   function keyAllows(key: Principal, repo: RepositoryRecord) { return key.repos === null || key.repos.includes(repo.id); }
-  async function authorize(key: Principal, repo: RepositoryRecord): Promise<boolean> {
-    if (!keyAllows(key, repo)) return false;
+  async function authorize(key: Principal, repo: RepositoryRecord): Promise<RepositoryRecord | null> {
+    if (!keyAllows(key, repo)) return null;
     const user = await store.getUser(key.owner);
-    if (!user) return false;
+    if (!user) return null;
     try {
-      const permitted = hasRepositoryRole(await codeup.getRepository(cipher.decrypt(user.credential, user.id), repo.codeup_id));
+      const token = cipher.decrypt(user.credential, user.id);
+      const source = await codeup.getRepository(token, repo.codeup_id);
+      const permitted = hasRepositoryRole(source) && !!source.httpUrlToRepo && await (deps.probe ?? checkCloneAccess)({
+        dataDir: config.dataDir, repositoryId: repo.id, branch: source.defaultBranch ?? repo.branch, cloneUrl: source.httpUrlToRepo,
+        allowedGitHosts: config.allowedGitHosts, gitUsername: user.username, token,
+      });
       return await mutate(async () => {
         const currentUser = await store.getUser(user.id); const currentKey = await store.getKey(key.hash);
-        return permitted && currentUser?.credential_version === user.credential_version && !!currentKey && !currentKey.revoked && (currentKey.expires_at === null || currentKey.expires_at > Date.now());
+        const latest = await store.getRepository(repo.id);
+        return permitted && currentUser?.credential_version === user.credential_version && !!currentKey && !currentKey.revoked &&
+          (currentKey.expires_at === null || currentKey.expires_at > Date.now()) && !!latest && latest.status !== 'disabled' &&
+          keyAllows(currentKey, latest) && latest.codeup_id === repo.codeup_id && latest.branch === repo.branch &&
+          latest.path === repo.path && latest.commit === repo.commit ? latest : null;
       });
     }
     catch (error) {
       if (error instanceof CodeupError && error.kind === 'invalid_credential') await mutate(async () => {
         if ((await store.getUser(user.id))?.credential_version === user.credential_version) await store.revokeUserKeys(user.id);
       });
-      if (error instanceof CodeupError && ['forbidden', 'not_found', 'invalid_credential'].includes(error.kind)) return false;
+      if (error instanceof CodeupError && ['forbidden', 'not_found', 'invalid_credential'].includes(error.kind)) return null;
       throw error;
     }
   }
   async function visible(key: Principal, id: string): Promise<RepositoryRecord> {
     const repo = await store.getRepository(id);
-    if (!repo || repo.status === 'disabled' || !(await authorize(key, repo))) fail(404, 'NOT_FOUND');
-    return repo;
+    if (!repo || repo.status === 'disabled') fail(404, 'NOT_FOUND');
+    const authorized = await authorize(key, repo);
+    if (!authorized) fail(404, 'NOT_FOUND');
+    return authorized;
   }
   async function listVisible(key: Principal): Promise<RepositoryRecord[]> {
     const initial = await store.getUser(key.owner);
     if (!initial) fail(401, 'UNAUTHENTICATED');
     const result: RepositoryRecord[] = [];
     for (const repo of await store.listRepositories()) {
-      if (repo.status !== 'disabled' && await authorize(key, repo)) result.push(repo);
+      if (repo.status !== 'disabled') { const authorized = await authorize(key, repo); if (authorized) result.push(authorized); }
     }
     return await mutate(async () => {
       const currentUser = await store.getUser(key.owner); const currentKey = await store.getKey(key.hash);
@@ -311,7 +324,10 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
         if (branch.startsWith('-') || branch.includes('..') || branch.includes('\\') || branch.includes('@{') || /[ ~^:?*\[]/.test(branch)) fail(400, 'INVALID_ARGUMENT');
         const user = (await store.getUser(key.owner))!; const pat = cipher.decrypt(user.credential, user.id);
         const remote = await codeup.getRepository(pat, codeupId);
-        if (!hasRepositoryRole(remote) || !remote.httpUrlToRepo) fail(404, 'NOT_FOUND');
+        if (!hasRepositoryRole(remote) || !remote.httpUrlToRepo || !(await (deps.probe ?? checkCloneAccess)({
+          dataDir: config.dataDir, repositoryId: codeupId, branch: remote.defaultBranch ?? branch, cloneUrl: remote.httpUrlToRepo,
+          allowedGitHosts: config.allowedGitHosts, gitUsername: user.username, token: pat,
+        }))) fail(404, 'NOT_FOUND');
         return await mutate(async () => {
           await assertActiveWrite();
           const exists = await store.getRepositoryByCodeupId(codeupId);

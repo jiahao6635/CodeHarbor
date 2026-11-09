@@ -44,7 +44,7 @@ test('real PostgreSQL-backed HTTP and MCP use case', { skip: !baseUrl, timeout: 
     app = createApp({ dataDir:dir, databasePath:join(dir,'unused.sqlite'), credentialKey:randomBytes(32),
       codeupEndpoint:'https://codeup.example', organizationId:'org', allowedGitHosts:['git.example'],
       allowedHosts, writeUsers:['alice'], codegraphBin:'codegraph' },
-      { store, codeup:codeup as never, graph:graph as never, worker:worker as never });
+      { store, codeup:codeup as never, graph:graph as never, worker:worker as never, probe:async () => true });
     await app.listen({port:0, host:'127.0.0.1'});
     const address = app.server.address(); assert.ok(address && typeof address === 'object');
     allowedHosts.push(`127.0.0.1:${address.port}`);

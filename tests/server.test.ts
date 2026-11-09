@@ -17,6 +17,10 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     'bob-pat': new Set(),
   };
   const revokedTokens = new Set<string>();
+  const deniedCloneTokens = new Set<string>();
+  const probeCalls: string[] = [];
+  let holdProbe: ((token: string) => Promise<void>) | undefined;
+  let duringExplore: (() => void) | undefined;
   let delayOldCredential: (() => Promise<void>) | undefined;
   let offline = false;
   const userFor = (token: string) => {
@@ -37,13 +41,13 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
       if (offline) throw new CodeupError('unavailable');
       if (!allowedByToken[token]?.has(id)) throw new CodeupError('not_found', 404);
       return { id, name: `repo-${id}`, path: `repo-${id}`, accessLevel: 30,
-        cloneDownloadRestricted: false, httpUrlToRepo: `https://git.example/${id}.git` };
+        cloneDownloadRestricted: true, httpUrlToRepo: `https://git.example/${id}.git` };
     },
   };
   const graphCalls: { path: string; query: string }[] = [];
   const fakeGraph = {
     async withQuery(fn: (explore: (path: string, query: string) => Promise<unknown>) => Promise<unknown>) {
-      return fn(async (path, query) => { graphCalls.push({ path, query }); return { result: 'matching code' }; });
+      return fn(async (path, query) => { graphCalls.push({ path, query }); duringExplore?.(); return { result: 'matching code' }; });
     },
     async probe() {},
     async close() {},
@@ -66,7 +70,9 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     codeupEndpoint: 'https://devops.example', organizationId: 'org', allowedGitHosts: ['git.example'],
     allowedHosts, writeUsers: ['alice'], codegraphBin: 'codegraph',
   };
-  app = createApp(config, { codeup: fakeCodeup as never, graph: fakeGraph as never, worker: fakeWorker as never, audit: event => audit.push(event) });
+  app = createApp(config, { codeup: fakeCodeup as never, graph: fakeGraph as never, worker: fakeWorker as never,
+    probe: async request => { probeCalls.push(request.token); await holdProbe?.(request.token); return !deniedCloneTokens.has(request.token); },
+    audit: event => audit.push(event) });
   await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
   assert.ok(address && typeof address === 'object');
@@ -129,6 +135,9 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
 
     assert.equal((await request('POST', '/api/v1/repositories', bob, { codeup_repository_id: '11', authorize_automatic_sync: true })).status, 403);
     assert.equal((await request('POST', '/api/v1/repositories', alice, { codeup_repository_id: '11' })).status, 400);
+    deniedCloneTokens.add('alice-pat');
+    assert.equal((await request('POST', '/api/v1/repositories', alice, { codeup_repository_id: '11', branch: 'main', authorize_automatic_sync: true })).status, 404);
+    deniedCloneTokens.delete('alice-pat');
     const created = await request('POST', '/api/v1/repositories', alice, { codeup_repository_id: '11', branch: 'main', authorize_automatic_sync: true });
     assert.equal(created.status, 202);
     assert.equal(kickCount, 1);
@@ -143,7 +152,21 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal(duplicate.body.repository.repo_id, repo);
 
     allowedByToken['bob-pat'].add('11');
+    deniedCloneTokens.add('bob-pat');
+    assert.equal((await request('GET', `/api/v1/repositories/${repo}`, bob)).status, 404);
+    deniedCloneTokens.delete('bob-pat');
     assert.equal((await request('GET', `/api/v1/repositories/${repo}`, bob)).status, 200);
+    assert.equal(probeCalls.at(-1), 'bob-pat');
+    let releaseRepoProbe!: () => void; let repoProbeStarted!: () => void;
+    const waitingRepoProbe = new Promise<void>(resolve => { repoProbeStarted = resolve; });
+    const blockedRepoProbe = new Promise<void>(resolve => { releaseRepoProbe = resolve; });
+    holdProbe = async token => { if (token === 'bob-pat') { repoProbeStarted(); await blockedRepoProbe; } };
+    const pendingRepo = request('GET', `/api/v1/repositories/${repo}`, bob);
+    await waitingRepoProbe;
+    await app.store.updateRepository(repo, { status: 'disabled' });
+    releaseRepoProbe(); holdProbe = undefined;
+    assert.equal((await pendingRepo).status, 404);
+    await app.store.updateRepository(repo, { status: 'pending' });
     assert.equal((await request('POST', `/api/v1/repositories/${repo}/sync`, bob)).status, 403);
     await app.store.updateRepository(repo, { path: '/private/index', commit: 'a'.repeat(40), indexed_at: Date.now(), status: 'ready' });
 
@@ -155,13 +178,17 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.match(JSON.stringify(found.body), /matching code/);
     assert.ok(!JSON.stringify(found.body).includes('/private/index'));
     assert.deepEqual(graphCalls, [{ path: '/private/index', query: 'order flow' }]);
+    duringExplore = () => { deniedCloneTokens.add('bob-pat'); };
+    const revokedDuringQuery = await mcp(bob, 'codegraph_explore', { repo_id: repo, query: 'revoked' });
+    assert.doesNotMatch(JSON.stringify(revokedDuringQuery.body), /matching code/);
+    duringExplore = undefined; deniedCloneTokens.delete('bob-pat');
     const injection = await mcp(bob, 'codegraph_explore', { repo_id: repo, query: 'x', projectPath: '/other' });
     assert.match(JSON.stringify(injection.body), /Invalid arguments/);
-    assert.equal(graphCalls.length, 1);
+    assert.equal(graphCalls.length, 2);
     allowedByToken['bob-pat'].delete('11');
     const denied = await mcp(bob, 'codegraph_explore', { repo_id: repo, query: 'x' });
     assert.match(JSON.stringify(denied.body), /Repository not found/);
-    assert.equal(graphCalls.length, 1);
+    assert.equal(graphCalls.length, 2);
     offline = true;
     assert.equal((await request('GET', `/api/v1/repositories/${repo}`, alice)).status, 503);
     offline = false;
@@ -171,7 +198,15 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     const scoped = await request('POST', '/api/v1/api-keys', alice, { scope: 'read', repos: [repo], expires_in: 3600 });
     assert.equal(scoped.status, 201);
     assert.equal((await request('GET', `/api/v1/repositories/${second.body.repository.repo_id}`, scoped.body.token)).status, 404);
+    let releaseProbe!: () => void; let probeStarted!: () => void;
+    const waitingProbe = new Promise<void>(resolve => { probeStarted = resolve; });
+    const blockedProbe = new Promise<void>(resolve => { releaseProbe = resolve; });
+    holdProbe = async token => { if (token === 'alice-pat') { probeStarted(); await blockedProbe; } };
+    const pending = request('GET', `/api/v1/repositories/${repo}`, scoped.body.token);
+    await waitingProbe;
     assert.equal((await request('DELETE', `/api/v1/api-keys/${scoped.body.prefix}`, alice)).status, 200);
+    releaseProbe(); holdProbe = undefined;
+    assert.equal((await pending).status, 404);
     assert.equal((await request('GET', `/api/v1/repositories/${repo}`, scoped.body.token)).status, 401);
 
     const payload = { object_kind: 'push', project_id: 11, ref: 'refs/heads/main', after: 'b'.repeat(40) };

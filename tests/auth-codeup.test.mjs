@@ -44,8 +44,8 @@ test('Codeup requests use authenticated API and validate response and pagination
   assert.equal(list.nextPage, 2);
   const repo = await api.getRepository('secret', '7');
   assert.equal(hasRepositoryRole(repo), true);
-  assert.equal(hasRepositoryRole({ ...repo, cloneDownloadRestricted: true }), false);
-  assert.equal(hasRepositoryRole({ ...repo, cloneDownloadRestricted: undefined }), false);
+  assert.equal(hasRepositoryRole({ ...repo, cloneDownloadRestricted: true }), true);
+  assert.equal(hasRepositoryRole({ ...repo, cloneDownloadRestricted: undefined }), true);
   assert.equal(hasRepositoryRole({ ...repo, accessLevel: null }), false);
   assert.ok(calls[0].options.headers['x-yunxiao-token'] === 'secret');
   assert.ok(calls.every((call) => call.options.redirect === 'error'));
@@ -54,10 +54,10 @@ test('Codeup requests use authenticated API and validate response and pagination
   assert.throws(() => new CodeupClient({ endpoint: 'http://devops.example' }), /HTTPS/);
 });
 
-test('either clone restriction, and missing restriction flags, deny access', async () => {
+test('a repository role alone does not interpret the clone control switch as permission', async () => {
   for (const [enabled, opened, allowed] of [
-    [false, false, true], [true, false, false], [false, true, false],
-    [true, true, false], [undefined, false, false], [false, undefined, false],
+    [false, false, true], [true, false, true], [false, true, true],
+    [true, true, true], [undefined, false, true], [false, undefined, true],
   ]) {
     const api = new CodeupClient({
       endpoint: 'https://devops.example',

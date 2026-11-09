@@ -5,6 +5,7 @@ import { CredentialCipher } from './auth.js';
 import { CodeupClient, CodeupError, hasRepositoryRole } from './codeup.js';
 import { CodeGraphClient } from './codegraph.js';
 import { buildIndexCandidate, getRemoteHead, isPublishedIndexHealthy, pruneIndexVersions, IndexError, type IndexCandidate, type IndexRequest } from './indexer.js';
+import { checkCloneAccess } from './clone-access.js';
 import type { JobRecord } from './store.js';
 import type { StoreBackend } from './async-store.js';
 
@@ -21,6 +22,7 @@ export type WorkerOptions = {
   build?: (request: IndexRequest) => Promise<IndexCandidate>;
   head?: (request: IndexRequest) => Promise<string>;
   healthy?: (request: IndexRequest, worktree: string, commit: string) => Promise<boolean>;
+  probe?: (request: IndexRequest) => Promise<boolean>;
 };
 
 /** A single-process worker. Multi-process deployments require durable leases and fencing. */
@@ -131,9 +133,15 @@ export class IndexWorker {
         cloneUrl: source.httpUrlToRepo, allowedGitHosts: this.options.allowedGitHosts,
         gitUsername: user.username, token, codegraphBin: this.options.codegraphBin,
       };
+      if (!(await (this.options.probe ?? checkCloneAccess)({ ...request, branch: source.defaultBranch ?? request.branch }))) throw new IndexError('CREDENTIAL_REQUIRED', 'Sync credential cannot clone the repository');
       const current = await (this.options.head ?? getRemoteHead)(request);
       const healthy = current === repo.commit && repo.path && await (this.options.healthy ?? isPublishedIndexHealthy)(request, repo.path, current);
       candidate = healthy ? null : await (this.options.build ?? buildIndexCandidate)(request);
+      const confirmed = await codeup.getRepository(token, repo.codeup_id);
+      if (!hasRepositoryRole(confirmed) || !confirmed.httpUrlToRepo || confirmed.httpUrlToRepo !== source.httpUrlToRepo ||
+          !(await (this.options.probe ?? checkCloneAccess)({ ...request, branch: confirmed.defaultBranch ?? request.branch }))) {
+        throw new IndexError('CREDENTIAL_REQUIRED', 'Sync credential cannot clone the repository');
+      }
       const publish = async () => {
         await store.transaction(async (tx) => {
           const latest = await tx.getRepository(repo.id);
