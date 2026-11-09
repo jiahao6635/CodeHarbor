@@ -113,12 +113,22 @@ export class CodeupClient {
   }
 
   async listRepositories(token: string, page = 1, perPage = 100): Promise<{ repositories: CodeupRepository[]; nextPage: number | null }> {
-    if (!Number.isInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 1 || perPage > 100) throw new Error('Invalid pagination');
+    if (!Number.isSafeInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 1 || perPage > 100) throw new Error('Invalid pagination');
     const { data, headers } = await this.get(`${this.repositoryRoot}/repositories?page=${page}&perPage=${perPage}`, token);
     if (!Array.isArray(data)) throw new CodeupError('invalid_response');
     const next = headers.get('x-next-page');
-    if (next && (!/^\d+$/.test(next) || Number(next) <= page)) throw new CodeupError('invalid_response');
-    return { repositories: data.map(repository), nextPage: next ? Number(next) : null };
+    const total = headers.get('x-total-pages');
+    if ((next && (!/^\d+$/.test(next) || !Number.isSafeInteger(Number(next)))) ||
+        (total && (!/^\d+$/.test(total) || !Number.isSafeInteger(Number(total))))) throw new CodeupError('invalid_response');
+    const nextPage = next ? Number(next) : null;
+    const totalPages = total ? Number(total) : null;
+    // Region can repeat the last page in x-next-page; total pages proves termination.
+    if (totalPages !== null && ((nextPage !== null && nextPage > page && nextPage !== page + 1) ||
+        (nextPage !== null && nextPage > totalPages) || (totalPages < page && data.length > 0) ||
+        (totalPages > page && (nextPage === null || nextPage <= page)) ||
+        (totalPages <= page && nextPage !== null && nextPage > page))) throw new CodeupError('invalid_response');
+    if (nextPage !== null && nextPage <= page && (totalPages === null || totalPages > page)) throw new CodeupError('invalid_response');
+    return { repositories: data.map(repository), nextPage: nextPage !== null && nextPage > page ? nextPage : null };
   }
 
   async getRepository(token: string, repoId: string): Promise<CodeupRepository> {

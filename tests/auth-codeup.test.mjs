@@ -68,6 +68,29 @@ test('either clone restriction, and missing restriction flags, deny access', asy
   }
 });
 
+test('repository pagination accepts a repeated last page only with a consistent total', async () => {
+  const make = (headers, records = [{ id: 7, name: 'test' }]) => new CodeupClient({
+    endpoint: 'https://devops.example', fetch: async () => Response.json(records, { headers }),
+  });
+  assert.equal((await make({ 'x-next-page': '2', 'x-total-pages': '2' }).listRepositories('secret', 1, 2)).nextPage, 2);
+  assert.equal((await make({ 'x-next-page': '2', 'x-total-pages': '2' }).listRepositories('secret', 2, 2)).nextPage, null);
+  assert.equal((await make({ 'x-next-page': '1', 'x-total-pages': '1' }).listRepositories('secret', 1, 100)).nextPage, null);
+  assert.equal((await make({ 'x-next-page': '2', 'x-total-pages': '2' }, []).listRepositories('secret', 3, 2)).nextPage, null);
+  assert.equal((await make({ 'x-next-page': '0', 'x-total-pages': '0' }, []).listRepositories('secret', 1)).nextPage, null);
+  for (const headers of [
+    { 'x-next-page': '1' },
+    { 'x-next-page': '0' },
+    { 'x-next-page': '0', 'x-total-pages': '2' },
+    { 'x-next-page': '1', 'x-total-pages': '2' },
+    { 'x-total-pages': '2' },
+    { 'x-next-page': '3', 'x-total-pages': '2' },
+    { 'x-next-page': '3', 'x-total-pages': '4' },
+    { 'x-next-page': '1', 'x-total-pages': 'invalid' },
+  ]) await assert.rejects(make(headers).listRepositories('secret', 1), error => error instanceof CodeupError && error.kind === 'invalid_response');
+  await assert.rejects(make({ 'x-next-page': '2', 'x-total-pages': '2' }).listRepositories('secret', 3), error => error instanceof CodeupError && error.kind === 'invalid_response');
+  await assert.rejects(make({ 'x-next-page': '0', 'x-total-pages': '0' }).listRepositories('secret', 1), error => error instanceof CodeupError && error.kind === 'invalid_response');
+});
+
 test('Codeup errors do not expose upstream details or token', async () => {
   const api = new CodeupClient({ endpoint: 'https://devops.example', fetch: async () => new Response('secret', { status: 401 }) });
   await assert.rejects(api.getUser('secret'), (error) => error instanceof CodeupError && error.kind === 'invalid_credential' && !error.message.includes('secret'));
