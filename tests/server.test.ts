@@ -116,6 +116,32 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal((await request('GET', '/health/ready')).status, 200);
     assert.equal((await request('GET', '/metrics')).status, 404);
     assert.equal((await request('GET', '/health/live', undefined, undefined, { origin: 'https://untrusted.example' })).status, 403);
+    const docs = await fetch(`${base}/docs/`);
+    assert.equal(docs.status, 200);
+    assert.match(docs.headers.get('content-security-policy') ?? '', /default-src 'self'/);
+    assert.match(await docs.text(), /swagger-ui/i);
+    assert.equal((await fetch(`${base}/docs`)).status, 200);
+    assert.equal((await fetch(`${base}/docs/static/swagger-ui-bundle.js`)).status, 200);
+    const initializer = await fetch(`${base}/docs/static/swagger-initializer.js`);
+    assert.equal(initializer.status, 200);
+    const initializerText = await initializer.text();
+    assert.match(initializerText, /persistAuthorization: false|"persistAuthorization":false/);
+    assert.match(initializerText, /validatorUrl: null|"validatorUrl":null/);
+    const openapi = await request('GET', '/openapi.json');
+    assert.equal(openapi.status, 200);
+    assert.match(openapi.body.openapi, /^3\./);
+    assert.ok(openapi.body.paths['/api/v1/repositories']);
+    assert.deepEqual((await request('GET', '/docs/json')).body, openapi.body);
+    for (const path of ['/docs/', '/docs/json', '/docs/static/swagger-ui-bundle.js', '/openapi.json']) {
+      const badHostStatus = await new Promise<number>((resolve, reject) => {
+        httpRequest(`${base}${path}`, { headers: { host: 'untrusted.example' } }, res => {
+          res.resume(); resolve(res.statusCode!);
+        }).on('error', reject).end();
+      });
+      assert.equal(badHostStatus, 403);
+      assert.equal((await fetch(`${base}${path}`, { headers: { origin: 'https://untrusted.example' } })).status, 403);
+    }
+    assert.equal((await request('GET', '/api/v1/me')).status, 401);
     assert.equal((await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'x'.repeat(70_000) })).status, 413);
     const invalid = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'wrong-secret' });
     assert.equal(invalid.status, 401);

@@ -47,6 +47,12 @@ npm run build
 
 本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者还检查数据库和上游 MCP 工具 schema。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 计数与延迟，不包含源码、仓库或用户标签；仅限内网采集。结构化 HTTP 和审计事件输出到 stdout，生产环境须配置访问受控的日志采集、留存和告警。
 
+## 接口文档
+
+服务启动后访问 `/docs` 查看 Swagger UI，或通过 `/openapi.json` 获取 OpenAPI 定义。页面使用服务本地提供的资源，管理接口可通过 **Authorize** 填写 CodeHarbor Key 后调试；具体权限仍由服务端检查，`write` 只允许平台管理及触发索引。建议继续使用交互式 CLI 绑定云效 PAT，避免在浏览器中输入或保存 PAT。新建的 Key、引导凭证和 Webhook Token 仅在创建时返回一次，须妥善保存。
+
+浏览器调用 API 时，须将页面实际的完整 Origin（例如 `https://codegraph.sigmob.com`）加入 `CODEHARBOR_ALLOWED_ORIGINS`，并确保 `CODEHARBOR_ALLOWED_HOSTS` 允许反向代理传递的 Host。文档页面和规范本身不要求登录；Host 白名单并非身份认证。生产环境应按企业策略在网关或网络层控制 `/docs`、`/docs/` 及其子路径和 `/openapi.json` 的访问，并只在可信浏览器中调试。文档中的健康检查和监控端点默认不经部署模板中的 Nginx 对外开放。
+
 ## 初次绑定与使用
 
 使用可信终端中的交互 CLI 绑定 PAT；不要将 PAT 写入命令参数、聊天消息或 shell 历史。令牌需要云效用户、仓库只读和 HTTPS Git 读取的必要权限，具体 scope 以企业云效版本为准：

@@ -1,5 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import Fastify, { LogController } from 'fastify';
+import swagger from '@fastify/swagger';
+import swaggerUi from '@fastify/swagger-ui';
 import { randomUUID } from 'node:crypto';
 import { CredentialCipher, createAccessKey, hashAccessKey, constantTimeEqual } from './auth.js';
 import { CodeupClient, CodeupError, hasRepositoryRole } from './codeup.js';
@@ -11,6 +13,7 @@ import { IndexError, verifyPushWebhook } from './indexer.js';
 import { checkCloneAccess } from './clone-access.js';
 import type { IndexRequest } from './indexer.js';
 import { IndexWorker } from './worker.js';
+import { openApiDocument } from './openapi.js';
 
 export interface AppConfig {
   dataDir: string;
@@ -421,9 +424,28 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
         try { deps.audit?.(event); } catch { /* An observer must not affect the response. */ }
       }
     });
+    // Documentation uses Fastify's normal response lifecycle; all other routes
+    // retain the original raw stream needed for MCP and early authentication.
+    const docsRoute = request.routeOptions.url === '/openapi.json' ||
+      request.routeOptions.url === '/docs' || request.routeOptions.url?.startsWith('/docs/');
+    if (docsRoute) {
+      reply.header('x-request-id', randomUUID());
+      reply.header('x-content-type-options', 'nosniff');
+      if (!request.raw.headers.host || !config.allowedHosts.includes(request.raw.headers.host) ||
+          (request.raw.headers.origin && !config.allowedOrigins?.includes(request.raw.headers.origin))) {
+        reply.code(403).header('cache-control', 'no-store').send({ error: 'FORBIDDEN' });
+      }
+      return;
+    }
     // MCP needs the original HTTP stream, and authorization must be captured before a slow body arrives.
     reply.hijack();
     await handle(request.raw, reply.raw);
+  });
+  fastify.register(swagger, { mode: 'static', specification: { document: openApiDocument } });
+  fastify.register(swaggerUi, { routePrefix: '/docs', staticCSP: true,
+    uiConfig: { docExpansion: 'list', persistAuthorization: false, validatorUrl: null } });
+  fastify.get('/openapi.json', async (_request, reply) => {
+    return reply.header('cache-control', 'no-store').send(openApiDocument);
   });
   const paths = ['/health/live', '/health/ready', '/metrics', '/mcp', '/api/v1/auth/yunxiao/bind',
     '/api/v1/auth/bootstrap/keys', '/api/v1/hooks/codeup/:id', '/api/v1/me',
