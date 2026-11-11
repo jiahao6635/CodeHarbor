@@ -9,6 +9,7 @@ CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库
 - Codeup Push Webhook、手动同步和 15 分钟对账；保留上次成功索引，报告 commit 和新鲜度。
 - 单个 `/mcp` 地址，提供 `list_repositories`、`get_repository_status`、`codegraph_explore`；每次调用按用户云效权限及 Key 仓库范围鉴权。
 - `write` Key 仅允许平台管理及触发索引，不能写云效代码。
+- 可选择仓库镜像后端：每个仓库的源码快照和索引打包为本机 Docker 镜像，查询容器使用经过适配的只读 CodeGraph；配置和迁移边界见 [镜像后端指南](docs/image-backend.md)。
 
 **使用边界**：此版本在生产模式使用 PostgreSQL 和 Vault Transit；仍是单进程 Worker，不支持多副本或跨进程租约与 fencing。它尚未通过真实云效账号和企业权限策略联调；部署前需验证云效身份、克隆/下载管控、继承权限和浏览者实际代码访问权。未经这些验证不要用于生产多租户环境。Index Worker 和共享 CodeGraph 进程还需要部署级文件系统及网络隔离；源码和索引须按源码等级保护。发布后保留当前及上一个受管理的索引版本；未知或无所有权标记的旧目录不会自动删除。
 
@@ -45,7 +46,7 @@ npm run build
 
 运行 `npm start`。`NODE_ENV=production` 会强制要求 PostgreSQL 验证服务端证书和 Vault Transit，不能退回 SQLite/本地密钥。其他模式若不配置 PostgreSQL 则使用 SQLite。生产数据库连接应直连或使用 session pooling，不可使用事务池，因为实例互斥锁依赖持续的数据库会话；会话断开后拒绝读写，需由 supervisor 重启。业务进程与 Worker 同实例运行，仍不能横向扩容。
 
-本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者还检查数据库和上游 MCP 工具 schema。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 计数与延迟，不包含源码、仓库或用户标签；仅限内网采集。结构化 HTTP 和审计事件输出到 stdout，生产环境须配置访问受控的日志采集、留存和告警。
+本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者检查数据库，工作树模式下检查上游 MCP 工具 schema，镜像模式下检查镜像调度控制器。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 计数与延迟，不包含源码、仓库或用户标签；仅限内网采集。结构化 HTTP 和审计事件输出到 stdout，生产环境须配置访问受控的日志采集、留存和告警。
 
 ## 接口文档
 

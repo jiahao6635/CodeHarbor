@@ -7,12 +7,13 @@ import { CredentialCipher, createAccessKey, hashAccessKey, constantTimeEqual } f
 import { CodeupClient, CodeupError, hasRepositoryRole } from './codeup.js';
 import type { KeyRecord, RepositoryRecord } from './store.js';
 import { AsyncSqliteStore, type StoreBackend } from './async-store.js';
-import { CodeGraphClient } from './codegraph.js';
+import { CodeGraphClient, type GraphClient } from './codegraph.js';
 import { createMcpHandler, type McpRepository } from './mcp.js';
 import { IndexError, verifyPushWebhook } from './indexer.js';
 import { checkCloneAccess } from './clone-access.js';
 import type { IndexRequest } from './indexer.js';
 import { IndexWorker } from './worker.js';
+import type { ImageIndexPipeline } from './image-indexer.js';
 import { openApiDocument } from './openapi.js';
 
 export interface AppConfig {
@@ -96,13 +97,14 @@ function errorResponse(res: ServerResponse, error: unknown) {
 }
 
 /** One instance only: the worker does not provide distributed coordination. */
-export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; graph?: CodeGraphClient; worker?: IndexWorker; store?: StoreBackend; audit?: (event: AuditEvent) => void; probe?: (request: IndexRequest) => Promise<boolean> } = {}) {
+export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; graph?: GraphClient; worker?: IndexWorker; imagePipeline?: ImageIndexPipeline; store?: StoreBackend; audit?: (event: AuditEvent) => void; probe?: (request: IndexRequest) => Promise<boolean> } = {}) {
   if (config.metricsToken !== undefined && (config.metricsToken.length < 32 || /[^\x21-\x7e]/.test(config.metricsToken))) throw new Error('Invalid metrics token');
   const store = deps.store ?? new AsyncSqliteStore(config.databasePath);
   const cipher = new CredentialCipher(config.credentialKey);
   const codeup = deps.codeup ?? new CodeupClient({ endpoint: config.codeupEndpoint, organizationId: config.organizationId });
   const graph = deps.graph ?? new CodeGraphClient(config.codegraphBin, config.dataDir);
-  const worker = deps.worker ?? new IndexWorker({ store, codeup, cipher, graph, dataDir: config.dataDir, allowedGitHosts: config.allowedGitHosts, codegraphBin: config.codegraphBin, reconcileIntervalMs: config.reconcileMs });
+  const worker = deps.worker ?? new IndexWorker({ store, codeup, cipher, graph, dataDir: config.dataDir, allowedGitHosts: config.allowedGitHosts, codegraphBin: config.codegraphBin, reconcileIntervalMs: config.reconcileMs,
+    ...(deps.imagePipeline ? { build: (request: IndexRequest) => deps.imagePipeline!.build(request), healthy: (request: IndexRequest, reference: string, commit: string) => deps.imagePipeline!.healthy(request, reference, commit), releaseCandidate: (candidate: { path: string }) => deps.imagePipeline!.release(candidate.path) } : {}) });
   const sessions = new Map<string, { userId: string; expires: number }>();
   const attempts = new Map<string, { count: number; until: number }>();
   const actors = new WeakMap<IncomingMessage, Pick<AuditEvent, 'subject' | 'key_prefix' | 'authentication' | 'repo_id' | 'tool' | 'tool_outcome'>>();

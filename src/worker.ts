@@ -3,7 +3,7 @@ import { rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { CredentialCipher } from './auth.js';
 import { CodeupClient, CodeupError, hasRepositoryRole } from './codeup.js';
-import { CodeGraphClient } from './codegraph.js';
+import type { GraphClient } from './codegraph.js';
 import { buildIndexCandidate, getRemoteHead, isPublishedIndexHealthy, pruneIndexVersions, IndexError, type IndexCandidate, type IndexRequest } from './indexer.js';
 import { checkCloneAccess } from './clone-access.js';
 import type { JobRecord } from './store.js';
@@ -13,7 +13,7 @@ export type WorkerOptions = {
   store: StoreBackend;
   codeup: CodeupClient;
   cipher: CredentialCipher;
-  graph: CodeGraphClient;
+  graph: GraphClient;
   dataDir: string;
   allowedGitHosts: string[];
   codegraphBin?: string;
@@ -22,6 +22,7 @@ export type WorkerOptions = {
   build?: (request: IndexRequest) => Promise<IndexCandidate>;
   head?: (request: IndexRequest) => Promise<string>;
   healthy?: (request: IndexRequest, worktree: string, commit: string) => Promise<boolean>;
+  releaseCandidate?: (candidate: IndexCandidate) => void;
   probe?: (request: IndexRequest) => Promise<boolean>;
 };
 
@@ -137,6 +138,10 @@ export class IndexWorker {
       const current = await (this.options.head ?? getRemoteHead)(request);
       const healthy = current === repo.commit && repo.path && await (this.options.healthy ?? isPublishedIndexHealthy)(request, repo.path, current);
       candidate = healthy ? null : await (this.options.build ?? buildIndexCandidate)(request);
+      // Image packaging can take time after indexing; never publish an older branch head.
+      if (candidate && await (this.options.head ?? getRemoteHead)(request) !== candidate.commit) {
+        throw new IndexError('REMOTE_CHANGED', 'Remote branch changed during indexing');
+      }
       const confirmed = await codeup.getRepository(token, repo.codeup_id);
       if (!hasRepositoryRole(confirmed) || !confirmed.httpUrlToRepo || confirmed.httpUrlToRepo !== source.httpUrlToRepo ||
           !(await (this.options.probe ?? checkCloneAccess)({ ...request, branch: confirmed.defaultBranch ?? request.branch }))) {
@@ -154,8 +159,13 @@ export class IndexWorker {
               latestUser.credential_version !== user.credential_version || (await tx.getJob(job.id))?.status !== 'running') {
             throw new IndexError('SUPERSEDED', 'Repository configuration changed during indexing');
           }
+          const imageCandidate = !!candidate && /^oci:\/\/sha256:[a-f0-9]{64}$/.test(candidate.path);
+          const priorImage = !!latest.path && /^oci:\/\/sha256:[a-f0-9]{64}$/.test(latest.path) &&
+            !!latest.commit && /^[a-f0-9]{40,64}$/.test(latest.commit);
           await tx.updateRepository(repo.id, {
             ...(candidate ? { path: candidate.path, commit: candidate.commit, indexed_at: Date.now() } : {}),
+            ...(imageCandidate && (candidate!.path !== latest.path || candidate!.commit !== latest.commit)
+              ? { previous_image: priorImage ? latest.path : null, previous_commit: priorImage ? latest.commit : null } : {}),
             status: (await tx.listJobs(repo.id)).some((entry) => entry.status === 'queued') ? 'updating' : 'ready',
             error: null,
           });
@@ -163,10 +173,14 @@ export class IndexWorker {
         });
       };
       if (candidate) await graph.withExclusive(async (explore) => {
-        await explore(candidate!.path, 'repository overview');
+        await explore(candidate!.path, 'repository overview', undefined, { repoId: repo.id, commit: candidate!.commit });
+        if (await (this.options.head ?? getRemoteHead)(request) !== candidate!.commit) {
+          throw new IndexError('REMOTE_CHANGED', 'Remote branch changed during indexing');
+        }
         await publish();
         published = true;
-        await pruneIndexVersions(this.options.dataDir, repo.id, [repo.path, candidate!.path]);
+        // Image publication must preserve any existing checkout for migration rollback.
+        if (!candidate!.path.startsWith('oci://')) await pruneIndexVersions(this.options.dataDir, repo.id, [repo.path, candidate!.path]);
       });
       else await publish();
     } catch (error) {
@@ -188,6 +202,7 @@ export class IndexWorker {
         await this.enqueue(repo.id, 'branch_changed');
       }
     } finally {
+      if (candidate) this.options.releaseCandidate?.(candidate);
       // Only remove a path constructed for this repository and this generation.
       if (candidate && !published && /^[0-9a-f-]{36}$/.test(candidate.generation)) {
         const expected = resolve(this.options.dataDir, 'repositories', repo.id, 'versions', candidate.generation, 'worktree');

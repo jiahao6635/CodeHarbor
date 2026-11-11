@@ -16,7 +16,7 @@ const keyRow = (row?: Row): KeyRecord | undefined => {
 };
 const repoRow = (row?: Row): RepositoryRecord | undefined => row ? ({ ...row, sync_credential_version: Number(row.sync_credential_version), indexed_at: numberOrNull(row.indexed_at) } as RepositoryRecord) : undefined;
 const jobRow = (row?: Row): JobRecord | undefined => row ? ({ ...row, created_at: Number(row.created_at) } as JobRecord) : undefined;
-const repoFields = 'id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", indexed_at, status, error';
+const repoFields = 'id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", previous_image, previous_commit, indexed_at, status, error';
 
 function access(client: pg.Client, run: Run): StoreAccess {
   const q = (sql: string, params: unknown[] = []) => client.query(sql, params);
@@ -29,12 +29,12 @@ function access(client: pg.Client, run: Run): StoreAccess {
     listKeys: owner => run(async () => (await q('SELECT * FROM keys WHERE owner=$1 ORDER BY prefix', [owner])).rows.map(keyRow) as KeyRecord[]),
     revokeKey: hash => run(async () => { await q('UPDATE keys SET revoked=1 WHERE hash=$1', [hash]); }),
     revokeUserKeys: owner => run(async () => { await q('UPDATE keys SET revoked=1 WHERE owner=$1', [owner]); }),
-    createRepository: repo => run(async () => { await q('INSERT INTO repositories(id,codeup_id,name,branch,owner,sync_owner,sync_credential_version,hook_hash,path,commit_sha,indexed_at,status,error) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)', [repo.id,repo.codeup_id,repo.name,repo.branch,repo.owner,repo.sync_owner,repo.sync_credential_version,repo.hook_hash,repo.path,repo.commit,repo.indexed_at,repo.status,repo.error]); }),
+    createRepository: repo => run(async () => { await q('INSERT INTO repositories(id,codeup_id,name,branch,owner,sync_owner,sync_credential_version,hook_hash,path,commit_sha,previous_image,previous_commit,indexed_at,status,error) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)', [repo.id,repo.codeup_id,repo.name,repo.branch,repo.owner,repo.sync_owner,repo.sync_credential_version,repo.hook_hash,repo.path,repo.commit,repo.previous_image ?? null,repo.previous_commit ?? null,repo.indexed_at,repo.status,repo.error]); }),
     getRepository: id => run(async () => repoRow((await q(`SELECT ${repoFields} FROM repositories WHERE id=$1`, [id])).rows[0])),
     getRepositoryByCodeupId: id => run(async () => repoRow((await q(`SELECT ${repoFields} FROM repositories WHERE codeup_id=$1`, [id])).rows[0])),
     listRepositories: () => run(async () => (await q(`SELECT ${repoFields} FROM repositories ORDER BY id`)).rows.map(repoRow) as RepositoryRecord[]),
     updateRepository: (id, patch) => run(async () => {
-      const columns: Record<string, string> = { name:'name',branch:'branch',owner:'owner',sync_owner:'sync_owner',sync_credential_version:'sync_credential_version',hook_hash:'hook_hash',path:'path',commit:'commit_sha',indexed_at:'indexed_at',status:'status',error:'error' };
+      const columns: Record<string, string> = { name:'name',branch:'branch',owner:'owner',sync_owner:'sync_owner',sync_credential_version:'sync_credential_version',hook_hash:'hook_hash',path:'path',commit:'commit_sha',previous_image:'previous_image',previous_commit:'previous_commit',indexed_at:'indexed_at',status:'status',error:'error' };
       const entries = Object.entries(patch).filter(([key,value]) => Object.hasOwn(columns,key) && value !== undefined);
       if (entries.length) await q(`UPDATE repositories SET ${entries.map(([key], i) => `${columns[key]}=$${i+1}`).join(',')} WHERE id=$${entries.length+1}`, [...entries.map(([,v]) => v),id]);
     }),
@@ -54,7 +54,9 @@ const schema = `
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT NOT NULL, credential TEXT NOT NULL, credential_version INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS keys(hash TEXT PRIMARY KEY, prefix TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), scope TEXT NOT NULL CHECK(scope IN ('read','write')), repos TEXT NOT NULL, expires_at BIGINT, revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)));
 CREATE INDEX IF NOT EXISTS keys_owner_idx ON keys(owner);
-CREATE TABLE IF NOT EXISTS repositories(id TEXT PRIMARY KEY, codeup_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, branch TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), sync_owner TEXT NOT NULL REFERENCES users(id), sync_credential_version INTEGER NOT NULL DEFAULT 0 CHECK(sync_credential_version >= 0), hook_hash TEXT NOT NULL, path TEXT, commit_sha TEXT, indexed_at BIGINT, status TEXT NOT NULL, error TEXT);
+CREATE TABLE IF NOT EXISTS repositories(id TEXT PRIMARY KEY, codeup_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, branch TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), sync_owner TEXT NOT NULL REFERENCES users(id), sync_credential_version INTEGER NOT NULL DEFAULT 0 CHECK(sync_credential_version >= 0), hook_hash TEXT NOT NULL, path TEXT, commit_sha TEXT, previous_image TEXT, previous_commit TEXT, indexed_at BIGINT, status TEXT NOT NULL, error TEXT);
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS previous_image TEXT;
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS previous_commit TEXT;
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed')), reason TEXT NOT NULL, created_at BIGINT NOT NULL, error TEXT);
 CREATE INDEX IF NOT EXISTS jobs_queue_idx ON jobs(status,created_at);
 `;
@@ -132,7 +134,9 @@ export class PostgresStore implements StoreBackend {
         const keys = source.prepare('SELECT * FROM keys').all() as unknown as Array<Omit<KeyRecord, 'repos'> & { repos: string }>;
         const columns = source.prepare('PRAGMA table_info(repositories)').all();
         const version = columns.some(col => col.name === 'sync_credential_version') ? 'sync_credential_version' : '0 AS sync_credential_version';
-        const repositories = source.prepare(`SELECT id,codeup_id,name,branch,owner,sync_owner,${version},hook_hash,path,commit_sha AS "commit",indexed_at,status,error FROM repositories`).all() as RepositoryRecord[];
+        const previousImage = columns.some(col => col.name === 'previous_image') ? 'previous_image' : 'NULL AS previous_image';
+        const previousCommit = columns.some(col => col.name === 'previous_commit') ? 'previous_commit' : 'NULL AS previous_commit';
+        const repositories = source.prepare(`SELECT id,codeup_id,name,branch,owner,sync_owner,${version},hook_hash,path,commit_sha AS "commit",${previousImage},${previousCommit},indexed_at,status,error FROM repositories`).all() as RepositoryRecord[];
         const jobs = source.prepare('SELECT * FROM jobs').all() as JobRecord[];
         source.exec('COMMIT');
         await this.client.query('BEGIN');

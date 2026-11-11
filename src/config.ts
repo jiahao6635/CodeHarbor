@@ -8,6 +8,20 @@ export async function databaseUrl(env: NodeJS.ProcessEnv): Promise<string | unde
   catch { throw new Error('Database URL file is unavailable'); }
 }
 
+/** Repository image mode must never fall back to ephemeral application SQLite. */
+export function indexBackend(env: NodeJS.ProcessEnv, dbUrl: string | undefined): 'filesystem' | 'image' {
+  const backend = env.CODEHARBOR_INDEX_BACKEND ?? 'filesystem';
+  if (backend !== 'filesystem' && backend !== 'image') throw new Error('Invalid index backend');
+  if (backend === 'image') {
+    let parsed: URL;
+    try { parsed = new URL(dbUrl ?? ''); } catch { throw new Error('PostgreSQL is required for image backend'); }
+    if (!['postgres:', 'postgresql:'].includes(parsed.protocol) || !parsed.hostname || parsed.pathname.length < 2) {
+      throw new Error('PostgreSQL is required for image backend');
+    }
+  }
+  return backend;
+}
+
 export function validateDatabaseTls(env: NodeJS.ProcessEnv, dbUrl: string | undefined): void {
   if (env.NODE_ENV !== 'production') return;
   if (!dbUrl) throw new Error('PostgreSQL is required in production');

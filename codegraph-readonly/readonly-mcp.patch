@@ -1,0 +1,33 @@
+--- a/src/mcp/index.ts
++++ b/src/mcp/index.ts
+@@ -352,6 +352,9 @@
+ 
+     // The detached daemon process itself. Checked before the opt-out so the
+     // daemon honors the same env it was spawned with (it never sets NO_DAEMON).
++    if (process.env.CODEGRAPH_MCP_READ_ONLY === '1') {
++      return this.startDirect('CODEGRAPH_MCP_READ_ONLY set');
++    }
+     if (daemonInternalSet()) {
+       return this.startDaemonProcess();
+     }
+@@ -431,7 +434,8 @@
+ 
+     // #1740: refuse a second direct writer on an initialized project. Daemon
+     // mode multiplexes clients; direct mode is single-writer-per-project.
+-    const writerRoot = resolveDaemonRoot(this.projectPath);
++    const readOnly = process.env.CODEGRAPH_MCP_READ_ONLY === '1';
++    const writerRoot = readOnly ? null : resolveDaemonRoot(this.projectPath);
+     if (writerRoot) {
+       assertNoRebuild(writerRoot);
+       const writer = tryAcquireWriterLock(writerRoot, 'direct');
+@@ -443,7 +447,9 @@
+       this.writerLockRoot = writerRoot;
+     }
+ 
+-    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
++    this.engine = readOnly
++      ? new MCPEngine({ readOnly: true, watch: false })
++      : new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+     const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
+     this.session = new MCPSession(transport, this.engine, {
+       explicitProjectPath: this.projectPath,

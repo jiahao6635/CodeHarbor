@@ -3,7 +3,15 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { databaseUrl, validateDatabaseTls, validateProduction } from '../src/config.js';
+import { databaseUrl, indexBackend, validateDatabaseTls, validateProduction } from '../src/config.js';
+
+test('image storage never silently falls back to ephemeral SQLite', () => {
+  assert.equal(indexBackend({}, undefined), 'filesystem');
+  assert.throws(() => indexBackend({ CODEHARBOR_INDEX_BACKEND: 'image' }, undefined), /PostgreSQL/);
+  assert.throws(() => indexBackend({ CODEHARBOR_INDEX_BACKEND: 'image' }, 'sqlite:///tmp/db'), /PostgreSQL/);
+  assert.throws(() => indexBackend({ CODEHARBOR_INDEX_BACKEND: 'unknown' }, undefined), /backend/);
+  assert.equal(indexBackend({ CODEHARBOR_INDEX_BACKEND: 'image' }, 'postgresql://localhost/test'), 'image');
+});
 
 test('production requires PostgreSQL with verified TLS and Vault', () => {
   const env = { NODE_ENV: 'production', CODEHARBOR_KEY_PROVIDER: 'vault-transit' };

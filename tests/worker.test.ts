@@ -102,6 +102,91 @@ test('failed builds preserve the previous published index', async () => {
   }
 });
 
+test('image publication records the previously published image and commit atomically', async () => {
+  const f = fixture();
+  const previous = `oci://sha256:${'a'.repeat(64)}`;
+  const next = `oci://sha256:${'b'.repeat(64)}`;
+  const oldCommit = 'c'.repeat(40); const newCommit = 'd'.repeat(40);
+  f.store.updateRepository('repo_1', { path: previous, commit: oldCommit, status: 'ready' });
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts:['git.example.com'], reconcileIntervalMs:0,
+    head:async () => newCommit, build:async () => ({path:next, commit:newCommit, generation:'v1'}),
+  });
+  try {
+    const job = await worker.enqueue('repo_1', 'manual'); await worker.start();
+    await waitFor(() => f.store.getJob(job.id)?.status === 'succeeded');
+    const record = f.store.getRepository('repo_1')!;
+    assert.equal(record.path, next); assert.equal(record.commit, newCommit);
+    assert.equal(record.previous_image, previous); assert.equal(record.previous_commit, oldCommit);
+  } finally { await worker.stop(); f.store.close(); }
+});
+
+test('worktree migration is not recorded as a previous image and failed image updates retain history', async () => {
+  const f = fixture();
+  const next = `oci://sha256:${'b'.repeat(64)}`; const nextCommit = 'd'.repeat(40);
+  f.store.updateRepository('repo_1', { path:'/old/worktree', commit:'a'.repeat(40), status:'ready' });
+  let fail = false;
+  const worker = new IndexWorker({ ...f, store:f.workerStore, dataDir:'/unused', allowedGitHosts:['git.example.com'], reconcileIntervalMs:0,
+    head:async () => fail ? 'e'.repeat(40) : nextCommit,
+    build:async () => { if (fail) throw new Error('test failure'); return {path:next, commit:nextCommit, generation:'v1'}; },
+  });
+  try {
+    const initial = await worker.enqueue('repo_1', 'migration'); await worker.start();
+    await waitFor(() => f.store.getJob(initial.id)?.status === 'succeeded');
+    assert.equal(f.store.getRepository('repo_1')?.previous_image, null);
+    assert.equal(f.store.getRepository('repo_1')?.previous_commit, null);
+    const older = `oci://sha256:${'f'.repeat(64)}`; const olderCommit = '1'.repeat(40);
+    f.store.updateRepository('repo_1', {previous_image:older, previous_commit:olderCommit});
+    fail = true;
+    const failed = await worker.enqueue('repo_1', 'manual');
+    await waitFor(() => f.store.getJob(failed.id)?.status === 'failed');
+    const record = f.store.getRepository('repo_1')!;
+    assert.equal(record.path, next); assert.equal(record.commit, nextCommit);
+    assert.equal(record.previous_image, older); assert.equal(record.previous_commit, olderCommit);
+  } finally { await worker.stop(); f.store.close(); }
+});
+
+test('rebuilding the same image does not overwrite the prior version', async () => {
+  const f = fixture();
+  const current = `oci://sha256:${'b'.repeat(64)}`; const currentCommit = 'c'.repeat(40);
+  const previous = `oci://sha256:${'d'.repeat(64)}`; const previousCommit = 'e'.repeat(40);
+  f.store.updateRepository('repo_1', { path:current, commit:currentCommit, previous_image:previous, previous_commit:previousCommit, status:'ready' });
+  const worker = new IndexWorker({ ...f, store:f.workerStore, dataDir:'/unused', allowedGitHosts:['git.example.com'], reconcileIntervalMs:0,
+    head:async () => currentCommit, healthy:async () => false,
+    build:async () => ({path:current, commit:currentCommit, generation:'v1'}),
+  });
+  try {
+    const job = await worker.enqueue('repo_1', 'manual'); await worker.start();
+    await waitFor(() => f.store.getJob(job.id)?.status === 'succeeded');
+    const record = f.store.getRepository('repo_1')!;
+    assert.equal(record.previous_image, previous); assert.equal(record.previous_commit, previousCommit);
+  } finally { await worker.stop(); f.store.close(); }
+});
+
+test('a newer branch head during image construction prevents publishing the older image', async () => {
+  const f = fixture();
+  f.store.updateRepository('repo_1', { path: '/old', commit: 'a'.repeat(40), status: 'ready' });
+  let heads = 0;
+  let allowRetry!: () => void;
+  const retryBlocked = new Promise<void>(resolve => { allowRetry = resolve; });
+  let builds = 0;
+  const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,
+    head: async () => ++heads === 1 ? 'b'.repeat(40) : 'c'.repeat(40),
+    build: async () => {
+      if (++builds > 1) await retryBlocked;
+      return { path: `oci://sha256:${'d'.repeat(64)}`, commit: builds === 1 ? 'b'.repeat(40) : 'c'.repeat(40), generation: 'v1' };
+    },
+  });
+  try {
+    const job = await worker.enqueue('repo_1', 'manual');
+    await worker.start();
+    await waitFor(() => f.store.getJob(job.id)?.status === 'failed' && builds > 1);
+    assert.equal(f.store.getRepository('repo_1')?.path, '/old');
+    assert.equal(f.store.getRepository('repo_1')?.commit, 'a'.repeat(40));
+    allowRetry();
+    await waitFor(() => f.store.getRepository('repo_1')?.commit === 'c'.repeat(40));
+  } finally { allowRetry(); await worker.stop(); f.store.close(); }
+});
+
 test('revoked clone permission after indexing blocks publication', async () => {
   const f = fixture(); let probes = 0;
   const worker = new IndexWorker({ ...f, store: f.workerStore, dataDir: '/unused', allowedGitHosts: ['git.example.com'], reconcileIntervalMs: 0,

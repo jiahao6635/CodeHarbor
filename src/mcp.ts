@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import type { CodeGraphClient } from './codegraph.js';
+import type { GraphClient } from './codegraph.js';
 
 export interface McpRepository {
   id: string;
@@ -21,7 +21,7 @@ export interface McpDependencies<Principal> {
   listRepositories(principal: Principal): Promise<McpRepository[]>;
   /** Returns null both for an unknown repository and for one not authorized. */
   getRepository(principal: Principal, repoId: string): Promise<McpRepository | null>;
-  codegraph: CodeGraphClient;
+  codegraph: GraphClient;
   /** Exact browser origins allowed to use the endpoint. Non-browser clients can omit Origin. */
   allowedOrigins?: string[];
   /** Exact Host values accepted by the endpoint; configure behind a reverse proxy. */
@@ -143,7 +143,7 @@ export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
             if (!repo) return toolError('Repository not found');
             authorizedRepo = repo.id;
             if (!repo.projectPath || !repo.indexedCommit) return toolError('Repository index is not available');
-            const result = await explore(repo.projectPath, query, extra.signal);
+            const result = await explore(repo.projectPath, query, extra.signal, { repoId: repo.id, commit: repo.indexedCommit });
             const confirmed = await deps.authenticate(req);
             if (confirmed === null) return toolError('Authentication required');
             const currentRepo = await deps.getRepository(confirmed, repoId);

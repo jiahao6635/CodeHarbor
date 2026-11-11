@@ -4,9 +4,16 @@ import { resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { createApp } from './server.js';
 import { loadMasterKey } from './master-key.js';
-import { databaseUrl, validateProduction } from './config.js';
+import { databaseUrl, indexBackend as resolveIndexBackend, validateProduction } from './config.js';
 import { PostgresStore } from './postgres-store.js';
 import { AsyncSqliteStore } from './async-store.js';
+import { ImageCodeGraphClient } from './image-codegraph.js';
+import { SocketImageQueryBackend } from './image-runtime-socket.js';
+import { ImageIndexPipeline } from './image-indexer.js';
+import { SocketImageBuildExecutor } from './image-build-socket.js';
+import { buildRepositoryImage } from './image-builder.js';
+import { serveImageAuthorizer } from './image-authorizer.js';
+import { imageAuthorization } from './image-authorization.js';
 
 async function main() {
   const dataDir = resolve(process.env.CODEHARBOR_DATA_DIR ?? './data');
@@ -14,6 +21,7 @@ async function main() {
   if (!endpoint) throw new Error('YUNXIAO_ENDPOINT is required');
   const dbUrl = await databaseUrl(process.env);
   validateProduction(process.env, dbUrl);
+  const indexBackend = resolveIndexBackend(process.env, dbUrl);
   const key = await loadMasterKey();
   const metricsToken = process.env.CODEHARBOR_METRICS_TOKEN_FILE
     ? (await readFile(process.env.CODEHARBOR_METRICS_TOKEN_FILE, 'utf8')).trim() : undefined;
@@ -30,26 +38,58 @@ async function main() {
   const platformCodegraph = process.env.CODEGRAPH_BIN ?? require.resolve(`@colbymchenry/codegraph-${process.platform}-${process.arch}/bin/codegraph`);
   const store = dbUrl ? await PostgresStore.open(dbUrl) : new AsyncSqliteStore(resolve(dataDir, 'codeharbor.sqlite'));
   let app: ReturnType<typeof createApp> | undefined;
+  let authorizer: Awaited<ReturnType<typeof serveImageAuthorizer>> | undefined;
   try {
+    let graph: ImageCodeGraphClient | undefined;
+    let imagePipeline: ImageIndexPipeline | undefined;
+    if (indexBackend === 'image') {
+      const runtimeImage = process.env.CODEHARBOR_REPOSITORY_RUNTIME_IMAGE;
+      const querySocket = process.env.CODEHARBOR_IMAGE_QUERY_SOCKET;
+      const buildSocket = process.env.CODEHARBOR_IMAGE_BUILD_SOCKET;
+      const queryTokenFile = process.env.CODEHARBOR_IMAGE_QUERY_TOKEN_FILE;
+      const buildTokenFile = process.env.CODEHARBOR_IMAGE_BUILD_TOKEN_FILE;
+      const authSocket = process.env.CODEHARBOR_IMAGE_AUTH_SOCKET;
+      const authTokenFile = process.env.CODEHARBOR_IMAGE_AUTH_TOKEN_FILE;
+      if (!runtimeImage || !/^sha256:[a-f0-9]{64}$/.test(runtimeImage) || !querySocket || !buildSocket || !queryTokenFile || !buildTokenFile || !authSocket || !authTokenFile) {
+        throw new Error('Incomplete image backend configuration');
+      }
+      const [queryToken, buildToken, authToken] = await Promise.all([readFile(queryTokenFile, 'utf8'), readFile(buildTokenFile, 'utf8'), readFile(authTokenFile, 'utf8')]);
+      const runtimeId = runtimeImage as `sha256:${string}`;
+      graph = new ImageCodeGraphClient(new SocketImageQueryBackend(querySocket, queryToken.trim()));
+      const executor = new SocketImageBuildExecutor({ path: buildSocket, token: buildToken.trim(), runtimeImage: runtimeId });
+      imagePipeline = new ImageIndexPipeline(runtimeId, graph, undefined,
+        request => buildRepositoryImage(request, executor.execute));
+      authorizer = await serveImageAuthorizer({ path: authSocket, token: authToken.trim(), authorize: imageAuthorization(store, imagePipeline), socketMode: 0o660 });
+      await graph.probe();
+    }
     app = createApp({
       dataDir, databasePath: resolve(dataDir, 'codeharbor.sqlite'), credentialKey: key,
       codeupEndpoint: endpoint, organizationId: process.env.YUNXIAO_ORGANIZATION_ID || undefined,
       allowedGitHosts, allowedHosts, allowedOrigins: list(process.env.CODEHARBOR_ALLOWED_ORIGINS),
       writeUsers: list(process.env.CODEHARBOR_WRITE_USERS), codegraphBin: platformCodegraph, metricsToken,
-    }, { store });
+    }, { store, graph, imagePipeline });
     key.fill(0);
+    if (imagePipeline) {
+      // Legacy checkouts remain intact for rollback and are rebuilt as images.
+      for (const repository of await store.listRepositories()) {
+        if (repository.path && !repository.path.startsWith('oci://') && !['disabled', 'branch_deleted'].includes(repository.status)) {
+          await app.worker.enqueue(repository.id, 'image_migration');
+        }
+      }
+    }
     await app.start();
     await app.listen({ port, host });
   } catch (error) {
     key.fill(0);
     if (app) await app.close().catch(() => {}); else await store.close().catch(() => {});
+    await authorizer?.close().catch(() => {});
     throw error;
   }
   const runningApp = app;
   let stopping = false;
   async function shutdown() {
     if (stopping) return; stopping = true;
-    try { await runningApp.close(); process.exitCode = 0; } catch { process.exitCode = 1; }
+    try { await runningApp.close(); await authorizer?.close(); process.exitCode = 0; } catch { process.exitCode = 1; }
   }
   process.on('SIGINT', () => { void shutdown(); });
   process.on('SIGTERM', () => { void shutdown(); });

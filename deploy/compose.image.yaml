@@ -1,0 +1,93 @@
+# Compose 2.24.4+ is required for !override. Prepare the protected host
+# directories and token files first; see docs/image-deployment.md.
+services:
+  codeharbor:
+    environment:
+      CODEHARBOR_INDEX_BACKEND: image
+      TMPDIR: /data
+      CODEHARBOR_REPOSITORY_RUNTIME_IMAGE: ${CODEHARBOR_REPOSITORY_RUNTIME_IMAGE:?set immutable local runtime image ID}
+      CODEHARBOR_IMAGE_QUERY_SOCKET: /run/codeharbor-controller/query.sock
+      CODEHARBOR_IMAGE_BUILD_SOCKET: /run/codeharbor-controller/build.sock
+      CODEHARBOR_IMAGE_AUTH_SOCKET: /run/codeharbor-authorizer/authorizer.sock
+      CODEHARBOR_IMAGE_QUERY_TOKEN_FILE: /run/secrets/image_query_token
+      CODEHARBOR_IMAGE_BUILD_TOKEN_FILE: /run/secrets/image_build_token
+      CODEHARBOR_IMAGE_AUTH_TOKEN_FILE: /run/secrets/image_auth_token
+    # Replace the base /data volume: Git worktrees and indexes exist only in
+    # build-time tmpfs or repository images, never in an application data mount.
+    volumes: !override
+      - type: bind
+        source: ${CODEHARBOR_IMAGE_CONTROLLER_SOCKET_DIR:?set controller socket directory}
+        target: /run/codeharbor-controller
+      - type: bind
+        source: ${CODEHARBOR_IMAGE_AUTHORIZER_SOCKET_DIR:?set authorizer socket directory}
+        target: /run/codeharbor-authorizer
+    tmpfs:
+      - /data:rw,exec,nosuid,nodev,size=${CODEHARBOR_IMAGE_WORKTREE_TMPFS_SIZE:-2g},mode=0700,uid=1000,gid=1000
+    secrets:
+      - image_query_token
+      - image_build_token
+      - image_auth_token
+    depends_on:
+      image-controller:
+        condition: service_healthy
+
+  image-controller:
+    image: ${CODEHARBOR_IMAGE_CONTROLLER_IMAGE:-codeharbor-image-controller:local}
+    build:
+      context: ..
+      dockerfile: Dockerfile.image-controller
+      args:
+        CODEHARBOR_DOCKER_CLI_IMAGE: ${CODEHARBOR_DOCKER_CLI_IMAGE:-docker:27-cli}
+    restart: unless-stopped
+    init: true
+    user: '0:1000'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    environment:
+      CODEHARBOR_REPOSITORY_RUNTIME_IMAGE: ${CODEHARBOR_REPOSITORY_RUNTIME_IMAGE:?set immutable local runtime image ID}
+      CODEHARBOR_IMAGE_CONTROLLER_ID: ${CODEHARBOR_IMAGE_CONTROLLER_ID:?set stable unique controller ID}
+      CODEHARBOR_IMAGE_QUERY_SOCKET: /run/codeharbor-controller/query.sock
+      CODEHARBOR_IMAGE_BUILD_SOCKET: /run/codeharbor-controller/build.sock
+      CODEHARBOR_IMAGE_AUTH_SOCKET: /run/codeharbor-authorizer/authorizer.sock
+      CODEHARBOR_IMAGE_ALLOWLIST: /var/lib/codeharbor-image-controller/images.sqlite
+      CODEHARBOR_IMAGE_FENCE_DIR: /var/lib/codeharbor-image-controller
+      CODEHARBOR_IMAGE_BUILD_WORK_DIR: /tmp
+      CODEHARBOR_IMAGE_QUERY_TOKEN_FILE: /run/secrets/image_query_token
+      CODEHARBOR_IMAGE_BUILD_TOKEN_FILE: /run/secrets/image_build_token
+      CODEHARBOR_IMAGE_AUTH_TOKEN_FILE: /run/secrets/image_auth_token
+    volumes:
+      - type: bind
+        source: ${CODEHARBOR_IMAGE_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+      - type: bind
+        source: ${CODEHARBOR_IMAGE_CONTROLLER_SOCKET_DIR:?set controller socket directory}
+        target: /run/codeharbor-controller
+      - type: bind
+        source: ${CODEHARBOR_IMAGE_AUTHORIZER_SOCKET_DIR:?set authorizer socket directory}
+        target: /run/codeharbor-authorizer
+      - type: bind
+        source: ${CODEHARBOR_IMAGE_STATE_DIR:?set controller persistent state directory}
+        target: /var/lib/codeharbor-image-controller
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=${CODEHARBOR_IMAGE_BUILD_TMPFS_SIZE:-2g},mode=0700,uid=0,gid=0
+    secrets:
+      - image_query_token
+      - image_build_token
+      - image_auth_token
+    healthcheck:
+      # Checks socket presence only; publication also performs a real MCP query.
+      test: [CMD, node, -e, "const f=require('node:fs');process.exit(f.statSync('/run/codeharbor-controller/build.sock').isSocket()&&f.statSync('/run/codeharbor-controller/query.sock').isSocket()?0:1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+secrets:
+  image_query_token:
+    file: ${CODEHARBOR_IMAGE_QUERY_TOKEN_HOST_FILE:?set query token file}
+  image_build_token:
+    file: ${CODEHARBOR_IMAGE_BUILD_TOKEN_HOST_FILE:?set build token file}
+  image_auth_token:
+    file: ${CODEHARBOR_IMAGE_AUTH_TOKEN_HOST_FILE:?set authorizer token file}

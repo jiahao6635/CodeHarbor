@@ -29,6 +29,9 @@ export type RepositoryRecord = {
   hook_hash: string;
   path: string | null;
   commit: string | null;
+  /** Last published OCI generation, absent for pre-image and older records. */
+  previous_image?: string | null;
+  previous_commit?: string | null;
   indexed_at: number | null;
   status: string;
   error: string | null;
@@ -82,6 +85,8 @@ export class Store {
         hook_hash TEXT NOT NULL,
         path TEXT,
         commit_sha TEXT,
+        previous_image TEXT,
+        previous_commit TEXT,
         indexed_at INTEGER,
         status TEXT NOT NULL,
         error TEXT
@@ -101,6 +106,8 @@ export class Store {
       // Existing credentials were never explicitly authorized for their current version.
       this.db.exec('ALTER TABLE repositories ADD COLUMN sync_credential_version INTEGER NOT NULL DEFAULT 0 CHECK(sync_credential_version >= 0)');
     }
+    if (!columns.some((column) => column.name === 'previous_image')) this.db.exec('ALTER TABLE repositories ADD COLUMN previous_image TEXT');
+    if (!columns.some((column) => column.name === 'previous_commit')) this.db.exec('ALTER TABLE repositories ADD COLUMN previous_commit TEXT');
   }
 
   close(): void {
@@ -176,31 +183,31 @@ export class Store {
 
   createRepository(repo: RepositoryRecord): void {
     this.db.prepare(`INSERT INTO repositories
-      (id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha, indexed_at, status, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      (id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha, previous_image, previous_commit, indexed_at, status, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(repo.id, repo.codeup_id, repo.name, repo.branch, repo.owner, repo.sync_owner, repo.sync_credential_version, repo.hook_hash,
-        repo.path, repo.commit, repo.indexed_at, repo.status, repo.error);
+        repo.path, repo.commit, repo.previous_image ?? null, repo.previous_commit ?? null, repo.indexed_at, repo.status, repo.error);
   }
 
   getRepository(id: string): RepositoryRecord | undefined {
-    return this.db.prepare('SELECT id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", indexed_at, status, error FROM repositories WHERE id = ?')
+    return this.db.prepare('SELECT id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", previous_image, previous_commit, indexed_at, status, error FROM repositories WHERE id = ?')
       .get(id) as RepositoryRecord | undefined;
   }
 
   getRepositoryByCodeupId(id: string): RepositoryRecord | undefined {
-    return this.db.prepare('SELECT id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", indexed_at, status, error FROM repositories WHERE codeup_id = ?')
+    return this.db.prepare('SELECT id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", previous_image, previous_commit, indexed_at, status, error FROM repositories WHERE codeup_id = ?')
       .get(id) as RepositoryRecord | undefined;
   }
 
   listRepositories(): RepositoryRecord[] {
-    return this.db.prepare('SELECT id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", indexed_at, status, error FROM repositories ORDER BY id')
+    return this.db.prepare('SELECT id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", previous_image, previous_commit, indexed_at, status, error FROM repositories ORDER BY id')
       .all() as RepositoryRecord[];
   }
 
   updateRepository(id: string, patch: RepoUpdate): void {
     const columns: Record<string, string> = {
       name: 'name', branch: 'branch', owner: 'owner', sync_owner: 'sync_owner', sync_credential_version: 'sync_credential_version', hook_hash: 'hook_hash',
-      path: 'path', commit: 'commit_sha', indexed_at: 'indexed_at', status: 'status', error: 'error',
+      path: 'path', commit: 'commit_sha', previous_image: 'previous_image', previous_commit: 'previous_commit', indexed_at: 'indexed_at', status: 'status', error: 'error',
     };
     const entries = Object.entries(patch).filter(([key, value]) => Object.hasOwn(columns, key) && value !== undefined);
     if (entries.length === 0) return;

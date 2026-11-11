@@ -23,6 +23,15 @@ test('store persists encrypted credentials, scoped keys, repositories and jobs',
     assert.equal(store.getRepositoryByCodeupId('123')?.id, 'repo-1');
     assert.equal(store.listPendingJobs().length, 1);
     store.updateRepository('repo-1', { commit: 'abc', status: 'ready' });
+    const previousImage = `oci://sha256:${'a'.repeat(64)}`;
+    const previousCommit = 'b'.repeat(40);
+    store.updateRepository('repo-1', { previous_image:previousImage, previous_commit:previousCommit });
+    assert.throws(() => store.transaction(() => {
+      store.updateRepository('repo-1', { path:'new', commit:'new', previous_image:'invalid', previous_commit:'invalid' });
+      throw new Error('rollback');
+    }));
+    assert.equal(store.getRepository('repo-1')?.previous_image, previousImage);
+    assert.equal(store.getRepository('repo-1')?.previous_commit, previousCommit);
     store.updateJob('job-1', { status: 'succeeded' });
     assert.equal(store.getRepository('repo-1')?.commit, 'abc');
     assert.equal(store.listPendingJobs().length, 0);
@@ -30,6 +39,10 @@ test('store persists encrypted credentials, scoped keys, repositories and jobs',
     assert.equal(store.getUser('user-1')?.credential_version, 2);
     store.revokeUserKeys('user-1');
     assert.equal(store.getKey('hash')?.revoked, 1);
+    store.close();
+    store = new Store(path);
+    assert.equal(store.getRepository('repo-1')?.previous_image, previousImage);
+    assert.equal(store.getRepository('repo-1')?.previous_commit, previousCommit);
     store.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -66,6 +79,8 @@ test('migration keeps old repository sync credentials unauthorized', () => {
     db.close();
     const store = new Store(path);
     assert.equal(store.getRepository('old')?.sync_credential_version, 0);
+    assert.equal(store.getRepository('old')?.previous_image, null);
+    assert.equal(store.getRepository('old')?.previous_commit, null);
     store.close();
     const reopened = new Store(path);
     assert.equal(reopened.getRepository('old')?.sync_credential_version, 0);

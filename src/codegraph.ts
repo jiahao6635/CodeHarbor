@@ -4,6 +4,11 @@ import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/sdk/shared/s
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 
+/** The gateway and worker share these operations regardless of index storage. */
+export type GraphClient = Pick<CodeGraphClient, 'withQuery' | 'withExclusive' | 'probe' | 'close'>;
+export type RepositoryIdentity = { repoId: string; commit: string };
+export type Explore = (path: string, query: string, signal?: AbortSignal, identity?: RepositoryIdentity) => Promise<string>;
+
 /** A stdio transport whose subprocess and ordinary descendants share a killable group. */
 export class ManagedCodeGraphTransport implements Transport {
   onclose?: () => void;
@@ -165,12 +170,12 @@ export class CodeGraphClient {
   }
 
   /** Resolve the current repository version inside this lock, not before it. */
-  async withQuery<T>(operation: (explore: (path: string, query: string, signal?: AbortSignal) => Promise<string>) => Promise<T>): Promise<T> {
+  async withQuery<T>(operation: (explore: Explore) => Promise<T>): Promise<T> {
     return this.serialized(() => operation((path, query, signal) => this.query(path, query, signal)));
   }
 
   /** Drain all queries, close cached upstream handles, and publish before later queries resume. */
-  async withExclusive<T>(operation: (explore: (path: string, query: string, signal?: AbortSignal) => Promise<string>) => Promise<T>): Promise<T> {
+  async withExclusive<T>(operation: (explore: Explore) => Promise<T>): Promise<T> {
     return this.serialized(async () => {
       if (this.unsafe) throw new Error('CodeGraph process shutdown failed; restart required');
       await this.closeConnection();
