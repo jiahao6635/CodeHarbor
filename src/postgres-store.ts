@@ -1,7 +1,7 @@
 import pg from 'pg';
 import { DatabaseSync } from 'node:sqlite';
 import type { StoreAccess, StoreBackend } from './async-store.js';
-import type { JobRecord, KeyRecord, RepositoryRecord, UserRecord } from './store.js';
+import { jobMetricsQuery, parseJobMetrics, type JobRecord, type KeyRecord, type RepositoryRecord, type UserRecord } from './store.js';
 
 type Run = <T>(fn: () => Promise<T>) => Promise<T>;
 
@@ -15,7 +15,8 @@ const keyRow = (row?: Row): KeyRecord | undefined => {
   return { ...row, repos, expires_at: numberOrNull(row.expires_at), revoked: Number(row.revoked) } as KeyRecord;
 };
 const repoRow = (row?: Row): RepositoryRecord | undefined => row ? ({ ...row, sync_credential_version: Number(row.sync_credential_version), indexed_at: numberOrNull(row.indexed_at) } as RepositoryRecord) : undefined;
-const jobRow = (row?: Row): JobRecord | undefined => row ? ({ ...row, created_at: Number(row.created_at) } as JobRecord) : undefined;
+const jobRow = (row?: Row): JobRecord | undefined => row ? ({ ...row, created_at: Number(row.created_at),
+  queued_at: numberOrNull(row.queued_at), finished_at: numberOrNull(row.finished_at), build_duration_ms: numberOrNull(row.build_duration_ms) } as JobRecord) : undefined;
 const repoFields = 'id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", previous_image, previous_commit, indexed_at, status, error';
 
 function access(client: pg.Client, run: Run): StoreAccess {
@@ -39,12 +40,18 @@ function access(client: pg.Client, run: Run): StoreAccess {
       if (entries.length) await q(`UPDATE repositories SET ${entries.map(([key], i) => `${columns[key]}=$${i+1}`).join(',')} WHERE id=$${entries.length+1}`, [...entries.map(([,v]) => v),id]);
     }),
     deleteRepository: id => run(async () => { await q('DELETE FROM repositories WHERE id=$1', [id]); }),
-    createJob: job => run(async () => { await q('INSERT INTO jobs(id,repo_id,status,reason,created_at,error) VALUES($1,$2,$3,$4,$5,$6)', [job.id,job.repo_id,job.status,job.reason,job.created_at,job.error]); }),
+    createJob: job => run(async () => { await q('INSERT INTO jobs(id,repo_id,status,reason,created_at,queued_at,finished_at,build_duration_ms,error) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)', [job.id,job.repo_id,job.status,job.reason,job.created_at,job.queued_at ?? job.created_at,job.finished_at ?? null,job.build_duration_ms ?? null,job.error]); }),
     getJob: id => run(async () => jobRow((await q('SELECT * FROM jobs WHERE id=$1', [id])).rows[0])),
     listJobs: id => run(async () => (await q('SELECT * FROM jobs WHERE repo_id=$1 ORDER BY created_at,id', [id])).rows.map(jobRow) as JobRecord[]),
     listPendingJobs: () => run(async () => (await q("SELECT * FROM jobs WHERE status IN ('queued','running') ORDER BY created_at,id")).rows.map(jobRow) as JobRecord[]),
+    jobMetrics: nowMs => run(async () => {
+      if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error('Invalid metrics time');
+      const row = (await q(jobMetricsQuery('$1', '$2'), [nowMs - 86_400_000, nowMs])).rows[0];
+      if (!row) throw new Error('Job metrics unavailable');
+      return parseJobMetrics(row);
+    }),
     updateJob: (id, patch) => run(async () => {
-      const entries = Object.entries(patch).filter(([key,value]) => (key === 'status' || key === 'error') && value !== undefined);
+      const entries = Object.entries(patch).filter(([key,value]) => ['status','error','queued_at','finished_at','build_duration_ms'].includes(key) && value !== undefined);
       if (entries.length) await q(`UPDATE jobs SET ${entries.map(([key],i)=>`${key}=$${i+1}`).join(',')} WHERE id=$${entries.length+1}`, [...entries.map(([,v]) => v),id]);
     }),
   };
@@ -57,8 +64,12 @@ CREATE INDEX IF NOT EXISTS keys_owner_idx ON keys(owner);
 CREATE TABLE IF NOT EXISTS repositories(id TEXT PRIMARY KEY, codeup_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, branch TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), sync_owner TEXT NOT NULL REFERENCES users(id), sync_credential_version INTEGER NOT NULL DEFAULT 0 CHECK(sync_credential_version >= 0), hook_hash TEXT NOT NULL, path TEXT, commit_sha TEXT, previous_image TEXT, previous_commit TEXT, indexed_at BIGINT, status TEXT NOT NULL, error TEXT);
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS previous_image TEXT;
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS previous_commit TEXT;
-CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed')), reason TEXT NOT NULL, created_at BIGINT NOT NULL, error TEXT);
+CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed')), reason TEXT NOT NULL, created_at BIGINT NOT NULL, queued_at BIGINT, finished_at BIGINT, build_duration_ms BIGINT, error TEXT);
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS queued_at BIGINT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS finished_at BIGINT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS build_duration_ms BIGINT;
 CREATE INDEX IF NOT EXISTS jobs_queue_idx ON jobs(status,created_at);
+CREATE INDEX IF NOT EXISTS jobs_finished_idx ON jobs(finished_at);
 `;
 
 /** One service instance per database. The session holding the lock runs every query. */
@@ -111,6 +122,7 @@ export class PostgresStore implements StoreBackend {
   getJob: StoreAccess['getJob'] = (...a) => this.access.getJob(...a);
   listJobs: StoreAccess['listJobs'] = (...a) => this.access.listJobs(...a);
   listPendingJobs: StoreAccess['listPendingJobs'] = (...a) => this.access.listPendingJobs(...a);
+  jobMetrics: StoreAccess['jobMetrics'] = (...a) => this.access.jobMetrics(...a);
   updateJob: StoreAccess['updateJob'] = (...a) => this.access.updateJob(...a);
   transaction<T>(fn: (tx: StoreAccess) => Promise<T>): Promise<T> {
     return this.serialize(async () => {
@@ -151,7 +163,8 @@ export class PostgresStore implements StoreBackend {
             await target.createKey({ ...row, repos: repos as string[] | null });
           }
           for (const repo of repositories) await target.createRepository(repo);
-          for (const job of jobs) await target.createJob({ ...job, status: job.status === 'running' ? 'queued' : job.status });
+          for (const job of jobs) await target.createJob(job.status === 'running'
+            ? { ...job, status: 'queued', queued_at: Date.now(), finished_at: null, build_duration_ms: null } : job);
           await this.client.query('COMMIT');
         } catch (error) { await this.client.query('ROLLBACK').catch(() => {}); throw error; }
       } finally { source.close(); }

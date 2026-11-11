@@ -14,6 +14,7 @@ import { SocketImageBuildExecutor } from './image-build-socket.js';
 import { buildRepositoryImage } from './image-builder.js';
 import { serveImageAuthorizer } from './image-authorizer.js';
 import { imageAuthorization } from './image-authorization.js';
+import { createInternalMcpHandler } from './internal-mcp.js';
 
 async function main() {
   const dataDir = resolve(process.env.CODEHARBOR_DATA_DIR ?? './data');
@@ -25,6 +26,13 @@ async function main() {
   const key = await loadMasterKey();
   const metricsToken = process.env.CODEHARBOR_METRICS_TOKEN_FILE
     ? (await readFile(process.env.CODEHARBOR_METRICS_TOKEN_FILE, 'utf8')).trim() : undefined;
+  const internalMcpSocket = process.env.CODEHARBOR_INTERNAL_MCP_SOCKET;
+  const internalMcpTokenFile = process.env.CODEHARBOR_INTERNAL_MCP_TOKEN_FILE;
+  if (!!internalMcpSocket !== !!internalMcpTokenFile) throw new Error('Incomplete internal MCP configuration');
+  const internalMcpToken = internalMcpTokenFile ? (await readFile(internalMcpTokenFile, 'utf8')).trim() : undefined;
+  const publicMcpDisabled = process.env.CODEHARBOR_PUBLIC_MCP_DISABLED === 'true';
+  if (process.env.CODEHARBOR_PUBLIC_MCP_DISABLED && !['true', 'false'].includes(process.env.CODEHARBOR_PUBLIC_MCP_DISABLED)) throw new Error('Invalid public MCP configuration');
+  if (internalMcpToken && internalMcpToken === metricsToken) throw new Error('Internal MCP token must be independent');
   const host = process.env.CODEHARBOR_BIND ?? '127.0.0.1';
   const port = Number(process.env.PORT ?? '8080');
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid PORT');
@@ -39,6 +47,7 @@ async function main() {
   const store = dbUrl ? await PostgresStore.open(dbUrl) : new AsyncSqliteStore(resolve(dataDir, 'codeharbor.sqlite'));
   let app: ReturnType<typeof createApp> | undefined;
   let authorizer: Awaited<ReturnType<typeof serveImageAuthorizer>> | undefined;
+  let internalMcp: Awaited<ReturnType<typeof createInternalMcpHandler>> | undefined;
   try {
     let graph: ImageCodeGraphClient | undefined;
     let imagePipeline: ImageIndexPipeline | undefined;
@@ -54,6 +63,7 @@ async function main() {
         throw new Error('Incomplete image backend configuration');
       }
       const [queryToken, buildToken, authToken] = await Promise.all([readFile(queryTokenFile, 'utf8'), readFile(buildTokenFile, 'utf8'), readFile(authTokenFile, 'utf8')]);
+      if (internalMcpToken && [queryToken, buildToken, authToken].some(token => token.trim() === internalMcpToken)) throw new Error('Internal MCP token must be independent');
       const runtimeId = runtimeImage as `sha256:${string}`;
       graph = new ImageCodeGraphClient(new SocketImageQueryBackend(querySocket, queryToken.trim()));
       const executor = new SocketImageBuildExecutor({ path: buildSocket, token: buildToken.trim(), runtimeImage: runtimeId });
@@ -66,7 +76,7 @@ async function main() {
       dataDir, databasePath: resolve(dataDir, 'codeharbor.sqlite'), credentialKey: key,
       codeupEndpoint: endpoint, organizationId: process.env.YUNXIAO_ORGANIZATION_ID || undefined,
       allowedGitHosts, allowedHosts, allowedOrigins: list(process.env.CODEHARBOR_ALLOWED_ORIGINS),
-      writeUsers: list(process.env.CODEHARBOR_WRITE_USERS), codegraphBin: platformCodegraph, metricsToken,
+      writeUsers: list(process.env.CODEHARBOR_WRITE_USERS), codegraphBin: platformCodegraph, metricsToken, publicMcpDisabled,
     }, { store, graph, imagePipeline });
     key.fill(0);
     if (imagePipeline) {
@@ -78,9 +88,11 @@ async function main() {
       }
     }
     await app.start();
+    if (internalMcpSocket && internalMcpToken) internalMcp = await createInternalMcpHandler({ path: internalMcpSocket, token: internalMcpToken, backend: app.internalMcp });
     await app.listen({ port, host });
   } catch (error) {
     key.fill(0);
+    await internalMcp?.close().catch(() => {});
     if (app) await app.close().catch(() => {}); else await store.close().catch(() => {});
     await authorizer?.close().catch(() => {});
     throw error;
@@ -89,7 +101,7 @@ async function main() {
   let stopping = false;
   async function shutdown() {
     if (stopping) return; stopping = true;
-    try { await runningApp.close(); await authorizer?.close(); process.exitCode = 0; } catch { process.exitCode = 1; }
+    try { await internalMcp?.close(); await runningApp.close(); await authorizer?.close(); process.exitCode = 0; } catch { process.exitCode = 1; }
   }
   process.on('SIGINT', () => { void shutdown(); });
   process.on('SIGTERM', () => { void shutdown(); });

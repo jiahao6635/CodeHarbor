@@ -75,6 +75,10 @@ test('coalesces queued work while preserving events during a build', async () =>
     assert.equal(builds, 1, 'unchanged remote HEAD does not rebuild');
     assert.equal(f.store.getRepository('repo_1')?.commit, 'b'.repeat(40));
     assert.equal(f.store.getRepository('repo_1')?.status, 'ready');
+    assert.ok(f.store.getJob(first.id)?.finished_at);
+    assert.ok((f.store.getJob(first.id)?.build_duration_ms ?? -1) >= 0);
+    assert.ok(f.store.getJob(next.id)?.finished_at);
+    assert.equal(f.store.getJob(next.id)?.build_duration_ms, null, 'no-op reconcile has no build sample');
   } finally {
     release();
     await worker.stop();
@@ -96,10 +100,37 @@ test('failed builds preserve the previous published index', async () => {
     assert.equal(f.store.getRepository('repo_1')?.commit, 'a'.repeat(40));
     assert.equal(f.store.getRepository('repo_1')?.status, 'stale');
     assert.equal(f.store.getJob(job.id)?.error, 'Index update failed');
+    assert.ok(f.store.getJob(job.id)?.finished_at);
+    assert.ok((f.store.getJob(job.id)?.build_duration_ms ?? -1) >= 0, 'failed builds retain a duration');
   } finally {
     await worker.stop();
     f.store.close();
   }
+});
+
+test('restarting an interrupted job resets queue time and clears the interrupted attempt', async () => {
+  const f = fixture();
+  const old = Date.now() - 60_000;
+  f.store.createJob({id:'interrupted', repo_id:'repo_1', status:'running', reason:'initial', created_at:old, queued_at:old, finished_at:old, build_duration_ms:123, error:null});
+  let release!: () => void;
+  let building = false;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const worker = new IndexWorker({ ...f, store:f.workerStore, dataDir:'/unused', allowedGitHosts:['git.example.com'], reconcileIntervalMs:0,
+    head:async () => 'a'.repeat(40),
+    build:async () => { building = true; await blocked; return {path:'/candidate', commit:'a'.repeat(40), generation:'v1'}; },
+  });
+  try {
+    await worker.start();
+    await waitFor(() => building);
+    const job = f.store.getJob('interrupted');
+    assert.equal(job?.created_at, old);
+    assert.ok((job?.queued_at ?? 0) > old);
+    assert.equal(job?.finished_at, null);
+    assert.equal(job?.build_duration_ms, null);
+    release();
+    await waitFor(() => f.store.getJob('interrupted')?.status === 'succeeded');
+    assert.ok((f.store.getJob('interrupted')?.build_duration_ms ?? -1) >= 0);
+  } finally { release(); await worker.stop(); f.store.close(); }
 });
 
 test('image publication records the previously published image and commit atomically', async () => {

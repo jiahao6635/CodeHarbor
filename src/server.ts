@@ -15,6 +15,8 @@ import type { IndexRequest } from './indexer.js';
 import { IndexWorker } from './worker.js';
 import type { ImageIndexPipeline } from './image-indexer.js';
 import { openApiDocument } from './openapi.js';
+import { renderJobMetrics } from './job-metrics.js';
+import type { InternalMcpBackend, InternalMcpRepository } from './internal-mcp.js';
 
 export interface AppConfig {
   dataDir: string;
@@ -30,6 +32,8 @@ export interface AppConfig {
   reconcileMs?: number;
   /** Monitoring credential loaded by the caller from a protected secret source. */
   metricsToken?: string;
+  /** Disable the legacy public MCP endpoint when the dedicated service is enabled. */
+  publicMcpDisabled?: boolean;
 }
 
 type Principal = KeyRecord;
@@ -138,15 +142,20 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
     await previous; try { return await fn(); } finally { release(); }
   }
 
-  function bearer(req: IncomingMessage): string | null {
-    const match = /^Bearer (ch_[A-Za-z0-9_-]{43})$/.exec(req.headers.authorization ?? '');
+  function bearer(authorization: string): string | null {
+    const match = /^Bearer (ch_[A-Za-z0-9_-]{43})$/.exec(authorization);
     return match?.[1] ?? null;
   }
-  async function authenticate(req: IncomingMessage): Promise<Principal | null> {
-    const token = bearer(req);
+  async function authenticateBearer(authorization: string): Promise<Principal | null> {
+    const token = bearer(authorization);
     if (!token) return null;
     const key = await store.getKey(hashAccessKey(token));
     if (!key || key.revoked || (key.expires_at !== null && key.expires_at <= Date.now()) || !(await store.getUser(key.owner))) return null;
+    return key;
+  }
+  async function authenticate(req: IncomingMessage): Promise<Principal | null> {
+    const key = await authenticateBearer(req.headers.authorization ?? '');
+    if (!key) return null;
     actors.set(req, { ...actors.get(req), subject: key.owner, key_prefix: key.prefix, authentication: 'api_key' });
     return key;
   }
@@ -201,6 +210,77 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
       return result;
     });
   }
+  const internalRepository = (repo: RepositoryRecord): InternalMcpRepository => {
+    const item = view(repo);
+    return { repo_id: item.id, name: item.name, status: item.status, indexed_commit: item.indexedCommit,
+      indexed_at: item.indexedAt, stale: item.stale };
+  };
+  async function internalPrincipal(authorization: string): Promise<Principal> {
+    const key = await authenticateBearer(authorization);
+    if (!key) throw new Error('Authentication required');
+    return key;
+  }
+  function auditInternalTool(tool: 'list_repositories' | 'get_repository_status' | 'codegraph_explore', outcome: 'success' | 'error', principal?: Principal, repoId?: string) {
+    const event: AuditEvent = { request_id: randomUUID(), method: 'POST', route: '/mcp', status: outcome === 'success' ? 200 : 400,
+      tool, tool_outcome: outcome, ...(principal ? { subject: principal.owner, key_prefix: principal.prefix, authentication: 'api_key' as const } : {}),
+      ...(principal && repoId && /^[A-Za-z0-9_-]{1,128}$/.test(repoId) ? { repo_id: repoId } : {}) };
+    fastify.log.info(event, 'audit');
+    try { deps.audit?.(event); } catch { /* Audit observers cannot alter a response. */ }
+  }
+  const internalMcp: InternalMcpBackend = {
+    async probe(signal) {
+      await store.checkHealth(); await graph.probe();
+      if (signal.aborted) throw new Error('Request cancelled');
+      return true;
+    },
+    async authenticate(authorization) { return !!(await authenticateBearer(authorization)); },
+    async list(authorization, signal) {
+      let principal: Principal | undefined; let outcome: 'success' | 'error' = 'error';
+      try {
+        principal = await internalPrincipal(authorization);
+        const repositories = await listVisible(principal);
+        if (signal.aborted || !(await authenticateBearer(authorization))) throw new Error('Authentication required');
+        outcome = 'success';
+        return repositories.map(internalRepository);
+      } finally { auditInternalTool('list_repositories', outcome, principal); }
+    },
+    async get(authorization, repoId, signal) {
+      let principal: Principal | undefined; let outcome: 'success' | 'error' = 'error';
+      try {
+        principal = await internalPrincipal(authorization);
+        const repo = await visible(principal, repoId);
+        if (signal.aborted || !(await authenticateBearer(authorization))) throw new Error('Authentication required');
+        outcome = 'success';
+        return internalRepository(repo);
+      } catch (error) { if (error instanceof HttpError && error.status === 404) return null; throw error; }
+      finally { auditInternalTool('get_repository_status', outcome, principal, repoId); }
+    },
+    async explore(authorization, repoId, query, signal) {
+      let principal: Principal | undefined;
+      const auditOutcome: { value: 'success' | 'error' } = { value: 'error' };
+      try {
+        return await graph.withQuery(async explore => {
+          if (signal.aborted) throw new Error('Request cancelled');
+          principal = await internalPrincipal(authorization);
+          let repo: RepositoryRecord;
+          try { repo = await visible(principal, repoId); }
+          catch (error) { if (error instanceof HttpError && error.status === 404) return null; throw error; }
+          if (!repo.path || !repo.commit) return null;
+          const result = await explore(repo.path, query, signal, { repoId: repo.id, commit: repo.commit });
+          if (signal.aborted) throw new Error('Request cancelled');
+          const confirmed = await internalPrincipal(authorization);
+          let current: RepositoryRecord;
+          try { current = await visible(confirmed, repoId); }
+          catch (error) { if (error instanceof HttpError && error.status === 404) return null; throw error; }
+          if (signal.aborted || current.path !== repo.path || current.commit !== repo.commit) return null;
+          auditOutcome.value = 'success';
+          return { repository: internalRepository(repo), result };
+        });
+      } finally {
+        auditInternalTool('codegraph_explore', auditOutcome.value, principal, repoId);
+      }
+    },
+  };
   const mcp = createMcpHandler<Principal>({
     authenticate, allowedHosts: config.allowedHosts, allowedOrigins: config.allowedOrigins,
     listRepositories: async key => (await listVisible(key)).map(view),
@@ -224,10 +304,16 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
       if (url.pathname === '/metrics' && method === 'GET') {
         if (!config.metricsToken) fail(404, 'NOT_FOUND');
         if (!constantTimeEqual(req.headers.authorization ?? '', `Bearer ${config.metricsToken}`)) fail(401, 'UNAUTHENTICATED');
+        const now = Date.now();
+        let jobMetrics;
+        try { jobMetrics = await store.jobMetrics(now); } catch { fail(503, 'METRICS_UNAVAILABLE'); }
         res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
-        return res.end(renderMetrics());
+        return res.end(renderMetrics() + renderJobMetrics(jobMetrics, now));
       }
-      if (url.pathname === '/mcp') return await mcp(req, res);
+      if (url.pathname === '/mcp') {
+        if (config.publicMcpDisabled) fail(404, 'NOT_FOUND');
+        return await mcp(req, res);
+      }
       if (url.pathname === '/api/v1/auth/yunxiao/bind' && method === 'POST') {
         const ip = req.socket.remoteAddress ?? 'unknown';
         const now = Date.now(); const old = attempts.get(ip);
@@ -259,7 +345,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
         });
       }
       if (url.pathname === '/api/v1/auth/bootstrap/keys' && method === 'POST') {
-        const token = bearer(req); const hash = token ? hashAccessKey(token) : ''; const session = sessions.get(hash);
+        const token = bearer(req.headers.authorization ?? ''); const hash = token ? hashAccessKey(token) : ''; const session = sessions.get(hash);
         if (!session || session.expires <= Date.now()) fail(401, 'UNAUTHENTICATED');
         actors.set(req, { subject: session.userId, authentication: 'bootstrap' });
         const input = await body(req); only(input, ['scope', 'expires_in']);
@@ -443,11 +529,14 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
     reply.hijack();
     await handle(request.raw, reply.raw);
   });
-  fastify.register(swagger, { mode: 'static', specification: { document: openApiDocument } });
+  const appOpenApiDocument = config.publicMcpDisabled
+    ? { ...openApiDocument, paths: Object.fromEntries(Object.entries(openApiDocument.paths).filter(([path]) => path !== '/mcp')) }
+    : openApiDocument;
+  fastify.register(swagger, { mode: 'static', specification: { document: appOpenApiDocument } });
   fastify.register(swaggerUi, { routePrefix: '/docs', staticCSP: true,
     uiConfig: { docExpansion: 'list', persistAuthorization: false, validatorUrl: null } });
   fastify.get('/openapi.json', async (_request, reply) => {
-    return reply.header('cache-control', 'no-store').send(openApiDocument);
+    return reply.header('cache-control', 'no-store').send(appOpenApiDocument);
   });
   const paths = ['/health/live', '/health/ready', '/metrics', '/mcp', '/api/v1/auth/yunxiao/bind',
     '/api/v1/auth/bootstrap/keys', '/api/v1/hooks/codeup/:id', '/api/v1/me',
@@ -456,7 +545,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
     '/api/v1/jobs/:id', '/api/v1/api-keys', '/api/v1/api-keys/:id', '/', '/*'];
   for (const path of paths) fastify.all(path, async () => {});
   return {
-    server: fastify.server, store, worker,
+    server: fastify.server, store, worker, internalMcp,
     listen(options: { port: number; host: string }) { return fastify.listen(options); },
     start() { return worker.start(); },
     async close() { await fastify.close(); await worker.stop(); await graph.close(); await store.close(); },

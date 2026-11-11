@@ -370,7 +370,16 @@ test('metrics use a separate credential and contain only bounded aggregate label
     const content = await result.text();
     assert.match(content, /codeharbor_http_requests_total\{method="GET",status="200"\}/);
     assert.match(content, /codeharbor_http_request_duration_seconds_bucket/);
+    assert.match(content, /^codeharbor_index_queue_queued_jobs 0$/m);
+    assert.match(content, /^codeharbor_index_jobs_failure_ratio_24h NaN$/m);
+    assert.match(content, /^codeharbor_index_build_samples_24h 0$/m);
     assert.ok(!content.includes('not-in-metrics') && !content.includes(metricsToken));
     assert.ok(!content.includes('route=') && !content.includes('user=') && !content.includes('repo='));
+    app.store.jobMetrics = async () => { throw new Error('database secret'); };
+    const unavailable = await fetch(`${base}/metrics`, { headers: { authorization: `Bearer ${metricsToken}` } });
+    assert.equal(unavailable.status, 503);
+    const errorBody = await unavailable.text();
+    assert.match(errorBody, /METRICS_UNAVAILABLE/);
+    assert.ok(!errorBody.includes('database secret'));
   } finally { await app.close(); rmSync(dir, { recursive: true, force: true }); }
 });

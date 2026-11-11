@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
-import { Store } from '../src/store.js';
+import { BUILD_DURATION_BUCKETS_MS, Store } from '../src/store.js';
 
 test('store persists encrypted credentials, scoped keys, repositories and jobs', () => {
   const dir = mkdtempSync(join(tmpdir(), 'codeharbor-store-'));
@@ -88,4 +88,57 @@ test('migration keeps old repository sync credentials unauthorized', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('queue metrics count completed jobs and actual builds within the last 24 hours', () => {
+  const store = new Store(':memory:');
+  const now = 1_700_000_000_000;
+  try {
+    store.createUser({id:'u', username:'user', credential:'encrypted', credential_version:1});
+    store.createRepository({id:'r', codeup_id:'123', name:'repo', branch:'main', owner:'u', sync_owner:'u', sync_credential_version:1, hook_hash:'hash', path:null, commit:null, indexed_at:null, status:'pending', error:null});
+    const add = (id: string, status: 'queued' | 'running' | 'succeeded' | 'failed', created: number, finished: number | null, duration: number | null) => {
+      store.createJob({id, repo_id:'r', status, reason:'test', created_at:created, error:null});
+      store.updateJob(id, {finished_at:finished, build_duration_ms:duration});
+    };
+    add('q1', 'queued', now - 100_000, null, null);
+    store.updateJob('q1', {queued_at:now - 30_000});
+    add('q2', 'queued', now - 50_000, null, null);
+    store.updateJob('q2', {queued_at:null}); // Legacy rows fall back to created_at.
+    add('ok', 'succeeded', now - 1000, now - 500, 1000);
+    add('failed', 'failed', now - 1000, now - 400, 5000);
+    add('noop', 'succeeded', now - 1000, now - 300, null);
+    add('early-failure', 'failed', now - 1000, now - 200, null);
+    add('old', 'failed', now - 90_000_000, now - 86_400_001, 99);
+    add('legacy', 'failed', now - 1000, null, 99);
+    add('future', 'succeeded', now, now + 1, 99);
+    add('running', 'running', now - 1000, now - 100, 99);
+    const metrics = store.jobMetrics(now);
+    assert.deepEqual(metrics, {
+      queued:2, oldestQueuedAt:now - 50_000, completed24h:4, succeeded24h:2, failed24h:2,
+      builds24h:2, buildDurationSumMs24h:6000, buildDurationMaxMs24h:5000,
+      buildDurationLastMs24h:5000, buildBuckets24h:BUILD_DURATION_BUCKETS_MS.map(bound => bound < 5000 ? 1 : 2),
+    });
+    assert.throws(() => store.jobMetrics(-1));
+  } finally { store.close(); }
+});
+
+test('legacy job migration leaves completed timestamps unknown', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codeharbor-jobs-migration-'));
+  const path = join(dir, 'state.sqlite');
+  try {
+    const db = new DatabaseSync(path);
+    db.exec(`CREATE TABLE jobs(id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, created_at INTEGER NOT NULL, error TEXT);
+      INSERT INTO jobs VALUES ('done', 'r', 'failed', 'test', 100, NULL);
+      INSERT INTO jobs VALUES ('queued', 'r', 'queued', 'test', 200, NULL);`);
+    db.close();
+    const store = new Store(path);
+    try {
+      const metrics = store.jobMetrics(1000);
+      assert.equal(metrics.completed24h, 0);
+      assert.equal(metrics.oldestQueuedAt, 200);
+      assert.equal(metrics.buildDurationMaxMs24h, null);
+      assert.equal(metrics.buildDurationLastMs24h, null);
+      assert.equal(store.getJob('done')?.finished_at, null);
+    } finally { store.close(); }
+  } finally { rmSync(dir, {recursive:true, force:true}); }
 });

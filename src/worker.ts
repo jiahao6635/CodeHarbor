@@ -40,7 +40,7 @@ export class IndexWorker {
     try {
       await this.options.store.transaction(async (tx) => {
         for (const job of await tx.listPendingJobs()) {
-          if (job.status === 'running') await tx.updateJob(job.id, { status: 'queued' });
+          if (job.status === 'running') await tx.updateJob(job.id, { status: 'queued', queued_at: Date.now(), finished_at: null, build_duration_ms: null });
         }
       });
     } catch (error) { this.running = false; throw error; }
@@ -79,7 +79,8 @@ export class IndexWorker {
         if (repo.status === 'branch_deleted' && !preserveDeletion) await tx.updateRepository(repoId, { status: repo.path ? 'updating' : 'pending', error: null });
         return queued;
       }
-      const created: JobRecord = { id: randomUUID(), repo_id: repoId, status: 'queued', reason, created_at: Date.now(), error: null };
+      const now = Date.now();
+      const created: JobRecord = { id: randomUUID(), repo_id: repoId, status: 'queued', reason, created_at: now, queued_at: now, error: null };
       await tx.createJob(created);
       if (!preserveDeletion) await tx.updateRepository(repoId, { status: repo.path ? 'updating' : 'pending', error: null });
       return created;
@@ -112,14 +113,15 @@ export class IndexWorker {
     const { store, cipher, codeup, graph } = this.options;
     const repo = await store.getRepository(job.repo_id);
     if (!repo || repo.status === 'disabled') {
-      await store.updateJob(job.id, { status: 'failed', error: 'Repository unavailable' });
+      await store.updateJob(job.id, { status: 'failed', error: 'Repository unavailable', finished_at: Date.now(), build_duration_ms: null });
       return;
     }
     await store.transaction(async (tx) => {
-      await tx.updateJob(job.id, { status: 'running', error: null });
+      await tx.updateJob(job.id, { status: 'running', error: null, finished_at: null, build_duration_ms: null });
       await tx.updateRepository(repo.id, { status: repo.path ? 'updating' : 'indexing', error: null });
     });
     let candidate: IndexCandidate | null = null;
+    let buildDurationMs: number | null = null;
     let published = false;
     try {
       const user = await store.getUser(repo.sync_owner);
@@ -137,7 +139,11 @@ export class IndexWorker {
       if (!(await (this.options.probe ?? checkCloneAccess)({ ...request, branch: source.defaultBranch ?? request.branch }))) throw new IndexError('CREDENTIAL_REQUIRED', 'Sync credential cannot clone the repository');
       const current = await (this.options.head ?? getRemoteHead)(request);
       const healthy = current === repo.commit && repo.path && await (this.options.healthy ?? isPublishedIndexHealthy)(request, repo.path, current);
-      candidate = healthy ? null : await (this.options.build ?? buildIndexCandidate)(request);
+      if (!healthy) {
+        const started = performance.now();
+        try { candidate = await (this.options.build ?? buildIndexCandidate)(request); }
+        finally { buildDurationMs = Math.max(0, Math.round(performance.now() - started)); }
+      }
       // Image packaging can take time after indexing; never publish an older branch head.
       if (candidate && await (this.options.head ?? getRemoteHead)(request) !== candidate.commit) {
         throw new IndexError('REMOTE_CHANGED', 'Remote branch changed during indexing');
@@ -169,7 +175,7 @@ export class IndexWorker {
             status: (await tx.listJobs(repo.id)).some((entry) => entry.status === 'queued') ? 'updating' : 'ready',
             error: null,
           });
-          await tx.updateJob(job.id, { status: 'succeeded', error: null });
+          await tx.updateJob(job.id, { status: 'succeeded', error: null, finished_at: Date.now(), build_duration_ms: buildDurationMs });
         });
       };
       if (candidate) await graph.withExclusive(async (explore) => {
@@ -188,7 +194,7 @@ export class IndexWorker {
       const credentials = (error instanceof IndexError && error.code === 'CREDENTIAL_REQUIRED') ||
         (error instanceof CodeupError && ['invalid_credential', 'forbidden', 'not_found'].includes(error.kind));
       await store.transaction(async (tx) => {
-        await tx.updateJob(job.id, { status: 'failed', error: message });
+        await tx.updateJob(job.id, { status: 'failed', error: message, finished_at: Date.now(), build_duration_ms: buildDurationMs });
         const latest = await tx.getRepository(repo.id);
         if (latest && latest.status !== 'disabled' && latest.status !== 'branch_deleted') {
           const queued = (await tx.listJobs(repo.id)).some((entry) => entry.status === 'queued');

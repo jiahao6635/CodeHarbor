@@ -32,6 +32,7 @@ function sqliteAccess(store: Store, run: Run): StoreAccess {
     getJob: (...a) => run(() => store.getJob(...a)),
     listJobs: (...a) => run(() => store.listJobs(...a)),
     listPendingJobs: (...a) => run(() => store.listPendingJobs(...a)),
+    jobMetrics: (...a) => run(() => store.jobMetrics(...a)),
     updateJob: (...a) => run(() => store.updateJob(...a)),
   };
 }
@@ -70,6 +71,7 @@ export class AsyncSqliteStore implements StoreBackend {
   getJob: StoreAccess['getJob'] = (...a) => this.access.getJob(...a);
   listJobs: StoreAccess['listJobs'] = (...a) => this.access.listJobs(...a);
   listPendingJobs: StoreAccess['listPendingJobs'] = (...a) => this.access.listPendingJobs(...a);
+  jobMetrics: StoreAccess['jobMetrics'] = (...a) => this.access.jobMetrics(...a);
   updateJob: StoreAccess['updateJob'] = (...a) => this.access.updateJob(...a);
   transaction<T>(fn: (tx: StoreAccess) => Promise<T>): Promise<T> {
     return this.serialize(() => this.db.transactionAsync(() => fn(sqliteAccess(this.db, async op => op()))));

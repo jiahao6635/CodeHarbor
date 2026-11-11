@@ -43,11 +43,60 @@ export type JobRecord = {
   status: 'queued' | 'running' | 'succeeded' | 'failed';
   reason: string;
   created_at: number;
+  /** Waiting start is reset when an interrupted attempt is requeued. */
+  queued_at?: number | null;
+  /** Only newly completed tasks have a known completion time. */
+  finished_at?: number | null;
+  /** Monotonic elapsed time for the actual build; null if no build completed. */
+  build_duration_ms?: number | null;
   error: string | null;
 };
 
+export const BUILD_DURATION_BUCKETS_MS = [1000, 5000, 10000, 30000, 60000, 120000, 300000, 600000, 1800000] as const;
+export type JobMetrics = {
+  queued: number;
+  oldestQueuedAt: number | null;
+  completed24h: number;
+  succeeded24h: number;
+  failed24h: number;
+  builds24h: number;
+  buildDurationSumMs24h: number;
+  buildDurationMaxMs24h: number | null;
+  buildDurationLastMs24h: number | null;
+  buildBuckets24h: number[];
+};
+
+/** SQL aggregates only jobs finished in the window, plus the current queue. */
+export function jobMetricsQuery(lower: string, upper: string): string {
+  return `WITH finished AS (
+    SELECT id, status, finished_at, build_duration_ms FROM jobs
+    WHERE status IN ('succeeded', 'failed') AND finished_at >= ${lower} AND finished_at <= ${upper}
+  ) SELECT
+    (SELECT COUNT(*) FROM jobs WHERE status = 'queued') AS queued,
+    (SELECT MIN(COALESCE(queued_at, created_at)) FROM jobs WHERE status = 'queued') AS oldest_queued_at,
+    COUNT(*) AS completed_24h,
+    SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded_24h,
+    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_24h,
+    COUNT(build_duration_ms) AS builds_24h,
+    SUM(build_duration_ms) AS build_duration_sum_ms_24h,
+    MAX(build_duration_ms) AS build_duration_max_ms_24h,
+    (SELECT build_duration_ms FROM finished WHERE build_duration_ms IS NOT NULL ORDER BY finished_at DESC, id DESC LIMIT 1) AS build_duration_last_ms_24h,
+    ${BUILD_DURATION_BUCKETS_MS.map((bound, i) => `SUM(CASE WHEN build_duration_ms IS NOT NULL AND build_duration_ms <= ${bound} THEN 1 ELSE 0 END) AS bucket_${i}`).join(',\n    ')}
+  FROM finished`;
+}
+
+export function parseJobMetrics(row: Record<string, unknown>): JobMetrics {
+  const count = (key: string) => Number(row[key] ?? 0);
+  const optional = (key: string) => row[key] == null ? null : Number(row[key]);
+  return { queued: count('queued'), oldestQueuedAt: optional('oldest_queued_at'), completed24h: count('completed_24h'),
+    succeeded24h: count('succeeded_24h'), failed24h: count('failed_24h'), builds24h: count('builds_24h'),
+    buildDurationSumMs24h: count('build_duration_sum_ms_24h'), buildDurationMaxMs24h: optional('build_duration_max_ms_24h'),
+    buildDurationLastMs24h: optional('build_duration_last_ms_24h'),
+    buildBuckets24h: BUILD_DURATION_BUCKETS_MS.map((_bound, i) => count(`bucket_${i}`)) };
+}
+
 type RepoUpdate = Partial<Omit<RepositoryRecord, 'id' | 'codeup_id'>>;
-type JobUpdate = Partial<Pick<JobRecord, 'status' | 'error'>>;
+type JobUpdate = Partial<Pick<JobRecord, 'status' | 'error' | 'queued_at' | 'finished_at' | 'build_duration_ms'>>;
 
 export class Store {
   private readonly db: DatabaseSync;
@@ -97,6 +146,9 @@ export class Store {
         status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'succeeded', 'failed')),
         reason TEXT NOT NULL,
         created_at INTEGER NOT NULL,
+        queued_at INTEGER,
+        finished_at INTEGER,
+        build_duration_ms INTEGER,
         error TEXT
       ) STRICT;
       CREATE INDEX IF NOT EXISTS jobs_queue_idx ON jobs(status, created_at);
@@ -108,6 +160,11 @@ export class Store {
     }
     if (!columns.some((column) => column.name === 'previous_image')) this.db.exec('ALTER TABLE repositories ADD COLUMN previous_image TEXT');
     if (!columns.some((column) => column.name === 'previous_commit')) this.db.exec('ALTER TABLE repositories ADD COLUMN previous_commit TEXT');
+    const jobColumns = this.db.prepare('PRAGMA table_info(jobs)').all();
+    if (!jobColumns.some(column => column.name === 'queued_at')) this.db.exec('ALTER TABLE jobs ADD COLUMN queued_at INTEGER');
+    if (!jobColumns.some(column => column.name === 'finished_at')) this.db.exec('ALTER TABLE jobs ADD COLUMN finished_at INTEGER');
+    if (!jobColumns.some(column => column.name === 'build_duration_ms')) this.db.exec('ALTER TABLE jobs ADD COLUMN build_duration_ms INTEGER');
+    this.db.exec('CREATE INDEX IF NOT EXISTS jobs_finished_idx ON jobs(finished_at)');
   }
 
   close(): void {
@@ -221,8 +278,9 @@ export class Store {
   }
 
   createJob(job: JobRecord): void {
-    this.db.prepare('INSERT INTO jobs (id, repo_id, status, reason, created_at, error) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(job.id, job.repo_id, job.status, job.reason, job.created_at, job.error);
+    this.db.prepare('INSERT INTO jobs (id, repo_id, status, reason, created_at, queued_at, finished_at, build_duration_ms, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(job.id, job.repo_id, job.status, job.reason, job.created_at, job.queued_at ?? job.created_at,
+        job.finished_at ?? null, job.build_duration_ms ?? null, job.error);
   }
 
   getJob(id: string): JobRecord | undefined {
@@ -237,10 +295,17 @@ export class Store {
     return this.db.prepare("SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at, id").all() as JobRecord[];
   }
 
+  jobMetrics(nowMs: number): JobMetrics {
+    if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error('Invalid metrics time');
+    const row = this.db.prepare(jobMetricsQuery('?', '?')).get(nowMs - 86_400_000, nowMs);
+    if (!row) throw new Error('Job metrics unavailable');
+    return parseJobMetrics(row);
+  }
+
   updateJob(id: string, patch: JobUpdate): void {
-    const entries = Object.entries(patch).filter(([key, value]) => (key === 'status' || key === 'error') && value !== undefined);
+    const entries = Object.entries(patch).filter(([key, value]) => ['status', 'error', 'queued_at', 'finished_at', 'build_duration_ms'].includes(key) && value !== undefined);
     if (entries.length === 0) return;
     this.db.prepare(`UPDATE jobs SET ${entries.map(([key]) => `${key} = ?`).join(', ')} WHERE id = ?`)
-      .run(...entries.map(([, value]) => value as string | null), id);
+      .run(...entries.map(([, value]) => value as string | number | null), id);
   }
 }

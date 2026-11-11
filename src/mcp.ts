@@ -21,7 +21,10 @@ export interface McpDependencies<Principal> {
   listRepositories(principal: Principal): Promise<McpRepository[]>;
   /** Returns null both for an unknown repository and for one not authorized. */
   getRepository(principal: Principal, repoId: string): Promise<McpRepository | null>;
-  codegraph: GraphClient;
+  /** Existing single-process backend. */
+  codegraph?: GraphClient;
+  /** Alternative backend must perform the complete query and before/after authorization atomically with publication coordination. */
+  remoteExplore?: (principal: Principal, repoId: string, query: string, signal: AbortSignal) => Promise<{ repository: McpRepository; result: string } | null>;
   /** Exact browser origins allowed to use the endpoint. Non-browser clients can omit Origin. */
   allowedOrigins?: string[];
   /** Exact Host values accepted by the endpoint; configure behind a reverse proxy. */
@@ -63,6 +66,7 @@ function rpcError(res: ServerResponse, status: number, message: string) {
 
 /** Creates a stateless MCP HTTP handler; never share a request's principal across clients. */
 export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
+  if (!!deps.codegraph === !!deps.remoteExplore) throw new Error('Exactly one MCP query backend is required');
   return async (req: IncomingMessage, res: ServerResponse, parsedBody?: unknown): Promise<void> => {
     const host = req.headers.host;
     const origin = req.headers.origin;
@@ -135,7 +139,13 @@ export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
         if (request.params.name === 'codegraph_explore') {
           if (!hasExactKeys(args, ['repo_id', 'query']) || !validRepoId(args.repo_id) || typeof args.query !== 'string' || !args.query.trim() || args.query.length > 2000) return toolError('Invalid arguments');
           const { repo_id: repoId, query } = args;
-          return await deps.codegraph.withQuery(async (explore) => {
+          if (deps.remoteExplore) {
+            const response = await deps.remoteExplore(caller, repoId, query, extra.signal);
+            if (!response) return toolError('Repository not found or index changed');
+            authorizedRepo = response.repository.id;
+            return success({ ...publicRepository(response.repository), result: response.result });
+          }
+          return await deps.codegraph!.withQuery(async (explore) => {
             // A call can wait behind an index publication; recheck the key after it acquires the lock.
             const current = await deps.authenticate(req);
             if (current === null) return toolError('Authentication required');
