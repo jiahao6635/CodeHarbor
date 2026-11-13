@@ -170,8 +170,11 @@ export class CodeGraphClient {
   }
 
   /** Resolve the current repository version inside this lock, not before it. */
-  async withQuery<T>(operation: (explore: Explore) => Promise<T>): Promise<T> {
-    return this.serialized(() => operation((path, query, signal) => this.query(path, query, signal)));
+  async withQuery<T>(operation: (explore: Explore) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.serialized(() => {
+      if (signal?.aborted) throw new Error('Request cancelled');
+      return operation((path, query, signal) => this.query(path, query, signal));
+    });
   }
 
   /** Drain all queries, close cached upstream handles, and publish before later queries resume. */
@@ -189,8 +192,9 @@ export class CodeGraphClient {
   }
 
   /** Verify the subprocess can start and advertises the expected MCP tool. */
-  async probe(): Promise<void> {
+  async probe(signal?: AbortSignal): Promise<void> {
     await this.serialized(async () => {
+      if (signal?.aborted) throw new Error('Request cancelled');
       try {
         const client = await this.connect();
         const { tools } = await client.listTools(undefined, { timeout: this.timeoutMs });

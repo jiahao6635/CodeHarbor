@@ -4,6 +4,7 @@ import { FileImageCreationFence } from './image-creation-fence.js';
 import { getTrustedImage, serveImageBuilder } from './image-build-socket.js';
 import { serveImageRuntime } from './image-runtime-socket.js';
 import { SocketImageAuthorizer } from './image-authorizer.js';
+import { queryConcurrency } from './query-concurrency.js';
 
 function required(name: string): string {
   const value = process.env[name];
@@ -13,6 +14,7 @@ function required(name: string): string {
 
 /** This process alone has Docker access; the gateway uses restricted Unix sockets. */
 async function main() {
+  const maxConcurrent = queryConcurrency(process.env.CODEHARBOR_MCP_QUERY_CONCURRENCY);
   const runtimeImage = required('CODEHARBOR_REPOSITORY_RUNTIME_IMAGE');
   if (!/^sha256:[a-f0-9]{64}$/.test(runtimeImage)) throw new Error('Invalid runtime image ID');
   const runtimeId = runtimeImage as `sha256:${string}`;
@@ -41,7 +43,7 @@ async function main() {
   try {
     builder = await serveImageBuilder({ path: buildSocket, token: buildToken.trim(), runtimeImage: runtimeId,
       allowlistPath, workDir, socketMode: 0o660 });
-    runtime = await serveImageRuntime({ path: querySocket, token: queryToken.trim(), backend, socketMode: 0o660 });
+    runtime = await serveImageRuntime({ path: querySocket, token: queryToken.trim(), backend, socketMode: 0o660, maxConcurrent });
     // Recovery must happen only after the unique controller socket is bound.
     await backend.probe(AbortSignal.timeout(30_000));
   } catch (error) {

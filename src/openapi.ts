@@ -23,14 +23,14 @@ const object = (properties: object, required: string[] = []) => ({ type: 'object
 const strings = { type: 'array', items: { type: 'string' } };
 const scope = { type: 'string', enum: ['read', 'write'], description: 'write 仅允许平台管理和触发索引，不授予代码写入权限。' };
 const expiresIn = { type: 'integer', minimum: 60, maximum: 7776000, default: 2592000, description: '有效期，单位秒；默认 30 天，最多 90 天。' };
-const repoScope = { ...strings, nullable: true, maxItems: 100, description: 'CodeHarbor 仓库 ID 列表；null 表示所有当前有权访问的仓库。' };
+const repoScope = { ...strings, nullable: true, maxItems: 100, description: 'CodeHarbor 仓库 ID 列表；MCP 代码查询要求列表明确包含仓库 ID。null 不能直接查询代码，仅受配置允许的 write 管理员可用于平台管理。' };
 const jobId = object({ job_id: { type: 'string' } }, ['job_id']);
 
 export const openApiDocument = {
   openapi: '3.0.3',
   info: {
     title: 'CodeHarbor API', version: '0.1.0',
-    description: 'CodeHarbor 管理 API 与 MCP 入口。除公开健康检查和云效账号绑定外，管理接口使用 CodeHarbor API Key，而不是云效 PAT。API Key 的 read / write 不改变云效仓库权限。索引任务异步执行，提交成功不代表索引完成。',
+    description: 'CodeHarbor 管理 API 与 MCP 入口。管理接口使用 CodeHarbor API Key。MCP 查询按 Key 的明确仓库列表授权，不逐次检查云效权限；云效撤权或 PAT 失效不会自动撤销 Key，需主动撤销。云效 PAT 仍用于仓库接入和同步。索引任务异步执行，提交成功不代表索引完成。',
   },
   servers: [{ url: '/' }],
   security: [{ ApiKey: [] }],
@@ -40,7 +40,7 @@ export const openApiDocument = {
     '/health/ready': { get: { tags: ['运维'], summary: '服务就绪检查', description: '检查数据库；工作树模式检查 CodeGraph MCP 工具，镜像模式检查调度控制器，不逐个检查仓库镜像。', security: [], responses: { '200': ok('依赖就绪。', ref('Health')), '403': common['403'], '503': ok('依赖不可用。', ref('Health')) } } },
     '/metrics': { get: { tags: ['运维'], summary: 'Prometheus 指标', description: '需要单独配置的 metrics token；未启用时返回 404。', security: [{ MetricsBearer: [] }], responses: { '200': { description: 'Prometheus 文本格式。', content: { 'text/plain': { schema: { type: 'string' } } } }, '401': common['401'], '403': common['403'], '404': common['404'] } } },
     '/api/v1/auth/yunxiao/bind': { post: { tags: ['认证'], summary: '绑定云效个人访问令牌', description: 'PAT 将加密保存。返回的 bootstrap_token 仅用于创建首个 API Key，5 分钟过期且成功使用后失效；重新绑定会使依赖该账号的自动同步仓库需要重新授权。', security: [], requestBody: request(object({ pat: { type: 'string', minLength: 1, maxLength: 4096, format: 'password' } }, ['pat'])), responses: { '200': ok('绑定成功；bootstrap_token 只在此响应中返回。', ref('BootstrapSession')), ...common, '429': error('绑定请求过于频繁。') } } },
-    '/api/v1/auth/bootstrap/keys': { post: { tags: ['认证'], summary: '创建首个 API Key', description: '使用绑定后获得的 bootstrap_token。write 仅允许配置中的用户创建；令牌明文仅在成功响应中返回一次。', security: [{ BootstrapBearer: [] }], requestBody: request(object({ scope, expires_in: expiresIn }, ['scope'])), responses: { '201': ok('密钥创建成功。', ref('BootstrapKey')), ...common } } },
+    '/api/v1/auth/bootstrap/keys': { post: { tags: ['认证'], summary: '创建首个 API Key', description: '使用绑定后获得的 bootstrap_token。首个 Key 无明确仓库范围，不能直接通过 MCP 查询代码；write 仅允许配置中的管理员创建并用于平台管理，管理员可再签发明确仓库范围的 Key。普通 read 初始 Key 无法自己派生 Key。令牌明文仅在成功响应中返回一次。', security: [{ BootstrapBearer: [] }], requestBody: request(object({ scope, expires_in: expiresIn }, ['scope'])), responses: { '201': ok('密钥创建成功。', ref('BootstrapKey')), ...common } } },
     '/api/v1/me': { get: { tags: ['认证'], summary: '当前身份和密钥权限', responses: { '200': ok('当前身份。', ref('Me')), ...common } } },
     '/api/v1/codeup/repositories': { get: { tags: ['云效仓库'], summary: '列出云效可见仓库', description: '仅无限定仓库范围的 API Key 可调用。可见不等于具有克隆权限；接入仓库时会进一步检查。', parameters: [{ name: 'page', in: 'query', schema: { type: 'integer', minimum: 1, default: 1 }, description: '页码；每页最多 100 项。' }], responses: { '200': ok('仓库列表。', object({ repositories: { type: 'array', items: ref('CodeupRepository') }, next_page: { type: 'integer', nullable: true } }, ['repositories', 'next_page'])), ...common } } },
     '/api/v1/repositories': {
@@ -53,11 +53,11 @@ export const openApiDocument = {
     '/api/v1/jobs/{jobId}': { get: { tags: ['仓库与索引'], summary: '查看索引任务', parameters: [pathParam('jobId', '索引任务 ID')], responses: { '200': ok('任务状态。', ref('Job')), ...common } } },
     '/api/v1/api-keys': {
       get: { tags: ['API Key'], summary: '列出当前账号的密钥', description: '限定仓库范围的密钥只返回自身。不会返回密钥明文。', responses: { '200': ok('密钥列表。', object({ keys: { type: 'array', items: ref('KeyInfo') } }, ['keys'])), ...common } },
-      post: { tags: ['API Key'], summary: '创建 API Key', description: '需要 write。新密钥的仓库范围不能超过当前密钥，过期时间不能晚于当前密钥；密钥明文仅在成功响应中返回一次。', requestBody: request(object({ scope, repos: repoScope, expires_in: expiresIn }, ['scope'])), responses: { '201': ok('密钥创建成功。', ref('CreatedKey')), ...common } },
+      post: { tags: ['API Key'], summary: '创建 API Key', description: '需要 write。read Key 必须提供明确的 repos 仓库 ID 列表；新密钥的范围不能超过当前密钥，过期时间不能晚于当前密钥。Key 的 owner 固定为调用者，不支持指定目标用户；代发时审计主体仍是签发者，可用 Key 前缀区分。密钥明文仅返回一次。', requestBody: request(object({ scope, repos: repoScope, expires_in: expiresIn }, ['scope'])), responses: { '201': ok('密钥创建成功。', ref('CreatedKey')), ...common } },
     },
     '/api/v1/api-keys/{prefix}': { delete: { tags: ['API Key'], summary: '撤销 API Key', description: '需要 write；限定仓库范围的密钥只能撤销自身。', parameters: [pathParam('prefix', '密钥前缀，如 ch_ 后跟 8 个字符')], responses: { '200': ok('密钥已撤销。', object({ revoked: { type: 'boolean', enum: [true] } }, ['revoked'])), ...common } } },
     '/api/v1/hooks/codeup/{repoId}': { post: { tags: ['Webhook'], summary: '接收云效 Push Hook', description: '使用仓库创建时返回的 webhook_token。Push Hook 项目 ID、分支和提交须匹配；非 Push Hook 或其他分支事件会被忽略但仍返回 202。全零 after 表示分支删除。', security: [{ WebhookToken: [] }], parameters: [pathParam('repoId', 'CodeHarbor 仓库 ID'), { name: 'codeup-event', in: 'header', required: false, schema: { type: 'string' }, description: 'Push 事件应为 Push Hook。' }], requestBody: request(object({ object_kind: { type: 'string', enum: ['push'] }, project_id: { oneOf: [{ type: 'integer' }, { type: 'string' }] }, ref: { type: 'string' }, after: { type: 'string', pattern: '^[0-9a-f]{40,64}$' } }), true), responses: { '202': ok('事件已接受或被忽略。', object({ accepted: { type: 'boolean', enum: [true] } }, ['accepted'])), ...common } } },
-    '/mcp': { post: { tags: ['MCP'], summary: 'MCP Streamable HTTP 入口', description: '使用 CodeHarbor API Key，通过 MCP 客户端进行 initialize、tools/list 和 tools/call。请求及响应遵循 MCP / JSON-RPC，工具包括 list_repositories、get_repository_status、codegraph_explore，具体输入结构由 tools/list 提供。read 可查询；write 仍不能修改仓库代码。', requestBody: request({ type: 'object', description: 'MCP JSON-RPC 消息。' }, true), responses: { '200': { description: 'MCP 响应；格式和头部遵循 MCP 协议。' }, '202': { description: 'MCP 通知已接受。' }, '400': { description: 'MCP 协议请求错误。' }, '401': { description: '认证失败；返回 MCP JSON-RPC 错误。' }, '403': common['403'], '405': { description: '不支持的方法。' }, '503': { description: '认证服务不可用；返回 MCP JSON-RPC 错误。' } } } },
+    '/mcp': { post: { tags: ['MCP'], summary: 'MCP Streamable HTTP 入口', description: '使用 CodeHarbor API Key，通过 MCP 客户端进行 initialize、tools/list 和 tools/call。工具包括 list_repositories、get_repository_status、codegraph_explore；MCP 查询要求 Key 的 repos 明确包含目标仓库，不逐次核验云效权限。云效撤权不会自动撤销已有 Key。write 不能修改仓库代码。', requestBody: request({ type: 'object', description: 'MCP JSON-RPC 消息。' }, true), responses: { '200': { description: 'MCP 响应；格式和头部遵循 MCP 协议。' }, '202': { description: 'MCP 通知已接受。' }, '400': { description: 'MCP 协议请求错误。' }, '401': { description: '认证失败；返回 MCP JSON-RPC 错误。' }, '403': common['403'], '405': { description: '不支持的方法。' }, '503': { description: '认证服务不可用；返回 MCP JSON-RPC 错误。' } } } },
   },
   components: {
     securitySchemes: {

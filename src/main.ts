@@ -15,6 +15,7 @@ import { buildRepositoryImage } from './image-builder.js';
 import { serveImageAuthorizer } from './image-authorizer.js';
 import { imageAuthorization } from './image-authorization.js';
 import { createInternalMcpHandler } from './internal-mcp.js';
+import { queryConcurrency } from './query-concurrency.js';
 
 async function main() {
   const dataDir = resolve(process.env.CODEHARBOR_DATA_DIR ?? './data');
@@ -65,7 +66,8 @@ async function main() {
       const [queryToken, buildToken, authToken] = await Promise.all([readFile(queryTokenFile, 'utf8'), readFile(buildTokenFile, 'utf8'), readFile(authTokenFile, 'utf8')]);
       if (internalMcpToken && [queryToken, buildToken, authToken].some(token => token.trim() === internalMcpToken)) throw new Error('Internal MCP token must be independent');
       const runtimeId = runtimeImage as `sha256:${string}`;
-      graph = new ImageCodeGraphClient(new SocketImageQueryBackend(querySocket, queryToken.trim()));
+      graph = new ImageCodeGraphClient(new SocketImageQueryBackend(querySocket, queryToken.trim()), undefined,
+        queryConcurrency(process.env.CODEHARBOR_MCP_QUERY_CONCURRENCY));
       const executor = new SocketImageBuildExecutor({ path: buildSocket, token: buildToken.trim(), runtimeImage: runtimeId });
       imagePipeline = new ImageIndexPipeline(runtimeId, graph, undefined,
         request => buildRepositoryImage(request, executor.execute));

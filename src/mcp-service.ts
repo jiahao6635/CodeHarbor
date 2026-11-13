@@ -5,8 +5,8 @@ import { createMcpHandler, type McpRepository } from './mcp.js';
 
 export interface McpServiceBackend {
   authenticate(authorization: string): Promise<boolean>;
-  list(authorization: string): Promise<McpRepository[]>;
-  get(authorization: string, repoId: string): Promise<McpRepository | null>;
+  list(authorization: string, signal?: AbortSignal): Promise<McpRepository[]>;
+  get(authorization: string, repoId: string, signal?: AbortSignal): Promise<McpRepository | null>;
   explore(authorization: string, repoId: string, query: string, signal: AbortSignal): Promise<{ repository: McpRepository; result: string } | null>;
   probe(signal: AbortSignal): Promise<void>;
 }
@@ -74,13 +74,13 @@ export class SocketMcpBackend implements McpServiceBackend {
     if (typeof result !== 'boolean') throw new Error('Invalid authentication response');
     return result;
   }
-  async list(authorization: string): Promise<McpRepository[]> {
-    const result = await this.request({ op: 'list', authorization });
+  async list(authorization: string, signal?: AbortSignal): Promise<McpRepository[]> {
+    const result = await this.request({ op: 'list', authorization }, signal);
     if (!Array.isArray(result)) throw new Error('Invalid repository list');
     return result.map(repository);
   }
-  async get(authorization: string, repoId: string): Promise<McpRepository | null> {
-    const result = await this.request({ op: 'get', authorization, repoId });
+  async get(authorization: string, repoId: string, signal?: AbortSignal): Promise<McpRepository | null> {
+    const result = await this.request({ op: 'get', authorization, repoId }, signal);
     return result === null ? null : repository(result);
   }
   async explore(authorization: string, repoId: string, query: string, signal: AbortSignal): Promise<{ repository: McpRepository; result: string } | null> {
@@ -109,8 +109,8 @@ export function createMcpService(options: { backend: McpServiceBackend; allowedH
       if (!authorization || !/^Bearer ch_[A-Za-z0-9_-]{43}$/.test(authorization)) return null;
       return await options.backend.authenticate(authorization) ? authorization : null;
     },
-    listRepositories: auth => options.backend.list(auth),
-    getRepository: (auth, id) => options.backend.get(auth, id),
+    listRepositories: (auth, signal) => options.backend.list(auth, signal),
+    getRepository: (auth, id, signal) => options.backend.get(auth, id, signal),
     remoteExplore: (auth, id, query, signal) => options.backend.explore(auth, id, query, signal),
   });
   const server = createServer((req, res) => {

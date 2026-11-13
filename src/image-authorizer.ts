@@ -117,7 +117,8 @@ export async function serveImageAuthorizer(options: {
       })();
     });
   });
-  server.maxConnections = 16;
+  // The query controller supports up to 32 simultaneous queries; retain room for control traffic.
+  server.maxConnections = 48;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(options.path, () => { server.removeListener('error', reject); resolve(); });

@@ -65,3 +65,20 @@ test('rejects unsafe socket directory and invalid configuration', async () => {
     await assert.rejects(serveImageAuthorizer({ path: join(dir, 'auth.sock'), token, authorize: async () => true }), /Unsafe/);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('authorizer accepts 32 parallel queries without dropping connections', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ch-auth-parallel-')); const path = join(dir, 'auth.sock');
+  let entered!: () => void; let release!: () => void; let active = 0;
+  const allEntered = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const server = await serveImageAuthorizer({ path, token, authorize: async () => {
+    if (++active === 32) entered();
+    await gate; return true;
+  } });
+  const client = new SocketImageAuthorizer(path, token, 5000);
+  const pending = Array.from({ length: 32 }, () => client.authorize(digest, repoId, commit));
+  try {
+    await allEntered; release();
+    assert.deepEqual(await Promise.all(pending), Array.from({ length: 32 }, () => true));
+  } finally { release(); await Promise.allSettled(pending); await server.close(); await rm(dir, { recursive: true, force: true }); }
+});

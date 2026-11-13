@@ -10,7 +10,6 @@ import test from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { CredentialCipher, createAccessKey } from '../src/auth.js';
-import { CodeupError } from '../src/codeup.js';
 import { ImageCodeGraphClient } from '../src/image-codegraph.js';
 import { createInternalMcpHandler } from '../src/internal-mcp.js';
 import { createApp, type AuditEvent } from '../src/server.js';
@@ -67,12 +66,9 @@ test('split MCP process shares platform authorization and publication locking', 
     },
     async probe() {}, async close() {},
   });
-  let permitted = true;
+  let cloudCalls = 0;
   const fakeCodeup = {
-    async getRepository(_token: string, id: string) {
-      if (!permitted) throw new CodeupError('not_found', 404);
-      return {id, name:'fixture', path:'fixture', accessLevel:30, httpUrlToRepo:'https://git.example/fixture.git'};
-    },
+    async getRepository() { cloudCalls++; throw new Error('Cloud must not be called for indexed queries'); },
   };
   const audits: AuditEvent[] = [];
   const allowedHosts: string[] = [];
@@ -80,7 +76,8 @@ test('split MCP process shares platform authorization and publication locking', 
   const app = createApp({dataDir:root, databasePath:join(root,'state.sqlite'), credentialKey:encryptionKey,
     codeupEndpoint:'https://devops.example', allowedGitHosts:['git.example'], allowedHosts,
     writeUsers:[], codegraphBin:'codegraph', publicMcpDisabled:true},
-  {codeup:fakeCodeup as never, graph:graph as never, worker:worker as never, probe:async () => permitted, audit:event => audits.push(event)});
+  {codeup:fakeCodeup as never, graph:graph as never, worker:worker as never,
+    probe:async () => { cloudCalls++; throw new Error('Clone probe must not run for indexed queries'); }, audit:event => audits.push(event)});
   let internal: Awaited<ReturnType<typeof createInternalMcpHandler>> | undefined;
   let child: ChildProcess | undefined;
   let appClosed = false;
@@ -131,12 +128,37 @@ test('split MCP process shares platform authorization and publication locking', 
     assert.equal(keyResult.isError,true); assert.doesNotMatch(JSON.stringify(keyResult),/fixture-query-result/);
 
     const second = await clientFor(key2.token);
-    const permissionGate = {started:deferred(),finish:deferred()}; gates.set('permission-revoke',permissionGate);
-    const permissionQuery = second.callTool({name:'codegraph_explore',arguments:{repo_id:repoId,query:'permission-revoke'}});
-    await permissionGate.started.promise; permitted = false; permissionGate.finish.release();
-    const permissionResult = await permissionQuery;
-    assert.equal(permissionResult.isError,true); assert.doesNotMatch(JSON.stringify(permissionResult),/fixture-query-result/);
-    permitted = true;
+    const disableGate = {started:deferred(),finish:deferred()}; gates.set('repository-disabled',disableGate);
+    const disabledQuery = second.callTool({name:'codegraph_explore',arguments:{repo_id:repoId,query:'repository-disabled'}});
+    await disableGate.started.promise; await app.store.updateRepository(repoId,{status:'disabled'}); disableGate.finish.release();
+    const disabledResult = await disabledQuery;
+    assert.equal(disabledResult.isError,true); assert.doesNotMatch(JSON.stringify(disabledResult),/fixture-query-result/);
+    await app.store.updateRepository(repoId,{status:'ready'});
+
+    const parallelAKey = createAccessKey(); const parallelBKey = createAccessKey();
+    for (const [owner, id, cloudId, image, commit, key] of [
+      ['parallel-a', 'repo-a', '124', 'c', 'd', parallelAKey],
+      ['parallel-b', 'repo-b', '125', 'e', 'f', parallelBKey],
+    ] as const) {
+      await app.store.createUser({id:owner,username:owner,credential:cipher.encrypt(credential,owner),credential_version:1});
+      await app.store.createRepository({id,codeup_id:cloudId,name:id,branch:'main',owner,sync_owner:owner,
+        sync_credential_version:1,hook_hash:'hook',path:`oci://sha256:${image.repeat(64)}`,commit:commit.repeat(40),indexed_at:Date.now(),status:'ready',error:null});
+      await app.store.createKey({...key,owner,scope:'read',repos:[id],expires_at:null,revoked:0});
+    }
+    const parallelA = await clientFor(parallelAKey.token); const parallelB = await clientFor(parallelBKey.token);
+    const gateA = {started:deferred(),finish:deferred()}; const gateB = {started:deferred(),finish:deferred()};
+    gates.set('parallel-a',gateA); gates.set('parallel-b',gateB);
+    const queryA = parallelA.callTool({name:'codegraph_explore',arguments:{repo_id:'repo-a',query:'parallel-a'}});
+    const queryB = parallelB.callTool({name:'codegraph_explore',arguments:{repo_id:'repo-b',query:'parallel-b'}});
+    // Reaching both barriers proves independent users and repositories run concurrently.
+    await Promise.all([gateA.started.promise,gateB.started.promise]);
+    await app.store.revokeKey(parallelAKey.hash);
+    gateA.finish.release();
+    const resultA = await queryA;
+    assert.equal(resultA.isError,true); assert.doesNotMatch(JSON.stringify(resultA),/fixture-query-result/);
+    gateB.finish.release();
+    const resultB = await queryB;
+    assert.notEqual(resultB.isError,true); assert.match(JSON.stringify(resultB),/fixture-query-result/);
 
     const lockGate = {started:deferred(),finish:deferred()}; gates.set('publish-lock',lockGate);
     const lockQuery = second.callTool({name:'codegraph_explore',arguments:{repo_id:repoId,query:'publish-lock'}});
@@ -155,7 +177,9 @@ test('split MCP process shares platform authorization and publication locking', 
     assert.equal((await fetch(`${base}/mcp`,{method:'POST',headers:{authorization:`Bearer ${key2.token}`}})).status,503);
     const serializedAudit = JSON.stringify(audits);
     assert.doesNotMatch(serializedAudit,/fixture-private-pat|fixture-query-result/);
-    assert.ok(!serializedAudit.includes(key1.token) && !serializedAudit.includes(serviceToken));
+    assert.ok(!serializedAudit.includes(key1.token) && !serializedAudit.includes(parallelAKey.token) &&
+      !serializedAudit.includes(parallelBKey.token) && !serializedAudit.includes(serviceToken));
+    assert.equal(cloudCalls,0);
   } finally {
     for (const gate of gates.values()) gate.finish.release();
     for (const client of clients) await client.close().catch(() => {});

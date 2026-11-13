@@ -66,7 +66,8 @@ test('private MCP IPC requires both credentials and rechecks authorization aroun
   const dir = mkdtempSync(join(tmpdir(), 'ch-internal-'));
   const path = join(dir, 'rpc.sock'); const secret = 'x'.repeat(40); const key = randomBytes(32);
   const access = createAccessKey(); const wrongKey = createAccessKey();
-  let cloneAllowed = true; let duringQuery: (() => Promise<void>) | undefined;
+  const unscoped = createAccessKey(); const otherRepo = createAccessKey(); const expired = createAccessKey();
+  let cloudCalls = 0; let duringQuery: (() => Promise<void>) | undefined;
   let graphChecks = 0;
   const audit: AuditEvent[] = [];
   const graph = {
@@ -81,12 +82,15 @@ test('private MCP IPC requires both credentials and rechecks authorization aroun
     codeupEndpoint: 'https://devops.example', allowedGitHosts: ['git.example'], allowedHosts: [],
     writeUsers: [], codegraphBin: 'codegraph' }, {
     graph: graph as never, worker: { async stop() {} } as never,
-    codeup: { async getRepository() { return { id: '11', accessLevel: 30, httpUrlToRepo: 'https://git.example/11.git' }; } } as never,
-    probe: async () => cloneAllowed,
+    codeup: { async getRepository() { cloudCalls++; throw new Error('Cloud must not be called for indexed queries'); } } as never,
+    probe: async () => { cloudCalls++; throw new Error('Clone probe must not run for indexed queries'); },
     audit: event => audit.push(event),
   });
   await app.store.createUser({ id: 'alice', username: 'alice', credential: new CredentialCipher(key).encrypt('pat', 'alice'), credential_version: 1 });
   await app.store.createKey({ hash: access.hash, prefix: access.prefix, owner: 'alice', scope: 'read', repos: ['repo1'], expires_at: null, revoked: 0 });
+  await app.store.createKey({ hash: unscoped.hash, prefix: unscoped.prefix, owner: 'alice', scope: 'read', repos: null, expires_at: null, revoked: 0 });
+  await app.store.createKey({ hash: otherRepo.hash, prefix: otherRepo.prefix, owner: 'alice', scope: 'read', repos: ['repo2'], expires_at: null, revoked: 0 });
+  await app.store.createKey({ hash: expired.hash, prefix: expired.prefix, owner: 'alice', scope: 'read', repos: ['repo1'], expires_at: Date.now() - 1, revoked: 0 });
   await app.store.createRepository({ id: 'repo1', codeup_id: '11', name: 'repo', branch: 'main', owner: 'alice', sync_owner: 'alice',
     sync_credential_version: 1, hook_hash: 'hook', path: '/secret/internal/path', commit: 'a'.repeat(40), indexed_at: 1000, status: 'ready', error: null });
   const ipc = await createInternalMcpHandler({ path, token: secret, backend: app.internalMcp });
@@ -98,6 +102,11 @@ test('private MCP IPC requires both credentials and rechecks authorization aroun
     assert.deepEqual(await send(path, { op: 'probe', token: 'not-the-token' }), { ok: false });
     assert.deepEqual(await request('authenticate'), { ok: true, result: true });
     assert.deepEqual(await request('authenticate', { authorization: `Bearer ${wrongKey.token}` }), { ok: true, result: false });
+    assert.deepEqual(await request('authenticate', { authorization: `Bearer ${expired.token}` }), { ok: true, result: false });
+    assert.deepEqual(await request('list', { authorization: `Bearer ${unscoped.token}` }), { ok: true, result: [] });
+    assert.deepEqual(await request('get', { authorization: `Bearer ${unscoped.token}`, repoId: 'repo1' }), { ok: true, result: null });
+    assert.deepEqual(await request('explore', { authorization: `Bearer ${unscoped.token}`, repoId: 'repo1', query: 'query' }), { ok: true, result: null });
+    assert.deepEqual(await request('get', { authorization: `Bearer ${otherRepo.token}`, repoId: 'repo1' }), { ok: true, result: null });
     assert.deepEqual(await request('list', { owner: 'alice' }), { ok: false });
     assert.deepEqual(await request('get', { repoId: '../repo1' }), { ok: false });
     assert.deepEqual(await request('explore', { repoId: 'repo1', query: 'query', projectPath: '/etc' }), { ok: false });
@@ -109,9 +118,8 @@ test('private MCP IPC requires both credentials and rechecks authorization aroun
     const queried = await request('explore', { repoId: 'repo1', query: 'find service' });
     assert.equal(queried.ok, true); assert.equal(queried.result.result.result, 'matching code');
     assert.ok(!JSON.stringify(queried).includes('/secret/internal/path'));
-    cloneAllowed = false;
-    assert.deepEqual(await request('get', { repoId: 'repo1' }), { ok: true, result: null });
-    cloneAllowed = true;
+    assert.deepEqual(await request('get', { repoId: 'unknown' }), { ok: true, result: null });
+    assert.equal(cloudCalls, 0);
     duringQuery = async () => { await app.store.updateRepository('repo1', { commit: 'b'.repeat(40) }); };
     assert.deepEqual(await request('explore', { repoId: 'repo1', query: 'changed during query' }), { ok: true, result: null });
     await app.store.updateRepository('repo1', { commit: 'a'.repeat(40) });
@@ -121,7 +129,7 @@ test('private MCP IPC requires both credentials and rechecks authorization aroun
     for (const tool of ['list_repositories', 'get_repository_status', 'codegraph_explore']) {
       assert.ok(audit.some(event => event.tool === tool && event.tool_outcome === 'success' && event.subject === 'alice' && event.key_prefix === access.prefix));
     }
-    assert.ok(audit.some(event => event.tool === 'get_repository_status' && event.tool_outcome === 'error' && event.repo_id === 'repo1'));
+    assert.ok(audit.some(event => event.tool === 'get_repository_status' && event.tool_outcome === 'error' && event.repo_id === 'unknown'));
     const auditText = JSON.stringify(audit);
     assert.ok(!auditText.includes(access.token) && !auditText.includes(secret) && !auditText.includes('find service') && !auditText.includes('matching code') && !auditText.includes('/secret/internal/path'));
   } finally {

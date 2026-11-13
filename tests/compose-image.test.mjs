@@ -26,6 +26,8 @@ for (const localPostgres of [false, true]) {
     const raw = execFileSync('docker', ['compose', '--env-file', '/dev/null', ...files, 'config', '--format', 'json'], { cwd: resolve('.'), env, encoding: 'utf8' });
     const config = JSON.parse(raw); const app = config.services.codeharbor; const controller = config.services['image-controller'];
     assert.equal(app.environment.CODEHARBOR_INDEX_BACKEND, 'image');
+    assert.equal(app.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');
+    assert.equal(controller.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');
     assert.equal(app.environment.TMPDIR, '/data');
     assert.equal(app.volumes.some((volume) => ['/data', '/var/run/docker.sock'].includes(volume.target)), false);
     assert.ok(app.tmpfs.some((item) => item.startsWith('/data:')));
@@ -41,3 +43,15 @@ for (const localPostgres of [false, true]) {
     }
   });
 }
+
+test('image Compose passes one configurable query limit to platform and controller, including split MCP', { skip: !available }, () => {
+  const files = ['-f', 'deploy/compose.yaml', '-f', 'deploy/compose.postgres.yaml', '-f', 'deploy/compose.image.yaml', '-f', 'deploy/compose.split.yaml'];
+  const configured = { ...env, CODEHARBOR_MCP_QUERY_CONCURRENCY: '7', CODEHARBOR_MCP_ALLOWED_HOSTS: '10.0.0.2:18080',
+    CODEHARBOR_MCP_LISTEN_ADDR: '10.0.0.2', CODEHARBOR_INTERNAL_MCP_SOCKET_DIR: '/tmp/internal-mcp',
+    CODEHARBOR_INTERNAL_MCP_TOKEN_HOST_FILE: '/tmp/internal-mcp-token' };
+  const raw = execFileSync('docker', ['compose', '--env-file', '/dev/null', ...files, 'config', '--format', 'json'], { cwd: resolve('.'), env: configured, encoding: 'utf8' });
+  const services = JSON.parse(raw).services;
+  assert.equal(services.codeharbor.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '7');
+  assert.equal(services['image-controller'].environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '7');
+  assert.equal(services.mcp.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, undefined);
+});

@@ -9,7 +9,63 @@ const MAX_ADVERTISEMENT_BYTES = 1024 * 1024;
 const MAX_PACK_BYTES = 32 * 1024 * 1024;
 const TIMEOUT_MS = 30_000;
 const MAX_CONCURRENT = 2;
-let active = 0;
+const MAX_WAITING = 64;
+
+type Waiter = { grant: () => void; cancel: () => void };
+
+/** Bound cloud probes separately from callers, without caching authorization. */
+export class CloneProbeGate {
+  private active = 0;
+  private readonly waiters: Waiter[] = [];
+
+  constructor(private readonly maxActive: number, private readonly maxWaiting: number, private readonly waitMs: number) {
+    if (!Number.isSafeInteger(maxActive) || maxActive < 1 || !Number.isSafeInteger(maxWaiting) || maxWaiting < 0 ||
+        !Number.isSafeInteger(waitMs) || waitMs < 1) throw new Error('Invalid clone authorization limit');
+  }
+
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) throw new IndexError('AUTH_UNAVAILABLE', 'Clone authorization unavailable');
+    if (this.active < this.maxActive && this.waiters.length === 0) {
+      this.active++;
+      return this.releaseOnce();
+    }
+    if (this.waiters.length >= this.maxWaiting) throw new IndexError('AUTH_BUSY', 'Clone authorization is busy');
+    return await new Promise<() => void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); };
+      const remove = () => { const index = this.waiters.indexOf(waiter); if (index >= 0) this.waiters.splice(index, 1); };
+      const abort = () => {
+        if (settled) return;
+        settled = true; remove(); cleanup();
+        reject(new IndexError('AUTH_UNAVAILABLE', 'Clone authorization unavailable'));
+      };
+      const waiter: Waiter = {
+        grant: () => { if (settled) return; settled = true; cleanup(); resolve(this.releaseOnce()); },
+        cancel: () => {
+          if (settled) return;
+          settled = true; remove(); cleanup();
+          reject(new IndexError('AUTH_BUSY', 'Clone authorization is busy'));
+        },
+      };
+      const timer = setTimeout(waiter.cancel, this.waitMs); timer.unref();
+      this.waiters.push(waiter);
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+    });
+  }
+
+  private releaseOnce(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.waiters.shift();
+      if (next) next.grant(); else this.active--;
+    };
+  }
+}
+
+const gate = new CloneProbeGate(MAX_CONCURRENT, MAX_WAITING, TIMEOUT_MS);
 
 function packet(text: string): string {
   return (Buffer.byteLength(text) + 4).toString(16).padStart(4, '0') + text;
@@ -132,18 +188,20 @@ async function verifyPack(pack: Buffer, commit: string, signal: AbortSignal): Pr
 }
 
 /** Prove this identity can receive a complete bounded Git upload-pack response. */
-export async function checkCloneAccess(request: IndexRequest): Promise<boolean> {
-  if (active >= MAX_CONCURRENT) throw new IndexError('AUTH_BUSY', 'Clone authorization is busy');
-  active++;
+export async function checkCloneAccess(request: IndexRequest, signal?: AbortSignal): Promise<boolean> {
+  const release = await gate.acquire(signal);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS); timer.unref();
+  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   try {
+    if (combined.aborted) throw new Error('Clone authorization cancelled');
     const origin = new URL(validateRequest(request));
     if (request.gitUsername.includes(':')) return false;
     const auth = `Basic ${Buffer.from(`${request.gitUsername}:${request.token}`).toString('base64')}`;
     const base = origin.pathname.replace(/\/$/, '');
     const advertisement = new URL(origin); advertisement.pathname = `${base}/info/refs`; advertisement.search = '?service=git-upload-pack';
-    const response = await fetch(advertisement, { redirect: 'error', signal: controller.signal, headers: { authorization: auth } });
+    const response = await fetch(advertisement, { redirect: 'error', signal: combined, headers: { authorization: auth } });
+    if (combined.aborted) throw new Error('Clone authorization cancelled');
     if ([401, 403, 404].includes(response.status)) return false;
     if (!response.ok || response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() !== 'application/x-git-upload-pack-advertisement') throw new Error('Git advertisement unavailable');
     const { commit, capabilities } = advertisedRef(await readBounded(response, MAX_ADVERTISEMENT_BYTES), request.branch);
@@ -151,14 +209,16 @@ export async function checkCloneAccess(request: IndexRequest): Promise<boolean> 
     const selected = [capabilities.has('side-band-64k') ? 'side-band-64k' : capabilities.has('side-band') ? 'side-band' : '', capabilities.has('filter') ? 'filter' : '', commit.length === 64 ? 'object-format=sha256' : ''].filter(Boolean);
     const body = packet(`want ${commit}${selected.length ? ' ' + selected.join(' ') : ''}\n`) + packet('deepen 1\n') + (capabilities.has('filter') ? packet('filter blob:none\n') : '') + '0000' + packet('done\n');
     const upload = new URL(origin); upload.pathname = `${base}/git-upload-pack`;
-    const result = await fetch(upload, { method: 'POST', redirect: 'error', signal: controller.signal,
+    const result = await fetch(upload, { method: 'POST', redirect: 'error', signal: combined,
       headers: { authorization: auth, 'content-type': 'application/x-git-upload-pack-request', accept: 'application/x-git-upload-pack-result' }, body });
+    if (combined.aborted) throw new Error('Clone authorization cancelled');
     if ([401, 403, 404].includes(result.status)) return false;
     if (!result.ok || result.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() !== 'application/x-git-upload-pack-result') throw new Error('Git pack unavailable');
     const pack = validPackResponse(await readBounded(result, MAX_PACK_BYTES), commit, sideband);
     if (!pack) throw new Error('Invalid Git pack');
-    await verifyPack(pack, commit, controller.signal);
+    await verifyPack(pack, commit, combined);
+    if (combined.aborted) throw new Error('Clone authorization cancelled');
     return true;
   } catch { throw new IndexError('AUTH_UNAVAILABLE', 'Clone authorization unavailable'); }
-  finally { clearTimeout(timer); controller.abort(); active--; }
+  finally { clearTimeout(timer); controller.abort(); release(); }
 }

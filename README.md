@@ -7,13 +7,13 @@ CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库
 - 用户使用云效个人访问令牌（PAT）绑定身份，创建只读或平台读写 CodeHarbor Key。
 - 使用 Codeup 仓库 ID 接入仓库，首次及变化后以独立目录全量构建 CodeGraph 1.6.2 索引；相同 commit 不重复构建。
 - Codeup Push Webhook、手动同步和 15 分钟对账；保留上次成功索引，报告 commit 和新鲜度。
-- 单个 `/mcp` 地址，提供 `list_repositories`、`get_repository_status`、`codegraph_explore`；每次调用按用户云效权限及 Key 仓库范围鉴权。
+- 单个 `/mcp` 地址，提供 `list_repositories`、`get_repository_status`、`codegraph_explore`；查询依据 CodeHarbor Key 中明确列出的仓库范围鉴权，不在每次查询时请求云效。
 - `write` Key 仅允许平台管理及触发索引，不能写云效代码。
 - 可选择仓库镜像后端：每个仓库的源码快照和索引打包为本机 Docker 镜像，查询容器使用经过适配的只读 CodeGraph；配置和迁移边界见 [镜像后端指南](docs/image-backend.md)。
 
 **使用边界**：此版本在生产模式使用 PostgreSQL 和 Vault Transit；仍是单进程 Worker，不支持多副本或跨进程租约与 fencing。它尚未通过真实云效账号和企业权限策略联调；部署前需验证云效身份、克隆/下载管控、继承权限和浏览者实际代码访问权。未经这些验证不要用于生产多租户环境。Index Worker 和共享 CodeGraph 进程还需要部署级文件系统及网络隔离；源码和索引须按源码等级保护。发布后保留当前及上一个受管理的索引版本；未知或无所有权标记的旧目录不会自动删除。
 
-查询仓库时，以调用者自己的云效 PAT 验证 HTTPS Git 对象下载；索引同步另使用仓库授权的同步账号。验证最多并发 2 次，每次总超时 30 秒、响应不超过 32 MiB 和 100,000 个对象；空仓库、没有可探测分支或服务器不支持 shallow 时无法验证。超时、超限和校验失败会拒绝访问，并返回授权不可用；探测需要临时目录空间，详见 [生产部署指南](docs/production-deployment.md)。
+查询已发布索引时，平台检查 Key 的有效期、撤销状态及明确的仓库 ID 列表，不重新检查持有人的云效权限；仓库更新后 Key 的范围保持不变。**云效撤权或 PAT 失效不会自动撤销 CodeHarbor Key 的读取权限**，应由管理员及时撤销或替换 Key。仓库首次接入及自动同步仍使用凭证持有人明确授权的 PAT 验证 Git 克隆权限；同步失败保留上一次成功的索引并报告状态，详见 [生产部署指南](docs/production-deployment.md)。
 
 ## 开发运行
 
@@ -34,6 +34,7 @@ npm run build
 | `DATABASE_URL` 或 `CODEHARBOR_DATABASE_URL_FILE` | PostgreSQL 连接串或受保护的连接串文件，二者只能设置一个；生产必须启用 `sslmode=verify-full` |
 | `CODEHARBOR_KEY_PROVIDER` | 生产设为 `vault-transit`；Vault 配置见 [Vault Transit 文档](docs/vault-transit.md) |
 | `CODEHARBOR_METRICS_TOKEN_FILE` | 可选，独立监控 Bearer 密钥文件；未配置时 `/metrics` 不开放 |
+| `CODEHARBOR_MCP_QUERY_CONCURRENCY` | 镜像模式并发查询上限，默认 `10`，可设 `1`～`32`；平台与镜像控制器必须一致 |
 | `YUNXIAO_ENDPOINT` | 必填，可信云效 API HTTPS 源，例如 `https://example.yunxiao.example` |
 | `YUNXIAO_ORGANIZATION_ID` | 云效中心版组织 ID；Region 版按实际 API 配置 |
 | `CODEHARBOR_GIT_HOSTS` | 必填，允许拉取的 HTTPS Git 主机，逗号分隔；包含非标准端口时写 `host:port` |
@@ -59,11 +60,23 @@ npm run build
 使用可信终端中的交互 CLI 绑定 PAT；不要将 PAT 写入命令参数、聊天消息或 shell 历史。令牌需要云效用户、仓库只读和 HTTPS Git 读取的必要权限，具体 scope 以企业云效版本为准：
 
 ```sh
-node dist/cli.js bind --url http://127.0.0.1:8080 --scope read
-# 要创建 write Key：先将自己的云效用户 ID 加入 CODEHARBOR_WRITE_USERS 并重启，随后使用 --scope write
+node dist/cli.js bind --url http://127.0.0.1:8080 --scope write
+# 创建 write Key 前，先将自己的云效用户 ID 加入 CODEHARBOR_WRITE_USERS 并重启
 ```
 
-CLI 隐藏 PAT 输入；CodeHarbor Key 明文只返回一次，使用者应自行安全保存。也可调用 `POST /api/v1/auth/yunxiao/bind` 和 `POST /api/v1/auth/bootstrap/keys`；PAT 只能经可信 TLS 或本机回环传输，首次引导凭证有效 5 分钟且只能使用一次。重新绑定同一用户的 PAT 可更新凭证，不应在未验证云效权限状态时认为其他用户的索引可访问。
+CLI 隐藏 PAT 输入；CodeHarbor Key 明文只返回一次，使用者应自行安全保存。也可调用 `POST /api/v1/auth/yunxiao/bind` 和 `POST /api/v1/auth/bootstrap/keys`；PAT 只能经可信 TLS 或本机回环传输，首次引导凭证有效 5 分钟且只能使用一次。
+
+首次引导产生的 Key 没有明确的仓库列表（`repos: null`），**不能直接通过 MCP 查询仓库代码**。平台管理员使用 write Key 接入仓库后，调用 `POST /api/v1/api-keys` 签发 `repos` 中明确列出 CodeHarbor 仓库 ID 的 read Key，并通过安全渠道交给使用者；该 Key 仅能查询列出的仓库。受配置允许的 write 管理员仍可用 `repos: null` 的管理 Key 操作平台和创建限定范围的 Key。普通用户的旧 `repos: null` read Key 不会自动扩为全部仓库权限，需由管理员重新签发限定范围的 Key。新建 read Key 必须提供 `repos` 列表。
+
+当前创建 Key 接口只为调用者本人签发，不支持指定目标用户。管理员代发的 Key 在审计中仍归属于管理员，可通过 Key 前缀区分不同 Key，但不能自动识别实际使用者；普通用户的初始 read Key 不能自己派生限定范围的 Key。请按公司策略决定 Key 的分发方式和审计要求。
+
+管理员创建限定仓库范围的 read Key 时，请求 `POST /api/v1/api-keys`，使用管理员 write Key 的 Bearer 认证，请求体示例：
+
+```json
+{"scope":"read","repos":["<CodeHarbor 仓库 ID>"],"expires_in":86400}
+```
+
+此处 ID 是平台接入后返回的 `repo_id`，不是云效仓库 ID；有效期为秒，且不能超过父 Key 的有效期。成功响应中的 `token` 只返回一次，须安全保存和分发。
 
 管理端点需要 Bearer Key：
 

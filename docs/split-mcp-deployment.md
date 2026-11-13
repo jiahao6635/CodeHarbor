@@ -25,6 +25,8 @@ export CODEHARBOR_INTERNAL_MCP_TOKEN_HOST_FILE=/path/to/private-internal-mcp-tok
 
 `CODEHARBOR_MCP_ALLOWED_HOSTS` 与客户端请求的 HTTP `Host` 严格匹配，默认端口以外的地址要包含端口；如果还需要经过可信代理或健康检查访问，应明确加入相应 Host，多个值以逗号分隔。非浏览器 MCP 客户端一般不发送 `Origin`；浏览器客户端仅在确有需要时设置 `CODEHARBOR_MCP_ALLOWED_ORIGINS`，填入允许的完整 Origin。
 
+镜像查询并发通过 `CODEHARBOR_MCP_QUERY_CONCURRENCY` 控制，默认 `10`、可配置 `1`～`32` 的整数。平台和镜像控制器必须使用同一个值；`compose.image.yaml` 会将该变量同时传给两者，独立 MCP 网关无需单独配置。上线时同时更新平台和控制器，并按实际负载验证 CPU、内存和等待时间。
+
 执行以下命令前检查合并结果：平台原有非目标挂载、PostgreSQL/Vault/镜像配置必须保留，`nginx.split.conf` 应替换原 Nginx 站点配置，MCP 只发布到指定内网 IP，且无 Docker socket、数据库或 Vault 密钥挂载。若部署使用本机 PostgreSQL，在 `compose.yaml` 与 `compose.image.yaml` 之间加入 `-f deploy/compose.postgres.yaml`；其他现有受控 override 也需在合并后核对。
 
 ```sh
@@ -34,11 +36,15 @@ docker compose -f deploy/compose.yaml -f deploy/compose.image.yaml -f deploy/com
 
 首次启动或升级时应选择维护窗口，确认平台、镜像控制器和 MCP 都已就绪。内网访问仍使用已有 CodeHarbor Key，通过 `Authorization: Bearer <Key>` 认证；不要把云效 PAT 发给 MCP 客户端。已配置旧公网 MCP 地址的客户端需要迁移到内网地址。
 
+MCP 查询需要有效且 `repos` 明确包含目标仓库 ID 的 Key；旧 `repos: null` Key 不自动获得所有仓库的代码读取权。管理员应为使用者签发限定仓库范围的 Key。查询不再实时核验云效权限，云效撤权或 PAT 失效时已有 Key 仍可读取其范围内的旧索引，必须通过 CodeHarbor 撤销或替换 Key 收回访问；接入和同步仍使用对应授权 PAT。
+
+管理员代发 Key 时，当前接口不能指定目标用户，Key 的 owner 和审计主体仍为签发者，仅可用 Key 前缀区分。普通用户的 `repos: null` 初始 read Key 不能自己派生限定范围的 Key；Key 分发与实际使用者识别需通过受控的企业流程处理。
+
 ## 验收与回退
 
 - 从另一台有访问权限的 ECS 检查内网地址，使用真实只读 Key 完成 MCP initialize、工具列表和已授权仓库查询；测试错误或已撤销 Key、无权仓库均被拒绝。
 - 验证 MCP 内网入口不能调用平台管理 API；检查公网 `https://codegraph.sigmob.com/mcp` 不再提供 MCP，而原有管理 API 和 Swagger 按既有策略可用。
-- 验证索引构建期间与完成后 MCP 查询、仓库权限撤销、平台重启和 MCP 重启；平台或内部 socket 不可用时应拒绝请求，不能绕过鉴权。
+- 验证索引构建期间与完成后 MCP 查询、CodeHarbor Key 撤销、平台重启和 MCP 重启；平台或内部 socket 不可用时应拒绝请求，不能绕过鉴权。另确认云效撤权不会自动撤销 Key，并按企业流程及时撤销对应 CodeHarbor Key。
 - 验证应用和 MCP 容器日志不包含 Bearer、内部 token 或查询源码；检查实际发布端口仅绑定目标内网 IP。`/health/ready` 不能替代一次实际仓库查询。
 
 如需回退，按原部署命令恢复之前的 Compose 组合和 Nginx 配置，并核对实际平台版本和监听端口。不要删除 PostgreSQL、Vault、镜像控制器状态或仓库镜像；回退前应通知使用新内网地址的客户端。公网 MCP 是否重新开放须由部署决策明确确认。

@@ -65,7 +65,11 @@ test('real PostgreSQL-backed HTTP and MCP use case', { skip: !baseUrl, timeout: 
     assert.equal((await store.getJob(created.json.job_id))?.status,'queued');
     const repoId = created.json.repository.repo_id;
     await store.updateRepository(repoId,{path:'/internal/project',commit:'a'.repeat(40),indexed_at:Date.now(),status:'ready'});
-    const mcp = await request('POST','/mcp',key,{jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'codegraph_explore',arguments:{repo_id:repoId,query:'find code'}}});
+    const unscoped = await request('POST','/mcp',key,{jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'codegraph_explore',arguments:{repo_id:repoId,query:'find code'}}});
+    assert.doesNotMatch(JSON.stringify(unscoped.json),/indexed code/);
+    const scoped = await request('POST','/api/v1/api-keys',key,{scope:'read',repos:[repoId],expires_in:3600});
+    assert.equal(scoped.status,201);
+    const mcp = await request('POST','/mcp',scoped.json.token,{jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'codegraph_explore',arguments:{repo_id:repoId,query:'find code'}}});
     assert.equal(mcp.status,200); assert.match(JSON.stringify(mcp.json),/indexed code/);
     const bindBob = await request('POST','/api/v1/auth/yunxiao/bind',undefined,{pat:'bob-test'});
     const bob = await request('POST','/api/v1/auth/bootstrap/keys',bindBob.json.bootstrap_token,{scope:'read'});

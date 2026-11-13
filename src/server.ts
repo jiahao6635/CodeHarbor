@@ -101,7 +101,7 @@ function errorResponse(res: ServerResponse, error: unknown) {
 }
 
 /** One instance only: the worker does not provide distributed coordination. */
-export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; graph?: GraphClient; worker?: IndexWorker; imagePipeline?: ImageIndexPipeline; store?: StoreBackend; audit?: (event: AuditEvent) => void; probe?: (request: IndexRequest) => Promise<boolean> } = {}) {
+export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; graph?: GraphClient; worker?: IndexWorker; imagePipeline?: ImageIndexPipeline; store?: StoreBackend; audit?: (event: AuditEvent) => void; probe?: (request: IndexRequest, signal?: AbortSignal) => Promise<boolean> } = {}) {
   if (config.metricsToken !== undefined && (config.metricsToken.length < 32 || /[^\x21-\x7e]/.test(config.metricsToken))) throw new Error('Invalid metrics token');
   const store = deps.store ?? new AsyncSqliteStore(config.databasePath);
   const cipher = new CredentialCipher(config.credentialKey);
@@ -160,55 +160,49 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
     return key;
   }
   function requireWrite(key: Principal) { if (key.scope !== 'write' || !config.writeUsers.includes(key.owner)) fail(403, 'FORBIDDEN'); }
-  function keyAllows(key: Principal, repo: RepositoryRecord) { return key.repos === null || key.repos.includes(repo.id); }
-  async function authorize(key: Principal, repo: RepositoryRecord): Promise<RepositoryRecord | null> {
-    if (!keyAllows(key, repo)) return null;
-    const user = await store.getUser(key.owner);
-    if (!user) return null;
-    try {
-      const token = cipher.decrypt(user.credential, user.id);
-      const source = await codeup.getRepository(token, repo.codeup_id);
-      const permitted = hasRepositoryRole(source) && !!source.httpUrlToRepo && await (deps.probe ?? checkCloneAccess)({
-        dataDir: config.dataDir, repositoryId: repo.id, branch: source.defaultBranch ?? repo.branch, cloneUrl: source.httpUrlToRepo,
-        allowedGitHosts: config.allowedGitHosts, gitUsername: user.username, token,
-      });
-      return await mutate(async () => {
-        const currentUser = await store.getUser(user.id); const currentKey = await store.getKey(key.hash);
-        const latest = await store.getRepository(repo.id);
-        return permitted && currentUser?.credential_version === user.credential_version && !!currentKey && !currentKey.revoked &&
-          (currentKey.expires_at === null || currentKey.expires_at > Date.now()) && !!latest && latest.status !== 'disabled' &&
-          keyAllows(currentKey, latest) && latest.codeup_id === repo.codeup_id && latest.branch === repo.branch &&
-          latest.path === repo.path && latest.commit === repo.commit ? latest : null;
-      });
-    }
-    catch (error) {
-      if (error instanceof CodeupError && error.kind === 'invalid_credential') await mutate(async () => {
-        if ((await store.getUser(user.id))?.credential_version === user.credential_version) await store.revokeUserKeys(user.id);
-      });
-      if (error instanceof CodeupError && ['forbidden', 'not_found', 'invalid_credential'].includes(error.kind)) return null;
-      throw error;
-    }
+  function keyAllows(key: Principal, repo: RepositoryRecord) {
+    return key.repos === null ? key.scope === 'write' && config.writeUsers.includes(key.owner) : key.repos.includes(repo.id);
   }
-  async function visible(key: Principal, id: string): Promise<RepositoryRecord> {
+  async function authorize(key: Principal, repo: RepositoryRecord, signal?: AbortSignal): Promise<RepositoryRecord | null> {
+    if (!keyAllows(key, repo)) return null;
+    return await mutate(async () => {
+      if (signal?.aborted) throw new Error('Request cancelled');
+      const currentKey = await store.getKey(key.hash);
+      const latest = await store.getRepository(repo.id);
+      return !!currentKey && !currentKey.revoked && currentKey.owner === key.owner && !!(await store.getUser(key.owner)) &&
+        (currentKey.expires_at === null || currentKey.expires_at > Date.now()) && !!latest && latest.status !== 'disabled' &&
+        keyAllows(currentKey, latest) && latest.codeup_id === repo.codeup_id && latest.branch === repo.branch &&
+        latest.path === repo.path && latest.commit === repo.commit ? latest : null;
+    });
+  }
+  async function visible(key: Principal, id: string, signal?: AbortSignal): Promise<RepositoryRecord> {
     const repo = await store.getRepository(id);
     if (!repo || repo.status === 'disabled') fail(404, 'NOT_FOUND');
-    const authorized = await authorize(key, repo);
+    const authorized = await authorize(key, repo, signal);
     if (!authorized) fail(404, 'NOT_FOUND');
     return authorized;
   }
-  async function listVisible(key: Principal): Promise<RepositoryRecord[]> {
+  async function listVisible(key: Principal, signal?: AbortSignal): Promise<RepositoryRecord[]> {
     const initial = await store.getUser(key.owner);
     if (!initial) fail(401, 'UNAUTHENTICATED');
     const result: RepositoryRecord[] = [];
     for (const repo of await store.listRepositories()) {
-      if (repo.status !== 'disabled') { const authorized = await authorize(key, repo); if (authorized) result.push(authorized); }
+      if (signal?.aborted) throw new Error('Request cancelled');
+      if (repo.status !== 'disabled') { const authorized = await authorize(key, repo, signal); if (authorized) result.push(authorized); }
     }
     return await mutate(async () => {
       const currentUser = await store.getUser(key.owner); const currentKey = await store.getKey(key.hash);
-      if (currentUser?.credential_version !== initial.credential_version || !currentKey || currentKey.revoked ||
+      if (!currentUser || !currentKey || currentKey.owner !== key.owner || currentKey.revoked ||
           (currentKey.expires_at !== null && currentKey.expires_at <= Date.now())) fail(401, 'UNAUTHENTICATED');
       return result;
     });
+  }
+  async function queryVisible(key: Principal, id: string, signal?: AbortSignal): Promise<RepositoryRecord> {
+    if (key.repos === null) fail(404, 'NOT_FOUND');
+    return await visible(key, id, signal);
+  }
+  async function queryList(key: Principal, signal?: AbortSignal): Promise<RepositoryRecord[]> {
+    return key.repos === null ? [] : await listVisible(key, signal);
   }
   const internalRepository = (repo: RepositoryRecord): InternalMcpRepository => {
     const item = view(repo);
@@ -229,7 +223,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
   }
   const internalMcp: InternalMcpBackend = {
     async probe(signal) {
-      await store.checkHealth(); await graph.probe();
+      await store.checkHealth(); await graph.probe(signal);
       if (signal.aborted) throw new Error('Request cancelled');
       return true;
     },
@@ -238,7 +232,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
       let principal: Principal | undefined; let outcome: 'success' | 'error' = 'error';
       try {
         principal = await internalPrincipal(authorization);
-        const repositories = await listVisible(principal);
+        const repositories = await queryList(principal, signal);
         if (signal.aborted || !(await authenticateBearer(authorization))) throw new Error('Authentication required');
         outcome = 'success';
         return repositories.map(internalRepository);
@@ -248,7 +242,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
       let principal: Principal | undefined; let outcome: 'success' | 'error' = 'error';
       try {
         principal = await internalPrincipal(authorization);
-        const repo = await visible(principal, repoId);
+        const repo = await queryVisible(principal, repoId, signal);
         if (signal.aborted || !(await authenticateBearer(authorization))) throw new Error('Authentication required');
         outcome = 'success';
         return internalRepository(repo);
@@ -263,19 +257,19 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
           if (signal.aborted) throw new Error('Request cancelled');
           principal = await internalPrincipal(authorization);
           let repo: RepositoryRecord;
-          try { repo = await visible(principal, repoId); }
+          try { repo = await queryVisible(principal, repoId, signal); }
           catch (error) { if (error instanceof HttpError && error.status === 404) return null; throw error; }
           if (!repo.path || !repo.commit) return null;
           const result = await explore(repo.path, query, signal, { repoId: repo.id, commit: repo.commit });
           if (signal.aborted) throw new Error('Request cancelled');
           const confirmed = await internalPrincipal(authorization);
           let current: RepositoryRecord;
-          try { current = await visible(confirmed, repoId); }
+          try { current = await queryVisible(confirmed, repoId, signal); }
           catch (error) { if (error instanceof HttpError && error.status === 404) return null; throw error; }
           if (signal.aborted || current.path !== repo.path || current.commit !== repo.commit) return null;
           auditOutcome.value = 'success';
           return { repository: internalRepository(repo), result };
-        });
+        }, signal);
       } finally {
         auditInternalTool('codegraph_explore', auditOutcome.value, principal, repoId);
       }
@@ -283,8 +277,8 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
   };
   const mcp = createMcpHandler<Principal>({
     authenticate, allowedHosts: config.allowedHosts, allowedOrigins: config.allowedOrigins,
-    listRepositories: async key => (await listVisible(key)).map(view),
-    getRepository: async (key, id) => { try { return view(await visible(key, id)); } catch (e) { if (e instanceof HttpError && e.status === 404) return null; throw e; } },
+    listRepositories: async (key, signal) => (await queryList(key, signal)).map(view),
+    getRepository: async (key, id, signal) => { try { return view(await queryVisible(key, id, signal)); } catch (e) { if (e instanceof HttpError && e.status === 404) return null; throw e; } },
     onToolResult: (req, event) => actors.set(req, { ...actors.get(req), tool: event.tool, tool_outcome: event.outcome,
       ...(event.repo_id ? { repo_id: event.repo_id } : {}) }),
     codegraph: graph,
@@ -394,9 +388,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
         const user = (await store.getUser(key.owner))!;
         const page = Number(url.searchParams.get('page') ?? '1');
         if (!Number.isInteger(page) || page < 1) fail(400, 'INVALID_ARGUMENT');
-        let result;
-        try { result = await codeup.listRepositories(cipher.decrypt(user.credential, user.id), page, 100); }
-        catch (error) { if (error instanceof CodeupError && error.kind === 'invalid_credential') await mutate(async () => { if ((await store.getUser(user.id))?.credential_version === user.credential_version) await store.revokeUserKeys(user.id); }); throw error; }
+        const result = await codeup.listRepositories(cipher.decrypt(user.credential, user.id), page, 100);
         return await mutate(async () => {
           const currentKey = await store.getKey(key.hash);
           if ((await store.getUser(user.id))?.credential_version !== user.credential_version || !currentKey || currentKey.revoked ||
@@ -473,6 +465,7 @@ export function createApp(config: AppConfig, deps: { codeup?: CodeupClient; grap
         const scope = input.scope === 'read' || input.scope === 'write' ? input.scope : fail(400, 'INVALID_ARGUMENT');
         const repos = input.repos === null || input.repos === undefined ? null : input.repos;
         if (repos !== null && (!Array.isArray(repos) || repos.length > 100 || !repos.every(r => typeof r === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(r)))) fail(400, 'INVALID_ARGUMENT');
+        if (scope === 'read' && repos === null) fail(400, 'REPOSITORY_SCOPE_REQUIRED');
         if (key.repos !== null && (repos === null || (repos as string[]).some(id => !key.repos!.includes(id)))) fail(403, 'FORBIDDEN');
         const seconds = Number(input.expires_in ?? 30 * 86400);
         if (!Number.isInteger(seconds) || seconds < 60 || seconds > 90 * 86400) fail(400, 'INVALID_ARGUMENT');

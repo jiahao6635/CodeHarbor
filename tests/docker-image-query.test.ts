@@ -53,6 +53,35 @@ test('a timed out create kills the CLI and fails closed if daemon outcome is unc
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test('cancellation while writing the fence clears it before any Docker create', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codeharbor-cancel-fence-'));
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const began = new Promise<void>(resolve => { entered = resolve; });
+  try {
+    const executable = join(dir, 'docker'); const log = join(dir, 'commands');
+    await writeFile(executable, `#!/usr/bin/env node\nconst fs=require('node:fs'); const cmd=process.argv[2]; fs.appendFileSync(${JSON.stringify(log)},cmd+'\\n');\nif(cmd==='ps') process.exit(0); else if(cmd==='version') console.log('1.0'); else if(cmd==='inspect') {process.stderr.write('Error response from daemon: No such container: '+process.argv.at(-1)); process.exit(1)} else process.exit(1);\n`);
+    await chmod(executable, 0o700);
+    const fence = new FileImageCreationFence(dir, owner);
+    const waitingFence = {
+      assertClear: () => fence.assertClear(),
+      begin: async (name: string) => { await fence.begin(name); entered(); await gate; },
+      complete: (name: string) => fence.complete(name),
+    };
+    const backend = new DockerImageQueryBackend(async () => true, executable, 3000, owner, waitingFence);
+    const controller = new AbortController();
+    const request = backend.explore({ digest, ...identity, query: 'symbol', projectPath: IMAGE_PROJECT_PATH, readOnlyRoot: true, signal: controller.signal });
+    await began;
+    controller.abort(); release();
+    await assert.rejects(request, /Image runtime request failed/);
+    await fence.assertClear();
+    assert.ok(!(await readFile(log, 'utf8')).split('\n').includes('create'));
+    await backend.probe(new AbortController().signal);
+    await backend.close();
+  } finally { release(); await rm(dir, { recursive: true, force: true }); }
+});
+
 test('a nonzero docker create preserves its fence because daemon outcome is unknown', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codeharbor-docker-query-test-'));
   try {

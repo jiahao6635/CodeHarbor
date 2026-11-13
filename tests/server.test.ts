@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { createApp, type AppConfig, type AuditEvent } from '../src/server.js';
 import { CodeupError } from '../src/codeup.js';
+import { createAccessKey, hashAccessKey } from '../src/auth.js';
 
 test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundaries', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'codeharbor-api-'));
@@ -19,8 +20,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
   const revokedTokens = new Set<string>();
   const deniedCloneTokens = new Set<string>();
   const probeCalls: string[] = [];
-  let holdProbe: ((token: string) => Promise<void>) | undefined;
-  let duringExplore: (() => void) | undefined;
+  let duringExplore: (() => void | Promise<void>) | undefined;
   let delayOldCredential: (() => Promise<void>) | undefined;
   let offline = false;
   const userFor = (token: string) => {
@@ -31,13 +31,13 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
   };
   const fakeCodeup = {
     async getUser(token: string) { return userFor(token); },
-    async listRepositories(token: string) { userFor(token); return { repositories: [], nextPage: null }; },
+    async listRepositories(token: string) {
+      userFor(token);
+      if (token === 'alice-pat' && delayOldCredential) { await delayOldCredential(); throw new CodeupError('invalid_credential', 401); }
+      return { repositories: [], nextPage: null };
+    },
     async getRepository(token: string, id: string) {
       userFor(token);
-      if (token === 'alice-pat' && delayOldCredential) {
-        await delayOldCredential();
-        throw new CodeupError('invalid_credential', 401);
-      }
       if (offline) throw new CodeupError('unavailable');
       if (!allowedByToken[token]?.has(id)) throw new CodeupError('not_found', 404);
       return { id, name: `repo-${id}`, path: `repo-${id}`, accessLevel: 30,
@@ -47,7 +47,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
   const graphCalls: { path: string; query: string }[] = [];
   const fakeGraph = {
     async withQuery(fn: (explore: (path: string, query: string) => Promise<unknown>) => Promise<unknown>) {
-      return fn(async (path, query) => { graphCalls.push({ path, query }); duringExplore?.(); return { result: 'matching code' }; });
+      return fn(async (path, query) => { graphCalls.push({ path, query }); await duringExplore?.(); return { result: 'matching code' }; });
     },
     async probe() {},
     async close() {},
@@ -71,7 +71,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     allowedHosts, writeUsers: ['alice'], codegraphBin: 'codegraph',
   };
   app = createApp(config, { codeup: fakeCodeup as never, graph: fakeGraph as never, worker: fakeWorker as never,
-    probe: async request => { probeCalls.push(request.token); await holdProbe?.(request.token); return !deniedCloneTokens.has(request.token); },
+    probe: async request => { probeCalls.push(request.token); return !deniedCloneTokens.has(request.token); },
     audit: event => audit.push(event) });
   await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
@@ -177,62 +177,66 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal(duplicate.status, 200);
     assert.equal(duplicate.body.repository.repo_id, repo);
 
+    // A bootstrap read key has null scope and must not inherit every repository.
     allowedByToken['bob-pat'].add('11');
-    deniedCloneTokens.add('bob-pat');
     assert.equal((await request('GET', `/api/v1/repositories/${repo}`, bob)).status, 404);
-    deniedCloneTokens.delete('bob-pat');
-    assert.equal((await request('GET', `/api/v1/repositories/${repo}`, bob)).status, 200);
-    assert.equal(probeCalls.at(-1), 'bob-pat');
-    let releaseRepoProbe!: () => void; let repoProbeStarted!: () => void;
-    const waitingRepoProbe = new Promise<void>(resolve => { repoProbeStarted = resolve; });
-    const blockedRepoProbe = new Promise<void>(resolve => { releaseRepoProbe = resolve; });
-    holdProbe = async token => { if (token === 'bob-pat') { repoProbeStarted(); await blockedRepoProbe; } };
-    const pendingRepo = request('GET', `/api/v1/repositories/${repo}`, bob);
-    await waitingRepoProbe;
+    const bobScoped = createAccessKey();
+    await app.store.createKey({...bobScoped, owner:'bob', scope:'read', repos:[repo], expires_at:null, revoked:0});
+    deniedCloneTokens.add('bob-pat'); offline = true;
+    const beforeReads = probeCalls.length;
+    assert.equal((await request('GET', `/api/v1/repositories/${repo}`, bobScoped.token)).status, 200);
+    assert.equal(probeCalls.length, beforeReads);
+    offline = false; deniedCloneTokens.delete('bob-pat');
     await app.store.updateRepository(repo, { status: 'disabled' });
-    releaseRepoProbe(); holdProbe = undefined;
-    assert.equal((await pendingRepo).status, 404);
+    assert.equal((await request('GET', `/api/v1/repositories/${repo}`, bobScoped.token)).status, 404);
     await app.store.updateRepository(repo, { status: 'pending' });
-    assert.equal((await request('POST', `/api/v1/repositories/${repo}/sync`, bob)).status, 403);
+    assert.equal((await request('POST', `/api/v1/repositories/${repo}/sync`, bobScoped.token)).status, 403);
     await app.store.updateRepository(repo, { path: '/private/index', commit: 'a'.repeat(40), indexed_at: Date.now(), status: 'ready' });
 
     const mcp = (token: string, name: string, args: Record<string, unknown>) => request('POST', '/mcp', token,
       { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } },
       { accept: 'application/json, text/event-stream' });
-    const found = await mcp(bob, 'codegraph_explore', { repo_id: repo, query: 'order flow' });
+    const unscoped = await mcp(bob, 'codegraph_explore', { repo_id: repo, query: 'unscoped' });
+    assert.doesNotMatch(JSON.stringify(unscoped.body), /matching code/);
+    const adminUnscoped = await mcp(alice, 'codegraph_explore', { repo_id: repo, query: 'admin-unscoped' });
+    assert.doesNotMatch(JSON.stringify(adminUnscoped.body), /matching code/);
+    const probesBeforeQuery = probeCalls.length;
+    offline = true; deniedCloneTokens.add('bob-pat');
+    const found = await mcp(bobScoped.token, 'codegraph_explore', { repo_id: repo, query: 'order flow' });
     assert.equal(found.status, 200);
     assert.match(JSON.stringify(found.body), /matching code/);
     assert.ok(!JSON.stringify(found.body).includes('/private/index'));
+    assert.equal(probeCalls.length, probesBeforeQuery);
+    offline = false; deniedCloneTokens.delete('bob-pat');
     assert.deepEqual(graphCalls, [{ path: '/private/index', query: 'order flow' }]);
-    duringExplore = () => { deniedCloneTokens.add('bob-pat'); };
-    const revokedDuringQuery = await mcp(bob, 'codegraph_explore', { repo_id: repo, query: 'revoked' });
-    assert.doesNotMatch(JSON.stringify(revokedDuringQuery.body), /matching code/);
-    duringExplore = undefined; deniedCloneTokens.delete('bob-pat');
-    const injection = await mcp(bob, 'codegraph_explore', { repo_id: repo, query: 'x', projectPath: '/other' });
+    duringExplore = async () => { await app.store.updateRepository(repo, {commit:'b'.repeat(40)}); };
+    const changedDuringQuery = await mcp(bobScoped.token, 'codegraph_explore', { repo_id: repo, query: 'changed' });
+    assert.doesNotMatch(JSON.stringify(changedDuringQuery.body), /matching code/);
+    duringExplore = undefined; await app.store.updateRepository(repo, {commit:'a'.repeat(40)});
+    const injection = await mcp(bobScoped.token, 'codegraph_explore', { repo_id: repo, query: 'x', projectPath: '/other' });
     assert.match(JSON.stringify(injection.body), /Invalid arguments/);
     assert.equal(graphCalls.length, 2);
     allowedByToken['bob-pat'].delete('11');
-    const denied = await mcp(bob, 'codegraph_explore', { repo_id: repo, query: 'x' });
-    assert.match(JSON.stringify(denied.body), /Repository not found/);
-    assert.equal(graphCalls.length, 2);
+    const stillAllowed = await mcp(bobScoped.token, 'codegraph_explore', { repo_id: repo, query: 'x' });
+    assert.match(JSON.stringify(stillAllowed.body), /matching code/);
     offline = true;
-    assert.equal((await request('GET', `/api/v1/repositories/${repo}`, alice)).status, 503);
+    assert.equal((await request('GET', `/api/v1/repositories/${repo}`, alice)).status, 200);
     offline = false;
 
     const second = await request('POST', '/api/v1/repositories', alice, { codeup_repository_id: '22', authorize_automatic_sync: true });
     assert.equal(second.status, 202);
+    const noScope = await request('POST', '/api/v1/api-keys', alice, { scope: 'read', repos: null, expires_in: 3600 });
+    assert.equal(noScope.status, 400);
+    assert.equal(noScope.body.error, 'REPOSITORY_SCOPE_REQUIRED');
+    const omittedScope = await request('POST', '/api/v1/api-keys', alice, { scope: 'read', expires_in: 3600 });
+    assert.equal(omittedScope.status, 400);
     const scoped = await request('POST', '/api/v1/api-keys', alice, { scope: 'read', repos: [repo], expires_in: 3600 });
     assert.equal(scoped.status, 201);
     assert.equal((await request('GET', `/api/v1/repositories/${second.body.repository.repo_id}`, scoped.body.token)).status, 404);
-    let releaseProbe!: () => void; let probeStarted!: () => void;
-    const waitingProbe = new Promise<void>(resolve => { probeStarted = resolve; });
-    const blockedProbe = new Promise<void>(resolve => { releaseProbe = resolve; });
-    holdProbe = async token => { if (token === 'alice-pat') { probeStarted(); await blockedProbe; } };
-    const pending = request('GET', `/api/v1/repositories/${repo}`, scoped.body.token);
-    await waitingProbe;
-    assert.equal((await request('DELETE', `/api/v1/api-keys/${scoped.body.prefix}`, alice)).status, 200);
-    releaseProbe(); holdProbe = undefined;
-    assert.equal((await pending).status, 404);
+    duringExplore = async () => { await app.store.revokeKey(hashAccessKey(scoped.body.token)); };
+    const revokedDuringQuery = await mcp(scoped.body.token, 'codegraph_explore', { repo_id: repo, query: 'revoked' });
+    assert.doesNotMatch(JSON.stringify(revokedDuringQuery.body), /matching code/);
+    duringExplore = undefined;
     assert.equal((await request('GET', `/api/v1/repositories/${repo}`, scoped.body.token)).status, 401);
 
     const payload = { object_kind: 'push', project_id: 11, ref: 'refs/heads/main', after: 'b'.repeat(40) };
@@ -256,11 +260,14 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal((await request('POST', '/api/v1/api-keys', restrictedToken, { scope: 'read', repos: [second.body.repository.repo_id], expires_in: 60 })).status, 403);
     assert.equal((await request('POST', '/api/v1/api-keys', restrictedToken, { scope: 'read', repos: [repo], expires_in: 7200 })).status, 403);
 
-    // A confirmed PAT revocation invalidates all of the owner's previously issued keys.
+    // PAT revocation blocks live Cloud DevOps operations, not existing CodeHarbor keys.
     revokedTokens.add('alice-pat');
-    assert.equal((await request('GET', `/api/v1/repositories/${repo}`, alice)).status, 404);
-    assert.equal((await request('GET', '/api/v1/me', alice)).status, 401);
-    assert.equal((await request('GET', '/api/v1/me', restrictedToken)).status, 401);
+    assert.equal((await request('GET', '/api/v1/codeup/repositories', alice)).status, 401);
+    assert.equal((await request('POST', '/api/v1/repositories', alice, { codeup_repository_id: '33', authorize_automatic_sync: true })).status, 401);
+    assert.equal((await request('GET', `/api/v1/repositories/${repo}`, alice)).status, 200);
+    assert.equal((await request('GET', '/api/v1/me', alice)).status, 200);
+    assert.equal((await request('GET', '/api/v1/me', restrictedToken)).status, 200);
+    assert.match(JSON.stringify((await mcp(restrictedToken, 'codegraph_explore', {repo_id: repo, query: 'pat-expired'})).body), /matching code/);
     revokedTokens.delete('alice-pat');
     const previousVersion = (await app.store.getUser('alice'))!.credential_version;
     const originalSyncVersion = (await app.store.getRepository(repo))!.sync_credential_version;
@@ -270,7 +277,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal((await app.store.getRepository(repo))!.sync_credential_version, originalSyncVersion);
     assert.equal((await app.store.getRepository(repo))!.status, 'credential_required');
     assert.equal((await app.store.getRepository(second.body.repository.repo_id))!.status, 'credential_required');
-    assert.equal((await request('GET', '/api/v1/me', alice)).status, 401);
+    assert.equal((await request('GET', '/api/v1/me', alice)).status, 200);
     const fresh = await request('POST', '/api/v1/auth/bootstrap/keys', rebound.body.bootstrap_token, { scope: 'write' });
     assert.equal(fresh.status, 201);
 
@@ -298,13 +305,14 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     const started = new Promise<void>(resolve => { notifyStarted = resolve; });
     const released = new Promise<void>(resolve => { releaseOld = resolve; });
     delayOldCredential = async () => { notifyStarted(); await released; };
-    const delayedRequest = request('GET', `/api/v1/repositories/${repo}`, fresh.body.token);
+    const delayedRequest = request('GET', '/api/v1/codeup/repositories', fresh.body.token);
     await started;
     const reboundAgain = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat-2' });
     const newer = await request('POST', '/api/v1/auth/bootstrap/keys', reboundAgain.body.bootstrap_token, { scope: 'write' });
     assert.equal(newer.status, 201);
     releaseOld();
-    assert.equal((await delayedRequest).status, 404);
+    assert.equal((await delayedRequest).status, 401);
+    delayOldCredential = undefined;
     assert.equal((await request('GET', '/api/v1/me', newer.body.token)).status, 200);
 
     // A session accepted before reading a slow body must still be consumed only once.

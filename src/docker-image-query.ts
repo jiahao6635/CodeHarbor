@@ -7,6 +7,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 import { IMAGE_PROJECT_PATH, validImageIdentity, type ImageDigest, type ImageQueryBackend } from './image-codegraph.js';
 import type { ImageCreationFence } from './image-creation-fence.js';
+import { ImageRuntimeRequestError, ImageRuntimeUncertainError } from './image-runtime-errors.js';
 
 const imagePattern = /^sha256:[a-f0-9]{64}$/;
 const containerPattern = /^[a-f0-9]{64}$/;
@@ -204,7 +205,15 @@ export class DockerImageQueryBackend implements ImageQueryBackend {
     this.controllers.add(controller);
     const operation = this.execute({ ...request, signal });
     this.operations.add(operation);
-    try { return await operation; }
+    try {
+      const result = await operation;
+      if (this.uncertain) throw new ImageRuntimeUncertainError();
+      return result;
+    } catch (error) {
+      if (this.uncertain) throw new ImageRuntimeUncertainError('Container creation outcome is uncertain or cleanup requires operator intervention');
+      throw new ImageRuntimeRequestError(error instanceof Error && error.message === 'Repository image unavailable'
+        ? error.message : undefined);
+    }
     finally { this.operations.delete(operation); this.controllers.delete(controller); }
   }
 
@@ -227,6 +236,8 @@ export class DockerImageQueryBackend implements ImageQueryBackend {
         try { await this.fence.begin(name); fenced = true; }
         catch { this.uncertain = true; throw new Error('Image creation fence requires operator intervention'); }
       }
+      // A cancellation during the durable fence write has not reached Docker.
+      if (request.signal.aborted) throw new Error('Request cancelled before container creation');
       let create: CommandResult;
       try {
         submitted = true;

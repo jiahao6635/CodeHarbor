@@ -48,6 +48,7 @@ test('real Git to trusted repository image and isolated readonly MCP query',
     let pipeline: ImageIndexPipeline | undefined;
     const candidatePaths: string[] = [];
     const published = new Map<string, { image: string; repoId: string; commit: string }>();
+    let parallelGate: { arrived: number; enter: () => void; release: Promise<void> } | undefined;
     let http: HttpServer | undefined;
     const clients: Client[] = [];
     try {
@@ -86,7 +87,14 @@ test('real Git to trusted repository image and isolated readonly MCP query',
       };
       const backend = new DockerImageQueryBackend(authorize, dockerShim, 90_000, controllerId, new FileImageCreationFence(root, controllerId));
       queryService = await serveImageRuntime({ path:querySocket, token:queryToken, backend:{
-        explore:async request => { try { return await backend.explore(request); } catch (error) { console.error('Fixture runtime failure', error instanceof Error ? error.message : 'unknown'); throw error; } },
+        explore:async request => {
+          if (parallelGate) {
+            const gate = parallelGate;
+            if (++gate.arrived === 10) gate.enter();
+            await gate.release;
+          }
+          try { return await backend.explore(request); } catch (error) { console.error('Fixture runtime failure', error instanceof Error ? error.message : 'unknown'); throw error; }
+        },
         probe:signal => backend.probe(signal), close:() => backend.close(),
       }, timeoutMs:90_000 });
       graph = new ImageCodeGraphClient(new SocketImageQueryBackend(querySocket, queryToken, 90_000), 90_000);
@@ -117,6 +125,19 @@ test('real Git to trusted repository image and isolated readonly MCP query',
       assert.doesNotMatch(result, /fictional-token-not-in-image/);
       published.set(identity.repoId, {image:built.path, ...identity}); pipeline.release(built.path);
       published.set('fixture-beta', {image:betaBuilt.path, repoId:'fixture-beta', commit:betaCommit}); pipeline.release(betaBuilt.path);
+      let releaseParallel!: () => void; let enteredParallel!: () => void;
+      const release = new Promise<void>(resolve => { releaseParallel = resolve; });
+      const bothEntered = new Promise<void>(resolve => { enteredParallel = resolve; });
+      parallelGate = { arrived: 0, enter: enteredParallel, release };
+      const simultaneous = Promise.all(Array.from({ length: 10 }, (_, index) => index % 2 === 0
+        ? graph!.withQuery(explore => explore(built.path, 'orchidsentinel_reference', undefined, identity))
+        : graph!.withQuery(explore => explore(betaBuilt.path, 'magnoliasentinel_reference', undefined, {repoId:'fixture-beta', commit:betaCommit}))));
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([bothEntered, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Queries did not enter concurrently')), 10_000); })]);
+      } finally { if (timer) clearTimeout(timer); parallelGate = undefined; releaseParallel(); }
+      const results = await simultaneous;
+      results.forEach((result, index) => assert.match(result, index % 2 === 0 ? /orchidsentinel_reference/ : /magnoliasentinel_reference/));
       await assert.rejects(graph.withQuery(explore => explore(built.path, 'orchidsentinel_reference', undefined, {repoId:'fixture-beta', commit:betaCommit})));
       await assert.rejects(graph.withQuery(explore => explore(betaBuilt.path, 'magnoliasentinel_reference', undefined, identity)));
       await assert.rejects(graph.withQuery(explore => explore(built.path, 'orchidsentinel_reference', undefined, {...identity, commit:betaCommit})));

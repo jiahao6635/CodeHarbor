@@ -18,9 +18,9 @@ export interface McpRepository {
 export interface McpDependencies<Principal> {
   authenticate(req: IncomingMessage): Promise<Principal | null>;
   /** This function must return only repositories this principal may read. */
-  listRepositories(principal: Principal): Promise<McpRepository[]>;
+  listRepositories(principal: Principal, signal?: AbortSignal): Promise<McpRepository[]>;
   /** Returns null both for an unknown repository and for one not authorized. */
-  getRepository(principal: Principal, repoId: string): Promise<McpRepository | null>;
+  getRepository(principal: Principal, repoId: string, signal?: AbortSignal): Promise<McpRepository | null>;
   /** Existing single-process backend. */
   codegraph?: GraphClient;
   /** Alternative backend must perform the complete query and before/after authorization atomically with publication coordination. */
@@ -124,13 +124,13 @@ export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
           if (!hasExactKeys(args, ['cursor', 'limit']) || (args.cursor !== undefined && (typeof args.cursor !== 'string' || !/^[0-9]{1,9}$/.test(args.cursor))) || (args.limit !== undefined && (typeof args.limit !== 'number' || !Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100))) return toolError('Invalid arguments');
           const offset = args.cursor === undefined ? 0 : Number(args.cursor);
           const limit = args.limit === undefined ? 50 : args.limit as number;
-          const repositories = await deps.listRepositories(caller);
+          const repositories = await deps.listRepositories(caller, extra.signal);
           if (await deps.authenticate(req) === null) return toolError('Authentication required');
           return success({ repositories: repositories.slice(offset, offset + limit).map(publicRepository), next_cursor: offset + limit < repositories.length ? String(offset + limit) : null });
         }
         if (request.params.name === 'get_repository_status') {
           if (!hasExactKeys(args, ['repo_id']) || !validRepoId(args.repo_id)) return toolError('Invalid arguments');
-          const repo = await deps.getRepository(caller, args.repo_id);
+          const repo = await deps.getRepository(caller, args.repo_id, extra.signal);
           if (await deps.authenticate(req) === null) return toolError('Authentication required');
           if (!repo) return toolError('Repository not found');
           authorizedRepo = repo.id;
@@ -149,17 +149,17 @@ export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
             // A call can wait behind an index publication; recheck the key after it acquires the lock.
             const current = await deps.authenticate(req);
             if (current === null) return toolError('Authentication required');
-            const repo = await deps.getRepository(current, repoId);
+            const repo = await deps.getRepository(current, repoId, extra.signal);
             if (!repo) return toolError('Repository not found');
             authorizedRepo = repo.id;
             if (!repo.projectPath || !repo.indexedCommit) return toolError('Repository index is not available');
             const result = await explore(repo.projectPath, query, extra.signal, { repoId: repo.id, commit: repo.indexedCommit });
             const confirmed = await deps.authenticate(req);
             if (confirmed === null) return toolError('Authentication required');
-            const currentRepo = await deps.getRepository(confirmed, repoId);
+            const currentRepo = await deps.getRepository(confirmed, repoId, extra.signal);
             if (!currentRepo || currentRepo.projectPath !== repo.projectPath || currentRepo.indexedCommit !== repo.indexedCommit) return toolError('Repository not found or index changed');
             return success({ ...publicRepository(repo), result });
-          });
+          }, extra.signal);
         }
         return toolError('Unknown tool');
       } catch {

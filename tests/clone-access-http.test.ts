@@ -70,7 +70,7 @@ test('clone authorization interoperates with real git-http-backend and fails clo
   }
 });
 
-test('stalled upstream is bounded and concurrency limit fails closed', async () => {
+test('stalled upstream and queued waiters time out and fail closed', async () => {
   const originalFetch = globalThis.fetch;
   const originalTimeout = globalThis.setTimeout;
   const keepAlive = originalTimeout(() => {}, 500);
