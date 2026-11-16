@@ -1,17 +1,20 @@
-import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { test } from 'node:test';
 import { promisify } from 'node:util';
 import { CodeGraphClient } from '../src/codegraph.js';
 
 const bin = resolve(process.env.CODEGRAPH_TEST_BIN ?? './node_modules/.bin/codegraph');
 const run = promisify(execFile);
 
-test('real CodeGraph queries two independent indexes and switches the published version after draining', { skip: !existsSync(bin), timeout: 60_000 }, async () => {
+test('real CodeGraph queries two independent indexes and switches the published version after draining', {
+  skip: !existsSync(bin),
+  timeout: 60_000,
+}, async () => {
   const root = await mkdtemp(join(tmpdir(), 'codeharbor-codegraph-'));
   const workspace = join(root, 'runtime');
   await mkdir(workspace);
@@ -23,7 +26,10 @@ test('real CodeGraph queries two independent indexes and switches the published 
       const name = i === 1 ? 'beta_symbol' : 'alpha_symbol';
       const marker = ['ALPHA_OLD', 'BETA_ONLY', 'ALPHA_NEW'][i];
       await writeFile(join(path, 'app.py'), `def ${name}():\n    return "${marker}"\n`);
-      await run(bin, ['init', path, '--yes'], { env: { ...process.env, DO_NOT_TRACK: '1', CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_NO_WATCH: '1' }, timeout: 20_000 });
+      await run(bin, ['init', path, '--yes'], {
+        env: { ...process.env, DO_NOT_TRACK: '1', CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_NO_WATCH: '1' },
+        timeout: 20_000,
+      });
     }
     await graph.probe();
     const alpha = await graph.withQuery((explore) => explore(paths[0], 'alpha_symbol'));
@@ -37,9 +43,17 @@ test('real CodeGraph queries two independent indexes and switches the published 
     let currentPath = paths[0];
     let release!: () => void;
     let started!: () => void;
-    const blocked = new Promise<void>((resolve) => { release = resolve; });
-    const entered = new Promise<void>((resolve) => { started = resolve; });
-    const first = graph.withQuery(async (explore) => { started(); await blocked; return explore(currentPath, 'alpha_symbol'); });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const first = graph.withQuery(async (explore) => {
+      started();
+      await blocked;
+      return explore(currentPath, 'alpha_symbol');
+    });
     await entered;
     const publish = graph.withExclusive(async (explore) => {
       assert.match(await explore(paths[2], 'alpha_symbol'), /ALPHA_NEW/);
@@ -56,13 +70,19 @@ test('real CodeGraph queries two independent indexes and switches the published 
   }
 });
 
-test('closing a CodeGraph transport kills a stubborn descendant in its process group', { skip: process.platform === 'win32', timeout: 10_000 }, async () => {
+test('closing a CodeGraph transport kills a stubborn descendant in its process group', {
+  skip: process.platform === 'win32',
+  timeout: 10_000,
+}, async () => {
   const { ManagedCodeGraphTransport } = await import('../src/codegraph.js');
   const { chmod, readFile } = await import('node:fs/promises');
   const root = await mkdtemp(join(tmpdir(), 'codeharbor-group-'));
   const executable = join(root, 'fake-codegraph');
   const pidPath = join(root, 'descendant.pid');
-  await writeFile(executable, `#!/usr/bin/env node\nconst {spawn} = require('node:child_process');\nconst fs = require('node:fs');\nconst child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {stdio:'inherit'});\nfs.writeFileSync(${JSON.stringify(pidPath)}, String(child.pid));\nprocess.on('SIGTERM',()=>{}); setInterval(()=>{},1000);\n`);
+  await writeFile(
+    executable,
+    `#!/usr/bin/env node\nconst {spawn} = require('node:child_process');\nconst fs = require('node:fs');\nconst child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {stdio:'inherit'});\nfs.writeFileSync(${JSON.stringify(pidPath)}, String(child.pid));\nprocess.on('SIGTERM',()=>{}); setInterval(()=>{},1000);\n`,
+  );
   await chmod(executable, 0o700);
   const transport = new ManagedCodeGraphTransport(executable, root);
   transport.onerror = () => {};
@@ -80,22 +100,34 @@ test('closing a CodeGraph transport kills a stubborn descendant in its process g
       process.kill(pid, 0);
       const result = await run('ps', ['-o', 'stat=', '-p', String(pid)]).catch(() => ({ stdout: '' }));
       alive = !!result.stdout.trim() && !result.stdout.trim().startsWith('Z');
-    } catch { alive = false; }
+    } catch {
+      alive = false;
+    }
     assert.equal(alive, false, 'descendant must not continue running after close');
   } finally {
     await transport.close().catch(() => {});
-    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    if (pid) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {}
+    }
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test('closing transport also kills descendants after an early parent exit', { skip: process.platform === 'win32', timeout: 10_000 }, async () => {
+test('closing transport also kills descendants after an early parent exit', {
+  skip: process.platform === 'win32',
+  timeout: 10_000,
+}, async () => {
   const { ManagedCodeGraphTransport } = await import('../src/codegraph.js');
   const { chmod, readFile } = await import('node:fs/promises');
   const root = await mkdtemp(join(tmpdir(), 'codeharbor-orphan-'));
   const executable = join(root, 'fake-codegraph');
   const pidPath = join(root, 'descendant.pid');
-  await writeFile(executable, `#!/usr/bin/env node\nconst {spawn} = require('node:child_process');\nconst fs = require('node:fs');\nconst child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {stdio:'ignore'});\nfs.writeFileSync(${JSON.stringify(pidPath)}, String(child.pid)); child.unref();\n`);
+  await writeFile(
+    executable,
+    `#!/usr/bin/env node\nconst {spawn} = require('node:child_process');\nconst fs = require('node:fs');\nconst child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {stdio:'ignore'});\nfs.writeFileSync(${JSON.stringify(pidPath)}, String(child.pid)); child.unref();\n`,
+  );
   await chmod(executable, 0o700);
   const transport = new ManagedCodeGraphTransport(executable, root);
   transport.onerror = () => {};
@@ -112,11 +144,17 @@ test('closing transport also kills descendants after an early parent exit', { sk
       process.kill(pid, 0);
       const result = await run('ps', ['-o', 'stat=', '-p', String(pid)]).catch(() => ({ stdout: '' }));
       alive = !!result.stdout.trim() && !result.stdout.trim().startsWith('Z');
-    } catch { alive = false; }
+    } catch {
+      alive = false;
+    }
     assert.equal(alive, false, 'orphan must not continue running after close');
   } finally {
     await transport.close().catch(() => {});
-    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    if (pid) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {}
+    }
     await rm(root, { recursive: true, force: true });
   }
 });

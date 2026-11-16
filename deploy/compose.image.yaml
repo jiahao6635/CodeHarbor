@@ -4,6 +4,7 @@ services:
   codeharbor:
     environment:
       CODEHARBOR_INDEX_BACKEND: image
+      CODEHARBOR_MCP_QUERY_CONCURRENCY: ${CODEHARBOR_MCP_QUERY_CONCURRENCY:-10}
       TMPDIR: /data
       CODEHARBOR_REPOSITORY_RUNTIME_IMAGE: ${CODEHARBOR_REPOSITORY_RUNTIME_IMAGE:?set immutable local runtime image ID}
       CODEHARBOR_IMAGE_QUERY_SOCKET: /run/codeharbor-controller/query.sock
@@ -46,6 +47,7 @@ services:
     security_opt: [no-new-privileges:true]
     network_mode: none
     environment:
+      CODEHARBOR_MCP_QUERY_CONCURRENCY: ${CODEHARBOR_MCP_QUERY_CONCURRENCY:-10}
       CODEHARBOR_REPOSITORY_RUNTIME_IMAGE: ${CODEHARBOR_REPOSITORY_RUNTIME_IMAGE:?set immutable local runtime image ID}
       CODEHARBOR_IMAGE_CONTROLLER_ID: ${CODEHARBOR_IMAGE_CONTROLLER_ID:?set stable unique controller ID}
       CODEHARBOR_IMAGE_QUERY_SOCKET: /run/codeharbor-controller/query.sock

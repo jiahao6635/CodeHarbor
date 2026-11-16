@@ -2,10 +2,14 @@ import { randomBytes } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseMasterKey, vaultTransitOptions, VaultTransitMasterKey } from './master-key.js';
+import { parseMasterKey, VaultTransitMasterKey, vaultTransitOptions } from './master-key.js';
 
 /** Create an encrypted key file without overwriting an existing deployment. */
-export async function writeVaultWrappedKey(env: NodeJS.ProcessEnv, mode: 'new' | 'existing', fetchImpl?: typeof fetch): Promise<void> {
+export async function writeVaultWrappedKey(
+  env: NodeJS.ProcessEnv,
+  mode: 'new' | 'existing',
+  fetchImpl?: typeof fetch,
+): Promise<void> {
   const destination = env.CODEHARBOR_VAULT_WRAPPED_KEY_FILE;
   if (!destination) throw new Error('CODEHARBOR_VAULT_WRAPPED_KEY_FILE is required');
   let key: Buffer;
@@ -30,7 +34,12 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     process.exitCode = 1;
   } else {
     writeVaultWrappedKey(process.env, mode === '--new' ? 'new' : 'existing')
-      .then(() => { process.stdout.write('Wrapped master key file created.\n'); })
-      .catch(() => { process.stderr.write('Failed to create wrapped master key file.\n'); process.exitCode = 1; });
+      .then(() => {
+        process.stdout.write('Wrapped master key file created.\n');
+      })
+      .catch(() => {
+        process.stderr.write('Failed to create wrapped master key file.\n');
+        process.exitCode = 1;
+      });
   }
 }

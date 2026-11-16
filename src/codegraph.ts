@@ -1,13 +1,20 @@
+import { type ChildProcess, spawn } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { spawn, type ChildProcess } from 'node:child_process';
 import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/sdk/shared/stdio.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 
 /** The gateway and worker share these operations regardless of index storage. */
-export type GraphClient = Pick<CodeGraphClient, 'withQuery' | 'withExclusive' | 'probe' | 'close'>;
+export type GraphClient = Pick<CodeGraphClient, 'withQuery' | 'withExclusive' | 'probe' | 'close'> & {
+  isUnsafe?(): boolean;
+};
 export type RepositoryIdentity = { repoId: string; commit: string };
-export type Explore = (path: string, query: string, signal?: AbortSignal, identity?: RepositoryIdentity) => Promise<string>;
+export type Explore = (
+  path: string,
+  query: string,
+  signal?: AbortSignal,
+  identity?: RepositoryIdentity,
+) => Promise<string>;
 
 /** A stdio transport whose subprocess and ordinary descendants share a killable group. */
 export class ManagedCodeGraphTransport implements Transport {
@@ -19,7 +26,10 @@ export class ManagedCodeGraphTransport implements Transport {
   private closing?: Promise<void>;
   private buffer = new ReadBuffer({ maxBufferSize: 4 * 1024 * 1024 });
 
-  constructor(private command: string, private cwd: string) {}
+  constructor(
+    private command: string,
+    private cwd: string,
+  ) {}
 
   async start(): Promise<void> {
     if (this.child) throw new Error('Transport already started');
@@ -28,13 +38,22 @@ export class ManagedCodeGraphTransport implements Transport {
       cwd: this.cwd,
       detached: true,
       env: {
-        PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: this.cwd,
-        CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_NO_WATCH: '1', CODEGRAPH_NO_DOWNLOAD: '1', DO_NOT_TRACK: '1',
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        HOME: this.cwd,
+        CODEGRAPH_NO_DAEMON: '1',
+        CODEGRAPH_NO_WATCH: '1',
+        CODEGRAPH_NO_DOWNLOAD: '1',
+        DO_NOT_TRACK: '1',
       },
       stdio: ['pipe', 'pipe', 'ignore'],
     });
     this.child = child;
-    this.exited = new Promise<void>((resolve) => child.once('close', () => { this.onclose?.(); resolve(); }));
+    this.exited = new Promise<void>((resolve) =>
+      child.once('close', () => {
+        this.onclose?.();
+        resolve();
+      }),
+    );
     child.on('error', (error) => this.onerror?.(error));
     child.stdin?.on('error', (error) => this.onerror?.(error));
     child.stdout?.on('error', (error) => this.onerror?.(error));
@@ -61,7 +80,7 @@ export class ManagedCodeGraphTransport implements Transport {
     const stream = this.child?.stdin;
     if (!stream || stream.destroyed) throw new Error('CodeGraph transport is closed');
     await new Promise<void>((resolve, reject) => {
-      stream.write(serializeMessage(message), (error) => error ? reject(error) : resolve());
+      stream.write(serializeMessage(message), (error) => (error ? reject(error) : resolve()));
     });
   }
 
@@ -72,21 +91,28 @@ export class ManagedCodeGraphTransport implements Transport {
     if (!child || !exited) return;
     this.closing = (async () => {
       child.stdin?.end();
-      const wait = async (ms: number) => new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => resolve(false), ms);
-        void exited.then(() => { clearTimeout(timer); resolve(true); });
-      });
+      const wait = async (ms: number) =>
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), ms);
+          void exited.then(() => {
+            clearTimeout(timer);
+            resolve(true);
+          });
+        });
       const signalGroup = (signal: NodeJS.Signals) => {
         if (!child.pid) return;
-        try { process.kill(-child.pid, signal); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+        try {
+          process.kill(-child.pid, signal);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+        }
       };
       await wait(500);
       // Even if the leader has exited, it may have left descendants in its group.
       signalGroup('SIGTERM');
       await wait(500);
       signalGroup('SIGKILL');
-      if (!await wait(2_000)) throw new Error('CodeGraph process group did not close');
+      if (!(await wait(2_000))) throw new Error('CodeGraph process group did not close');
       this.buffer.clear();
     })();
     return this.closing;
@@ -109,9 +135,15 @@ export class CodeGraphClient {
   private async serialized<T>(operation: () => Promise<T>): Promise<T> {
     const previous = this.tail;
     let release!: () => void;
-    this.tail = new Promise<void>((resolve) => { release = resolve; });
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     await previous;
-    try { return await operation(); } finally { release(); }
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   private async connect(): Promise<Client> {
@@ -130,7 +162,9 @@ export class CodeGraphClient {
         throw new Error('Incompatible CodeGraph MCP tool schema');
       }
       this.client = client;
-      client.onclose = () => { if (this.client === client) this.client = undefined; };
+      client.onclose = () => {
+        if (this.client === client) this.client = undefined;
+      };
       return client;
     } catch (error) {
       await this.closeConnection().catch(() => {});
@@ -144,34 +178,46 @@ export class CodeGraphClient {
     this.client = undefined;
     this.transport = undefined;
     if (client || transport) {
-      try { if (client) await client.close(); else await transport!.close(); }
-      catch (error) { this.unsafe = true; throw error; }
+      try {
+        if (client) await client.close();
+        else if (transport) await transport.close();
+      } catch (error) {
+        this.unsafe = true;
+        throw error;
+      }
     }
   }
 
   private async query(path: string, query: string, signal?: AbortSignal): Promise<string> {
-      if (signal?.aborted) throw new Error('Request cancelled');
-      try {
-        const client = await this.connect();
-        const result = await client.callTool({ name: 'codegraph_explore', arguments: { projectPath: path, query } }, undefined, {
+    if (signal?.aborted) throw new Error('Request cancelled');
+    try {
+      const client = await this.connect();
+      const result = await client.callTool(
+        { name: 'codegraph_explore', arguments: { projectPath: path, query } },
+        undefined,
+        {
           timeout: this.timeoutMs,
           signal,
-        });
-        if (result.isError || !Array.isArray(result.content) || !result.content.every((item) => item.type === 'text')) {
-          throw new Error('CodeGraph query failed');
-        }
-        const text = result.content.map((item) => item.type === 'text' ? item.text : '').join('\n');
-        if (Buffer.byteLength(text, 'utf8') > 1024 * 1024) throw new Error('CodeGraph result exceeded size limit');
-        return text.split(path).join('[repository]');
-      } catch (error) {
-        await this.closeConnection().catch(() => {});
-        throw error;
+        },
+      );
+      if (result.isError || !Array.isArray(result.content) || !result.content.every((item) => item.type === 'text')) {
+        throw new Error('CodeGraph query failed');
       }
+      const text = result.content.map((item) => (item.type === 'text' ? item.text : '')).join('\n');
+      if (Buffer.byteLength(text, 'utf8') > 1024 * 1024) throw new Error('CodeGraph result exceeded size limit');
+      return text.split(path).join('[repository]');
+    } catch (error) {
+      await this.closeConnection().catch(() => {});
+      throw error;
+    }
   }
 
   /** Resolve the current repository version inside this lock, not before it. */
-  async withQuery<T>(operation: (explore: Explore) => Promise<T>): Promise<T> {
-    return this.serialized(() => operation((path, query, signal) => this.query(path, query, signal)));
+  async withQuery<T>(operation: (explore: Explore) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.serialized(() => {
+      if (signal?.aborted) throw new Error('Request cancelled');
+      return operation((path, query, signal) => this.query(path, query, signal));
+    });
   }
 
   /** Drain all queries, close cached upstream handles, and publish before later queries resume. */
@@ -179,8 +225,11 @@ export class CodeGraphClient {
     return this.serialized(async () => {
       if (this.unsafe) throw new Error('CodeGraph process shutdown failed; restart required');
       await this.closeConnection();
-      try { return await operation((path, query, signal) => this.query(path, query, signal)); }
-      finally { await this.closeConnection(); }
+      try {
+        return await operation((path, query, signal) => this.query(path, query, signal));
+      } finally {
+        await this.closeConnection();
+      }
     });
   }
 
@@ -189,8 +238,14 @@ export class CodeGraphClient {
   }
 
   /** Verify the subprocess can start and advertises the expected MCP tool. */
-  async probe(): Promise<void> {
+  /** True once a shutdown failed and the runtime must be restarted. */
+  isUnsafe(): boolean {
+    return this.unsafe;
+  }
+
+  async probe(signal?: AbortSignal): Promise<void> {
     await this.serialized(async () => {
+      if (signal?.aborted) throw new Error('Request cancelled');
       try {
         const client = await this.connect();
         const { tools } = await client.listTools(undefined, { timeout: this.timeoutMs });

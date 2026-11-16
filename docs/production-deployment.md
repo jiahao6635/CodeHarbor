@@ -8,7 +8,8 @@
 - PostgreSQL 连接持有 session advisory lock，同一数据库只允许一个 CodeHarbor 实例。连接断开时拒绝后续数据库操作；使用 supervisor 监控并重启。仅支持直连或 session pooling，禁止使用事务池模式。
 - PAT 使用 AES-256-GCM 加密，主密钥通过 Vault Transit 保护；启动时 Vault 解包主密钥到应用内存。详见 [Vault Transit 指南](vault-transit.md)。
 - 本模板没有跨实例任务租约、fencing、共享索引协调或高可用；不应增加副本。索引 Worker 与 API 共用容器，容器边界无法提供仓库间强隔离。未验证企业云效权限之前不能认为可以用于生产多租户。
-- 仓库权限按当前用户自己的 PAT 实时探测 Git HTTPS upload-pack，索引同步另用对应同步账号的 PAT。探测并发最多 2 个，总超时 30 秒，响应最多 32 MiB、100,000 个对象；探测会在临时目录验证 Git 包并清理。空仓库、没有可探测分支、服务器不支持 shallow、数据超限或协议校验失败时无法确认权限，将拒绝访问并返回授权不可用。探测不缓存，仓库较大或并发较高时会增加云效和磁盘负载；临时目录需有足够空间。
+- 已发布索引的 MCP 查询只检查 CodeHarbor Key 的明确仓库列表、有效期和撤销状态，不实时检查持有人的云效权限。云效撤权或 PAT 失效不会自动收回已签发 Key 的读取权，管理员须主动撤销或替换 Key；旧 `repos: null` Key 不可直接通过 MCP 查询。受配置允许的 write 管理员仍可管理平台并签发限定仓库范围的 Key。
+- 仓库接入和索引同步仍使用明确授权的同步账号 PAT 探测 Git HTTPS upload-pack。探测最多同时执行 2 个，运行超时 30 秒，响应最多 32 MiB、100,000 个对象；探测会在临时目录验证 Git 包并清理。空仓库、没有可探测分支、服务器不支持 shallow、数据超限或协议校验失败时无法确认克隆权限。同步凭据失效时不发布新版本，旧索引仍可由有效的限定范围 Key 查询。
 - Nginx 对外提供 TLS，不公开 `/health/` 或 `/metrics`；指标通过受控内网及独立 Bearer 访问应用端口。按企业网关、告警和日志平台调整。
 
 ## 前提
@@ -25,7 +26,10 @@
 
 - `YUNXIAO_ENDPOINT`、`YUNXIAO_ORGANIZATION_ID`、`CODEHARBOR_GIT_HOSTS`：实际云效信息。
 - `CODEHARBOR_ALLOWED_HOSTS`：代理对上游传递的主机名；若需要内部健康检查也加入 `127.0.0.1:8080`。浏览器调用时另设 `CODEHARBOR_ALLOWED_ORIGINS`（模板按需扩展）。
-- `CODEHARBOR_WRITE_USERS`：经企业批准、可签发 write Key 的云效用户 ID；留空不允许 write Key。
+- `CODEHARBOR_WRITE_USERS`：经企业批准、可签发 write Key 的云效用户 ID；留空不允许 write Key。这些用户的无范围 write Key 即平台管理员 Key。
+- `CODEHARBOR_TRUST_PROXY`：模板固定为 `true`，Nginx 传递 `X-Forwarded-For`，应用按真实客户端地址做认证失败限流；Nginx 层另有 `/mcp` 20r/s、`/api/v1/auth/` 1r/s 的每地址限流。
+- `CODEHARBOR_DOCS_ENABLED`：默认 `false`；Nginx 模板同时对 `/docs`、`/openapi.json` 返回 404。
+- `CODEHARBOR_ACCESS_TTL_MS`、`CODEHARBOR_AUDIT_RETENTION_DAYS`：无范围 read Key 的云效权限缓存有效期（默认 6 小时）与持久化审计保留天数（默认 180）。
 - `CODEHARBOR_DATABASE_URL_FILE`：保存 PostgreSQL URL 的文件路径；也支持 `DATABASE_URL`，但不要同时配置。生产 URL 必须只使用单个 `sslmode=verify-full` 和可选 `application_name` 参数。
 - `CODEHARBOR_VAULT_ADDR`、`CODEHARBOR_VAULT_TRANSIT_KEY`、`CODEHARBOR_VAULT_TOKEN_FILE`、`CODEHARBOR_VAULT_WRAPPED_KEY_FILE`：参见 [Vault Transit 指南](vault-transit.md)。
 - `CODEHARBOR_METRICS_TOKEN_FILE`、`CODEHARBOR_TLS_CERT`、`CODEHARBOR_TLS_KEY`：分别指向监控 token、TLS 证书和私钥文件。
@@ -116,22 +120,18 @@ docker compose -f deploy/compose.yaml -f deploy/compose.postgres.yaml up -d --bu
 
 保留并备份数据库卷、证书及密钥；不要使用会删除卷的命令代替常规停机。Docker Compose 的 `restart` 不能仅凭健康检查失败自动重启容器，数据库不可用时应结合外部监控和服务恢复策略。切换远端与本地数据库只改变连接目标，不会自动复制数据；已有数据须通过一致性备份/恢复或迁移完成转移，并验证身份、仓库及索引状态。
 
-## 从 MVP SQLite 迁移
+## 数据库 schema 迁移
 
-1. 停止旧服务及 Worker，备份 SQLite 数据库（包含 WAL 一致性状态）、数据目录和原主密钥，并演练恢复。目标 PostgreSQL 数据库必须为空。
-2. 在相同或经过验证的挂载路径恢复索引目录。离线迁移复制已有绝对路径，换路径时必须先完成受控路径迁移，不能仅复制数据库。
-3. 通过 Vault Transit 用 `--wrap-existing` 包装旧主密钥，并验证可以解密备份数据。不要用新随机密钥覆盖旧密钥。
-4. 在可信环境通过 `DATABASE_URL` 或 `CODEHARBOR_DATABASE_URL_FILE` 提供目标地址，执行：
-
-   ```sh
-   node dist/migrate-sqlite.js --source /path/to/codeharbor.sqlite --confirm-source-offline
-   ```
-
-   迁移事务检查目标库为空并导入；运行中的任务转为待处理。失败时不会将部分记录提交到目标库。生产模式同样要求数据库连接通过 TLS 验证。
-5. 启动单实例并核对用户 Key、仓库、索引 commit 和任务状态；用测试用户验证权限、Webhook 和同步。失败时停机回滚到保留的旧数据库、旧主密钥与原数据目录。不可在两个实例同时访问共享仓库目录。
+schema 由仓库内 `migrations/NNNN_name.sql` 管理，服务启动时在持有实例锁的会话中按序执行未应用的版本，并记入 `schema_migrations(version, name, applied_at)`；每个版本在独立事务中执行，失败整体回滚且服务拒绝启动。数据库中的版本高于当前构建、或同一版本名称不一致时也会拒绝启动，避免误用旧镜像连接新库。升级流程：先备份数据库，再部署新版本让其自动迁移；回滚到旧版本前必须恢复备份，迁移本身不提供 down 脚本。当前处于开发阶段，所有表合并为 `0001_init.sql`；早于迁移机制的旧库不受支持，需要重建。
 
 ## 监控与恢复
 
-`/health/live` 表示进程响应；`/health/ready` 会检查持锁数据库连接及 CodeGraph MCP 工具。`/metrics` 使用独立 Bearer token，只输出聚合 HTTP 请求数与耗时；当前没有队列长度、索引延迟或云效错误等完整生产指标，需后续补齐。Fastify 输出结构化请求和审计日志；MCP 工具调用记录受控工具名、成功或失败及已授权的仓库 ID，不记录查询内容或源码。日志采集、访问控制、保留和告警由部署平台负责。
+`/health/live` 表示进程响应；`/health/ready` 会检查持锁数据库连接及 CodeGraph MCP 工具。`/metrics` 使用独立 Bearer token，输出聚合 HTTP 请求和索引队列指标；指标含义、统计窗口和查询示例见[队列监控](queue-metrics.md)。云效错误等指标仍需另行补充。Fastify 输出结构化请求和审计日志；MCP 工具调用记录受控工具名、成功或失败及已授权的仓库 ID，不记录查询内容或源码。日志采集、访问控制、保留和告警由部署平台负责。
 
 定期测试 PostgreSQL 备份、Vault Transit 旧密钥版本与包装文件、索引磁盘备份或重建，以及 Git/云效凭证重新授权。恢复后检查数据库路径、CodeGraph 版本、仓库 commit 和密钥一致性，再恢复流量。安装与配置所需的具体凭证、云资源和内网权限需要公司提供。
+
+### 告警建议
+
+- `codeharbor_runtime_fenced{component="image_runtime"} == 1` 或 `component="image_query"` / `graph_client` 为 1：镜像运行时进入 fail-closed（容器创建结果不确定或清理失败），所有查询将被拒绝，需按 [镜像后端文档](image-backend.md) 人工核对 Docker 状态后重启控制器。
+- `increase(codeharbor_audit_dropped_total[5m]) > 0` 或 `codeharbor_audit_failed_total` 增长：审计落库滞后或数据库异常，审计证据可能缺失。
+- `codeharbor_http_requests_total{status="429"}` 持续增长：某客户端或 Key 超出配额，结合审计表中的 `key_prefix` 定位。

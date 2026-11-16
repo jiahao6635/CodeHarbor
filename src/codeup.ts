@@ -1,7 +1,10 @@
 export type CodeupErrorKind = 'invalid_credential' | 'forbidden' | 'not_found' | 'unavailable' | 'invalid_response';
 
 export class CodeupError extends Error {
-  constructor(public readonly kind: CodeupErrorKind, public readonly status?: number) {
+  constructor(
+    public readonly kind: CodeupErrorKind,
+    public readonly status?: number,
+  ) {
     super(`Cloud DevOps request failed: ${kind}`);
     this.name = 'CodeupError';
   }
@@ -38,10 +41,14 @@ function repository(value: unknown): CodeupRepository {
   const id = String(data.id ?? '');
   if (!/^\d+$/.test(id) || typeof data.name !== 'string') throw new CodeupError('invalid_response');
   const rawLevel = data.accessLevel;
-  const level = typeof rawLevel === 'number' || (typeof rawLevel === 'string' && /^\d+$/.test(rawLevel)) ? Number(rawLevel) : null;
-  const cloneDownloadRestricted = data.enableCloneDownloadControl === true || data.openCloneDownloadControl === true
-    ? true
-    : data.enableCloneDownloadControl === false && data.openCloneDownloadControl === false ? false : undefined;
+  const level =
+    typeof rawLevel === 'number' || (typeof rawLevel === 'string' && /^\d+$/.test(rawLevel)) ? Number(rawLevel) : null;
+  const cloneDownloadRestricted =
+    data.enableCloneDownloadControl === true || data.openCloneDownloadControl === true
+      ? true
+      : data.enableCloneDownloadControl === false && data.openCloneDownloadControl === false
+        ? false
+        : undefined;
   return {
     id,
     name: data.name,
@@ -66,10 +73,18 @@ export class CodeupClient {
 
   constructor(options: ClientOptions) {
     const endpoint = new URL(options.endpoint);
-    if ((endpoint.protocol !== 'https:' && !(options.allowHttp && endpoint.protocol === 'http:')) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== '/') {
+    if (
+      (endpoint.protocol !== 'https:' && !(options.allowHttp && endpoint.protocol === 'http:')) ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.search ||
+      endpoint.hash ||
+      endpoint.pathname !== '/'
+    ) {
       throw new Error('Codeup endpoint must be a trusted HTTPS origin');
     }
-    if (options.organizationId && !/^[A-Za-z0-9_-]+$/.test(options.organizationId)) throw new Error('Invalid organization ID');
+    if (options.organizationId && !/^[A-Za-z0-9_-]+$/.test(options.organizationId))
+      throw new Error('Invalid organization ID');
     this.endpoint = endpoint;
     this.repositoryRoot = options.organizationId
       ? `/oapi/v1/codeup/organizations/${encodeURIComponent(options.organizationId)}`
@@ -112,22 +127,39 @@ export class CodeupClient {
     return { id: user.id, username: user.username, name: typeof user.name === 'string' ? user.name : user.username };
   }
 
-  async listRepositories(token: string, page = 1, perPage = 100): Promise<{ repositories: CodeupRepository[]; nextPage: number | null }> {
-    if (!Number.isSafeInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 1 || perPage > 100) throw new Error('Invalid pagination');
-    const { data, headers } = await this.get(`${this.repositoryRoot}/repositories?page=${page}&perPage=${perPage}`, token);
+  async listRepositories(
+    token: string,
+    page = 1,
+    perPage = 100,
+  ): Promise<{ repositories: CodeupRepository[]; nextPage: number | null }> {
+    if (!Number.isSafeInteger(page) || page < 1 || !Number.isInteger(perPage) || perPage < 1 || perPage > 100)
+      throw new Error('Invalid pagination');
+    const { data, headers } = await this.get(
+      `${this.repositoryRoot}/repositories?page=${page}&perPage=${perPage}`,
+      token,
+    );
     if (!Array.isArray(data)) throw new CodeupError('invalid_response');
     const next = headers.get('x-next-page');
     const total = headers.get('x-total-pages');
-    if ((next && (!/^\d+$/.test(next) || !Number.isSafeInteger(Number(next)))) ||
-        (total && (!/^\d+$/.test(total) || !Number.isSafeInteger(Number(total))))) throw new CodeupError('invalid_response');
+    if (
+      (next && (!/^\d+$/.test(next) || !Number.isSafeInteger(Number(next)))) ||
+      (total && (!/^\d+$/.test(total) || !Number.isSafeInteger(Number(total))))
+    )
+      throw new CodeupError('invalid_response');
     const nextPage = next ? Number(next) : null;
     const totalPages = total ? Number(total) : null;
     // Region can repeat the last page in x-next-page; total pages proves termination.
-    if (totalPages !== null && ((nextPage !== null && nextPage > page && nextPage !== page + 1) ||
-        (nextPage !== null && nextPage > totalPages) || (totalPages < page && data.length > 0) ||
+    if (
+      totalPages !== null &&
+      ((nextPage !== null && nextPage > page && nextPage !== page + 1) ||
+        (nextPage !== null && nextPage > totalPages) ||
+        (totalPages < page && data.length > 0) ||
         (totalPages > page && (nextPage === null || nextPage <= page)) ||
-        (totalPages <= page && nextPage !== null && nextPage > page))) throw new CodeupError('invalid_response');
-    if (nextPage !== null && nextPage <= page && (totalPages === null || totalPages > page)) throw new CodeupError('invalid_response');
+        (totalPages <= page && nextPage !== null && nextPage > page))
+    )
+      throw new CodeupError('invalid_response');
+    if (nextPage !== null && nextPage <= page && (totalPages === null || totalPages > page))
+      throw new CodeupError('invalid_response');
     return { repositories: data.map(repository), nextPage: nextPage !== null && nextPage > page ? nextPage : null };
   }
 
@@ -138,5 +170,4 @@ export class CodeupClient {
     if (repo.id !== repoId) throw new CodeupError('invalid_response');
     return repo;
   }
-
 }

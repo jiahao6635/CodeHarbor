@@ -1,0 +1,28 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.6.8/schema.json",
+  "root": false,
+  "extends": "//",
+  "files": {
+    "includes": ["src/**", "*.json", "*.ts", "!dist/**", "!node_modules/**"]
+  },
+  "css": {
+    "parser": { "tailwindDirectives": true }
+  },
+  "linter": {
+    "rules": {
+      "recommended": true,
+      "a11y": { "recommended": true },
+      "correctness": { "useExhaustiveDependencies": "warn" }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["src/components/ui/label.tsx"],
+      "linter": { "rules": { "a11y": { "noLabelWithoutControl": "off" } } }
+    },
+    {
+      "includes": ["src/styles/**"],
+      "linter": { "rules": { "complexity": { "noImportantStyles": "off" } } }
+    }
+  ]
+}

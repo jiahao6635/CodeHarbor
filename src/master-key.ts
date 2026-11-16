@@ -36,8 +36,19 @@ export class VaultTransitMasterKey {
 
   constructor(options: VaultTransitOptions) {
     let address: URL;
-    try { address = new URL(options.address); } catch { throw new Error('Invalid Vault address'); }
-    if (address.protocol !== 'https:' || address.username || address.password || address.search || address.hash || address.pathname !== '/') {
+    try {
+      address = new URL(options.address);
+    } catch {
+      throw new Error('Invalid Vault address');
+    }
+    if (
+      address.protocol !== 'https:' ||
+      address.username ||
+      address.password ||
+      address.search ||
+      address.hash ||
+      address.pathname !== '/'
+    ) {
       throw new Error('Vault address must be an HTTPS origin');
     }
     if (!options.tokenFile || options.tokenFile.includes('\0')) throw new Error('Vault token file is required');
@@ -47,33 +58,54 @@ export class VaultTransitMasterKey {
     this.options = { ...options, keyName: segment(options.keyName) };
   }
 
-  private async request(operation: 'encrypt' | 'decrypt', payload: Record<string, string>): Promise<Record<string, unknown>> {
+  private async request(
+    operation: 'encrypt' | 'decrypt',
+    payload: Record<string, string>,
+  ): Promise<Record<string, unknown>> {
     let token: string;
-    try { token = (await readFile(this.options.tokenFile, 'utf8')).trim(); }
-    catch { throw new Error('Vault token is unavailable'); }
+    try {
+      token = (await readFile(this.options.tokenFile, 'utf8')).trim();
+    } catch {
+      throw new Error('Vault token is unavailable');
+    }
     if (!token || token.length > 16_384 || /[\r\n\0]/.test(token)) throw new Error('Vault token is unavailable');
     let response: Response;
     try {
-      response = await (this.options.fetch ?? fetch)(`${this.origin}${this.path}/${operation}/${this.options.keyName}`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json', 'x-vault-token': token,
-          ...(this.options.namespace ? { 'x-vault-namespace': this.options.namespace } : {}),
+      response = await (this.options.fetch ?? fetch)(
+        `${this.origin}${this.path}/${operation}/${this.options.keyName}`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-vault-token': token,
+            ...(this.options.namespace ? { 'x-vault-namespace': this.options.namespace } : {}),
+          },
+          body: JSON.stringify({ ...payload, associated_data: associatedData }),
+          redirect: 'error',
+          signal: AbortSignal.timeout(this.options.timeoutMs ?? 10_000),
         },
-        body: JSON.stringify({ ...payload, associated_data: associatedData }),
-        redirect: 'error',
-        signal: AbortSignal.timeout(this.options.timeoutMs ?? 10_000),
-      });
-    } catch { throw new Error('Vault Transit request failed'); }
+      );
+    } catch {
+      throw new Error('Vault Transit request failed');
+    }
     if (!response.ok) throw new Error('Vault Transit request failed');
     let result: unknown;
     try {
       const output = await response.text();
       if (Buffer.byteLength(output) > 16_384) throw new Error();
       result = JSON.parse(output);
-    } catch { throw new Error('Vault Transit returned an invalid response'); }
-    if (!result || typeof result !== 'object' || Array.isArray(result) ||
-        !('data' in result) || !result.data || typeof result.data !== 'object' || Array.isArray(result.data)) {
+    } catch {
+      throw new Error('Vault Transit returned an invalid response');
+    }
+    if (
+      !result ||
+      typeof result !== 'object' ||
+      Array.isArray(result) ||
+      !('data' in result) ||
+      !result.data ||
+      typeof result.data !== 'object' ||
+      Array.isArray(result.data)
+    ) {
       throw new Error('Vault Transit returned an invalid response');
     }
     return result.data as Record<string, unknown>;
@@ -89,11 +121,15 @@ export class VaultTransitMasterKey {
   }
 
   async unwrap(wrapped: string): Promise<Buffer> {
-    if (wrapped.length > 16_384 || !/^vault:v[1-9][0-9]*:[A-Za-z0-9+/]+={0,2}$/.test(wrapped)) throw new Error('Invalid wrapped master key');
+    if (wrapped.length > 16_384 || !/^vault:v[1-9][0-9]*:[A-Za-z0-9+/]+={0,2}$/.test(wrapped))
+      throw new Error('Invalid wrapped master key');
     const data = await this.request('decrypt', { ciphertext: wrapped });
     if (typeof data.plaintext !== 'string') throw new Error('Vault Transit returned an invalid response');
-    try { return parseMasterKey(data.plaintext); }
-    catch { throw new Error('Vault Transit returned an invalid master key'); }
+    try {
+      return parseMasterKey(data.plaintext);
+    } catch {
+      throw new Error('Vault Transit returned an invalid master key');
+    }
   }
 }
 
@@ -101,8 +137,15 @@ export function vaultTransitOptions(env: NodeJS.ProcessEnv): VaultTransitOptions
   const address = env.CODEHARBOR_VAULT_ADDR;
   const keyName = env.CODEHARBOR_VAULT_TRANSIT_KEY;
   const tokenFile = env.CODEHARBOR_VAULT_TOKEN_FILE;
-  if (!address || !keyName || !tokenFile) throw new Error('Vault address, Transit key name and token file are required');
-  return { address, keyName, tokenFile, mount: env.CODEHARBOR_VAULT_TRANSIT_MOUNT ?? 'transit', namespace: env.CODEHARBOR_VAULT_NAMESPACE || undefined };
+  if (!address || !keyName || !tokenFile)
+    throw new Error('Vault address, Transit key name and token file are required');
+  return {
+    address,
+    keyName,
+    tokenFile,
+    mount: env.CODEHARBOR_VAULT_TRANSIT_MOUNT ?? 'transit',
+    namespace: env.CODEHARBOR_VAULT_NAMESPACE || undefined,
+  };
 }
 
 /** Fail closed: a configured Vault provider never falls back to a local key. */
@@ -115,7 +158,10 @@ export async function loadMasterKey(env: NodeJS.ProcessEnv = process.env, fetchI
   if (provider !== 'vault-transit') throw new Error('Unknown credential key provider');
   if (!env.CODEHARBOR_VAULT_WRAPPED_KEY_FILE) throw new Error('Vault wrapped key file is required');
   let wrapped: string;
-  try { wrapped = (await readFile(env.CODEHARBOR_VAULT_WRAPPED_KEY_FILE, 'utf8')).trim(); }
-  catch { throw new Error('Vault wrapped key file is unavailable'); }
+  try {
+    wrapped = (await readFile(env.CODEHARBOR_VAULT_WRAPPED_KEY_FILE, 'utf8')).trim();
+  } catch {
+    throw new Error('Vault wrapped key file is unavailable');
+  }
   return new VaultTransitMasterKey({ ...vaultTransitOptions(env), fetch: fetchImpl }).unwrap(wrapped);
 }

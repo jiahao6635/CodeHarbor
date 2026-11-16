@@ -2,6 +2,8 @@
 
 此模板用于单服务器评估镜像模式。CodeHarbor 应用在 `/data` 的 tmpfs 中临时克隆和建立索引，查询容器使用只读镜像；不会把 Git 工作树或索引目录挂载为持久卷。Docker 镜像、层和构建缓存仍保存在 Docker 主机存储中，包含源码，须按源码等级保护。PostgreSQL 和 Vault 的持久化方案保持不变。
 
+并发查询版本的内部协议与旧控制器不兼容。升级时应安排维护窗口，先停止新请求并等待在途查询完成，安全停止旧平台和控制器；随后先启动新版控制器并确认就绪，再启动新版平台，验收后恢复流量。不要让新版平台与旧控制器同时处理查询。回退时同样先停流，确认全部查询容器和新版 pending 标记已按受控恢复流程处理，再切换旧版本。
+
 控制器是独立进程，只有它持有 Docker socket；公网网关不挂载该 socket。**Docker socket 本身仍提供高度敏感的宿主机控制能力**，Unix socket 协议限制不等同于 Docker daemon 权限隔离；仅在可信主机、专用控制器和独立系统账号边界下使用。按企业策略限制 Docker 访问、镜像/缓存与日志，并保持控制器单实例。
 
 ## 准备目录和令牌
@@ -29,6 +31,8 @@ export CODEHARBOR_REPOSITORY_RUNTIME_IMAGE="$(docker image inspect codeharbor-co
 ```
 
 配置以上目录、令牌文件和控制器 ID，同时准备 `production-deployment.md` 中已有的云效、PostgreSQL、Vault、TLS 和 Nginx 配置。若需本机 PostgreSQL，在基础文件和镜像文件之间加入 `deploy/compose.postgres.yaml`。
+
+`CODEHARBOR_MCP_QUERY_CONCURRENCY` 控制同时执行的查询数，默认 `10`，只接受 `1` 至 `32` 的整数。Compose 会将同一值传给平台和镜像控制器；若自行部署两个服务或追加 override，必须保持两者相同，修改值后需同步重启。默认 10 个查询容器合计最多可使用 10 核 CPU 和 5 GiB 内存，实际影响取决于工作负载和同机其他服务，需压测确认。
 
 `CODEHARBOR_DOCKER_CLI_IMAGE` 控制构建控制器镜像所用的 Docker CLI 镜像，默认 `docker:27-cli`；生产构建应指定企业审核并固定 digest 的镜像。控制器最终仍连接宿主机 Docker daemon，应确认客户端与 daemon 版本兼容。
 
