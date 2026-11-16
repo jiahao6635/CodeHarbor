@@ -17,11 +17,21 @@ CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库
 
 ## 开发运行
 
-需要 Node.js 22.13+（本项目限定 Node 22）、Git 和可访问的云效 Codeup；CodeGraph npm 包版本已固定，`npm ci` 会安装对应平台的可执行文件。
+需要 Node.js 22.13+（本项目限定 Node 22）、Git、Docker（用于本地 PostgreSQL 和测试）以及可访问的云效 Codeup；CodeGraph npm 包版本已固定，`npm ci` 会安装对应平台的可执行文件。
 
 ```sh
 npm ci
+npm run check   # tsc --noEmit + biome check
 npm run build
+```
+
+代码风格由 [Biome](biome.json) 统一（120 列、单引号、禁止一行多语句），提交前运行 `npm run lint:fix`。
+
+平台元数据只支持 PostgreSQL。schema 由 `migrations/*.sql` 管理：文件按 `NNNN_name.sql` 连续编号，服务启动时在持有实例锁的会话中按序执行未应用的版本并记入 `schema_migrations`；版本回退或改名会拒绝启动。当前处于开发阶段，所有表合并在 `0001_init.sql`，已有的旧库需要重建。本地开发可直接使用测试数据库：
+
+```sh
+npm run test:db:up
+export DATABASE_URL='postgres://codeharbor_test:codeharbor_test@127.0.0.1:54329/postgres'
 ```
 
 索引任务会执行位于临时目录和数据目录中的 Git 凭证助手，因此这两个目录须允许执行文件；若挂载为 `noexec`，任务会失败。测试也会在临时目录运行测试夹具。生产部署应将这两个目录限制为服务专用。
@@ -31,27 +41,33 @@ npm run build
 | 变量 | 说明 |
 |---|---|
 | `CODEHARBOR_MASTER_KEY` | 本地开发模式使用的 Base64 编码 32 字节密钥；与数据目录分开保存；生产不使用此模式 |
-| `DATABASE_URL` 或 `CODEHARBOR_DATABASE_URL_FILE` | PostgreSQL 连接串或受保护的连接串文件，二者只能设置一个；生产必须启用 `sslmode=verify-full` |
+| `DATABASE_URL` 或 `CODEHARBOR_DATABASE_URL_FILE` | 必填，PostgreSQL 连接串或受保护的连接串文件，二者只能设置一个；生产必须启用 `sslmode=verify-full` |
 | `CODEHARBOR_KEY_PROVIDER` | 生产设为 `vault-transit`；Vault 配置见 [Vault Transit 文档](docs/vault-transit.md) |
 | `CODEHARBOR_METRICS_TOKEN_FILE` | 可选，独立监控 Bearer 密钥文件；未配置时 `/metrics` 不开放 |
 | `CODEHARBOR_MCP_QUERY_CONCURRENCY` | 镜像模式并发查询上限，默认 `10`，可设 `1`～`32`；平台与镜像控制器必须一致 |
 | `YUNXIAO_ENDPOINT` | 必填，可信云效 API HTTPS 源，例如 `https://example.yunxiao.example` |
 | `YUNXIAO_ORGANIZATION_ID` | 云效中心版组织 ID；Region 版按实际 API 配置 |
 | `CODEHARBOR_GIT_HOSTS` | 必填，允许拉取的 HTTPS Git 主机，逗号分隔；包含非标准端口时写 `host:port` |
-| `CODEHARBOR_WRITE_USERS` | 允许申请平台 write Key 的云效用户 ID，逗号分隔；默认无人可写 |
+| `CODEHARBOR_WRITE_USERS` | 允许申请平台 write Key 的云效用户 ID，逗号分隔；默认无人可写。持有 `repos: null` write Key 的这些用户即平台管理员 |
+| `CODEHARBOR_ACCESS_TTL_MS` | 无范围 read Key 的云效仓库权限缓存有效期，默认 6 小时（`21600000`）；到期后按需或由后台复核 |
+| `CODEHARBOR_TRUST_PROXY` | `true` 时客户端地址取 `X-Forwarded-For` 最后一跳；仅在可信反向代理后开启 |
+| `CODEHARBOR_DOCS_ENABLED` | 是否提供 `/docs` 与 `/openapi.json`；生产默认 `false` |
+| `CODEHARBOR_MCP_KEY_RATE_PER_MIN` | 每个 Key 每分钟的 `/mcp` 请求配额，默认 `120`，超出返回 429 |
+| `CODEHARBOR_AUTH_FAILURE_RATE_PER_MIN` | 每个客户端地址每分钟允许的 Bearer 认证失败次数，默认 `30` |
+| `CODEHARBOR_AUDIT_RETENTION_DAYS` | 持久化审计事件保留天数，默认 `180` |
 | `CODEHARBOR_DATA_DIR` | 持久化目录，默认 `./data` |
 | `CODEHARBOR_BIND`、`PORT` | 默认 `127.0.0.1:8080` |
 | `CODEHARBOR_ALLOWED_HOSTS` | 允许的 HTTP Host，逗号分隔；默认允许本地 `127.0.0.1` 和 `localhost` 带端口 |
 | `CODEHARBOR_ALLOWED_ORIGINS` | 允许的浏览器 Origin；默认不允许携带 Origin 的请求 |
 | `CODEGRAPH_BIN` | 可选，覆盖 CodeGraph 可执行文件路径 |
 
-运行 `npm start`。`NODE_ENV=production` 会强制要求 PostgreSQL 验证服务端证书和 Vault Transit，不能退回 SQLite/本地密钥。其他模式若不配置 PostgreSQL 则使用 SQLite。生产数据库连接应直连或使用 session pooling，不可使用事务池，因为实例互斥锁依赖持续的数据库会话；会话断开后拒绝读写，需由 supervisor 重启。业务进程与 Worker 同实例运行，仍不能横向扩容。
+运行 `npm start`。`NODE_ENV=production` 会强制要求 PostgreSQL 验证服务端证书和 Vault Transit，不能退回本地密钥。服务使用一条专用会话持有实例互斥锁（`pg_advisory_lock`）并执行迁移，业务查询和事务走独立连接池（默认 10 个连接）；因此数据库连接应直连或使用 session pooling，不可使用事务池。锁会话断开后所有读写拒绝执行，需由 supervisor 重启。业务进程与 Worker 同实例运行，仍不能横向扩容。
 
-本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者检查数据库，工作树模式下检查上游 MCP 工具 schema，镜像模式下检查镜像调度控制器。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 与索引队列指标，不包含源码、仓库或用户标签；仅限内网采集。指标含义和查询示例见[队列监控](docs/queue-metrics.md)。结构化 HTTP 和审计事件输出到 stdout，生产环境须配置访问受控的日志采集、留存和告警。
+本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者检查数据库，工作树模式下检查上游 MCP 工具 schema，镜像模式下检查镜像调度控制器。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 与索引队列指标，不包含源码、仓库或用户标签；仅限内网采集。指标含义和查询示例见[队列监控](docs/queue-metrics.md)。结构化 HTTP 和审计事件输出到 stdout，同时批量写入数据库 `audit_events` 表（代码查询只记录 SHA-256 摘要，不记录内容），管理员可通过 `GET /api/v1/admin/audit` 查询；生产环境仍须配置访问受控的日志采集、留存和告警。`/metrics` 额外暴露 `codeharbor_runtime_fenced{component}`（镜像运行时/图客户端进入 fail-closed 状态时为 1，需人工介入）和 `codeharbor_audit_dropped_total`，应接入告警。
 
 ## 接口文档
 
-服务启动后访问 `/docs` 查看 Swagger UI，或通过 `/openapi.json` 获取 OpenAPI 定义。页面使用服务本地提供的资源，管理接口可通过 **Authorize** 填写 CodeHarbor Key 后调试；具体权限仍由服务端检查，`write` 只允许平台管理及触发索引。建议继续使用交互式 CLI 绑定云效 PAT，避免在浏览器中输入或保存 PAT。新建的 Key、引导凭证和 Webhook Token 仅在创建时返回一次，须妥善保存。
+开发环境启动后访问 `/docs` 查看 Swagger UI，或通过 `/openapi.json` 获取 OpenAPI 定义（生产默认关闭，需 `CODEHARBOR_DOCS_ENABLED=true`，且部署模板中的 Nginx 不对外转发这两个路径）。页面使用服务本地提供的资源，管理接口可通过 **Authorize** 填写 CodeHarbor Key 后调试；具体权限仍由服务端检查，`write` 只允许平台管理及触发索引。建议继续使用交互式 CLI 绑定云效 PAT，避免在浏览器中输入或保存 PAT。新建的 Key、引导凭证和 Webhook Token 仅在创建时返回一次，须妥善保存。
 
 浏览器调用 API 时，须将页面实际的完整 Origin（例如 `https://codegraph.sigmob.com`）加入 `CODEHARBOR_ALLOWED_ORIGINS`，并确保 `CODEHARBOR_ALLOWED_HOSTS` 允许反向代理传递的 Host。文档页面和规范本身不要求登录；Host 白名单并非身份认证。生产环境应按企业策略在网关或网络层控制 `/docs`、`/docs/` 及其子路径和 `/openapi.json` 的访问，并只在可信浏览器中调试。文档中的健康检查和监控端点默认不经部署模板中的 Nginx 对外开放。
 
@@ -66,9 +82,11 @@ node dist/cli.js bind --url http://127.0.0.1:8080 --scope write
 
 CLI 隐藏 PAT 输入；CodeHarbor Key 明文只返回一次，使用者应自行安全保存。也可调用 `POST /api/v1/auth/yunxiao/bind` 和 `POST /api/v1/auth/bootstrap/keys`；PAT 只能经可信 TLS 或本机回环传输，首次引导凭证有效 5 分钟且只能使用一次。
 
-首次引导产生的 Key 没有明确的仓库列表（`repos: null`），**不能直接通过 MCP 查询仓库代码**。平台管理员使用 write Key 接入仓库后，调用 `POST /api/v1/api-keys` 签发 `repos` 中明确列出 CodeHarbor 仓库 ID 的 read Key，并通过安全渠道交给使用者；该 Key 仅能查询列出的仓库。受配置允许的 write 管理员仍可用 `repos: null` 的管理 Key 操作平台和创建限定范围的 Key。普通用户的旧 `repos: null` read Key 不会自动扩为全部仓库权限，需由管理员重新签发限定范围的 Key。新建 read Key 必须提供 `repos` 列表。
+**自助使用（推荐）**：每位使用者用自己的云效 PAT 绑定账号并申请 `--scope read` 的首个 Key。该 Key 没有明确仓库列表（`repos: null`），其可见范围等于持有者**当前**在云效中具有访问角色的已接入仓库：首次访问某仓库时平台用持有者的 PAT 核验一次并缓存，`CODEHARBOR_ACCESS_TTL_MS`（默认 6 小时）后按需或由后台（每个 reconcile 周期）复核。云效撤权后最迟一个 TTL 内自动失去可见性；PAT 失效（被撤销或过期）会立即撤销该用户的全部 Key，并把以其凭据同步的仓库置为 `credential_required`。审计事件直接归属于使用者本人。
 
-当前创建 Key 接口只为调用者本人签发，不支持指定目标用户。管理员代发的 Key 在审计中仍归属于管理员，可通过 Key 前缀区分不同 Key，但不能自动识别实际使用者；普通用户的初始 read Key 不能自己派生限定范围的 Key。请按公司策略决定 Key 的分发方式和审计要求。
+**显式授权（CI / 机器人）**：平台管理员调用 `POST /api/v1/api-keys` 签发 `repos` 中明确列出 CodeHarbor 仓库 ID 的 read Key；该 Key 只能查询列出的仓库，不核验云效权限，审计归属于签发的管理员，需管理员自行吊销。受配置允许的 write 管理员使用 `repos: null` 的管理 Key 操作平台，但管理 Key 本身不能查询代码。
+
+**管理面**（需管理员 Key）：`POST /api/v1/repositories/{id}/disable|enable`、`DELETE /api/v1/repositories/{id}`（仅限已禁用）、`GET /api/v1/admin/users`、`GET /api/v1/admin/api-keys`、`DELETE /api/v1/admin/api-keys/{prefix}`、`POST /api/v1/admin/users/{id}/revoke-keys`、`GET /api/v1/admin/audit`。
 
 管理员创建限定仓库范围的 read Key 时，请求 `POST /api/v1/api-keys`，使用管理员 write Key 的 Bearer 认证，请求体示例：
 
@@ -101,11 +119,15 @@ Agent 配置 MCP URL `https://<trusted-host>/mcp` 和 `Authorization: Bearer <Co
 
 ## 测试
 
+测试全部运行在真实 PostgreSQL 上：每个测试用例创建独立数据库、执行迁移、结束后删除。先用 Docker 启动测试库，再运行测试：
+
 ```sh
+npm run test:db:up
 CODEGRAPH_TEST_BIN="$PWD/node_modules/.bin/codegraph" npm test
+npm run test:db:down
 ```
 
-测试包括虚拟 Codeup 权限、MCP 隔离、Webhook、任务及真实 CodeGraph 多仓库查询。设置 `CODEHARBOR_TEST_DATABASE_URL` 后还执行真实 PostgreSQL 的迁移、实例锁和 HTTP/MCP 集成测试；该测试需要可创建和删除测试数据库的独立测试账号。虚拟云效测试不代表真实云效端到端验证。
+默认连接 [deploy/compose.test.yaml](deploy/compose.test.yaml) 暴露的 `127.0.0.1:54329`；要使用其他实例，设置 `CODEHARBOR_TEST_DATABASE_URL` 指向一个可创建和删除数据库的账号。测试包括虚拟 Codeup 权限、MCP 隔离、Webhook、任务、迁移与实例锁，以及真实 CodeGraph 多仓库查询。虚拟云效测试不代表真实云效端到端验证。
 
 ## 容器
 

@@ -1,10 +1,4 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  randomBytes,
-  timingSafeEqual,
-} from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 /** The encryption key must be supplied independently of the database. */
 export class CredentialCipher {
@@ -21,7 +15,12 @@ export class CredentialCipher {
     const cipher = createCipheriv('aes-256-gcm', this.key, iv);
     cipher.setAAD(Buffer.from(ownerId, 'utf8'));
     const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-    return ['v1', iv.toString('base64url'), cipher.getAuthTag().toString('base64url'), ciphertext.toString('base64url')].join('.');
+    return [
+      'v1',
+      iv.toString('base64url'),
+      cipher.getAuthTag().toString('base64url'),
+      ciphertext.toString('base64url'),
+    ].join('.');
   }
 
   decrypt(encoded: string, ownerId: string): string {

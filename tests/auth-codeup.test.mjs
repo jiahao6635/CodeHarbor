@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import test from 'node:test';
-import { CredentialCipher, createAccessKey, hashAccessKey, constantTimeEqual } from '../src/auth.ts';
+import { CredentialCipher, constantTimeEqual, createAccessKey, hashAccessKey } from '../src/auth.ts';
 import { CodeupClient, CodeupError, hasRepositoryRole } from '../src/codeup.ts';
 
 test('credentials are authenticated, encrypted and bound to their owner', () => {
@@ -32,9 +32,19 @@ test('Codeup requests use authenticated API and validate response and pagination
   const calls = [];
   const fakeFetch = async (url, options) => {
     calls.push({ url: String(url), options });
-    if (url.pathname === '/oapi/v1/platform/user') return Response.json({ id: 'user-1', username: 'alice', name: 'Alice' });
-    if (url.pathname.endsWith('/repositories/7')) return Response.json({ id: 7, name: 'test', accessLevel: 30, httpUrlToRepo: 'https://git.example/test.git', enableCloneDownloadControl: false, openCloneDownloadControl: false });
-    if (url.pathname.endsWith('/repositories')) return Response.json([{ id: 7, name: 'test', accessLevel: 30 }], { headers: { 'x-next-page': '2' } });
+    if (url.pathname === '/oapi/v1/platform/user')
+      return Response.json({ id: 'user-1', username: 'alice', name: 'Alice' });
+    if (url.pathname.endsWith('/repositories/7'))
+      return Response.json({
+        id: 7,
+        name: 'test',
+        accessLevel: 30,
+        httpUrlToRepo: 'https://git.example/test.git',
+        enableCloneDownloadControl: false,
+        openCloneDownloadControl: false,
+      });
+    if (url.pathname.endsWith('/repositories'))
+      return Response.json([{ id: 7, name: 'test', accessLevel: 30 }], { headers: { 'x-next-page': '2' } });
     return new Response(null, { status: 404 });
   };
   const api = new CodeupClient({ endpoint: 'https://devops.example', organizationId: 'org-1', fetch: fakeFetch });
@@ -56,27 +66,51 @@ test('Codeup requests use authenticated API and validate response and pagination
 
 test('a repository role alone does not interpret the clone control switch as permission', async () => {
   for (const [enabled, opened, allowed] of [
-    [false, false, true], [true, false, true], [false, true, true],
-    [true, true, true], [undefined, false, true], [false, undefined, true],
+    [false, false, true],
+    [true, false, true],
+    [false, true, true],
+    [true, true, true],
+    [undefined, false, true],
+    [false, undefined, true],
   ]) {
     const api = new CodeupClient({
       endpoint: 'https://devops.example',
-      fetch: async () => Response.json({ id: 7, name: 'test', accessLevel: 30,
-        enableCloneDownloadControl: enabled, openCloneDownloadControl: opened }),
+      fetch: async () =>
+        Response.json({
+          id: 7,
+          name: 'test',
+          accessLevel: 30,
+          enableCloneDownloadControl: enabled,
+          openCloneDownloadControl: opened,
+        }),
     });
     assert.equal(hasRepositoryRole(await api.getRepository('secret', '7')), allowed);
   }
 });
 
 test('repository pagination accepts a repeated last page only with a consistent total', async () => {
-  const make = (headers, records = [{ id: 7, name: 'test' }]) => new CodeupClient({
-    endpoint: 'https://devops.example', fetch: async () => Response.json(records, { headers }),
-  });
+  const make = (headers, records = [{ id: 7, name: 'test' }]) =>
+    new CodeupClient({
+      endpoint: 'https://devops.example',
+      fetch: async () => Response.json(records, { headers }),
+    });
   assert.equal((await make({ 'x-next-page': '2', 'x-total-pages': '2' }).listRepositories('secret', 1, 2)).nextPage, 2);
-  assert.equal((await make({ 'x-next-page': '2', 'x-total-pages': '2' }).listRepositories('secret', 2, 2)).nextPage, null);
-  assert.equal((await make({ 'x-next-page': '1', 'x-total-pages': '1' }).listRepositories('secret', 1, 100)).nextPage, null);
-  assert.equal((await make({ 'x-next-page': '2', 'x-total-pages': '2' }, []).listRepositories('secret', 3, 2)).nextPage, null);
-  assert.equal((await make({ 'x-next-page': '0', 'x-total-pages': '0' }, []).listRepositories('secret', 1)).nextPage, null);
+  assert.equal(
+    (await make({ 'x-next-page': '2', 'x-total-pages': '2' }).listRepositories('secret', 2, 2)).nextPage,
+    null,
+  );
+  assert.equal(
+    (await make({ 'x-next-page': '1', 'x-total-pages': '1' }).listRepositories('secret', 1, 100)).nextPage,
+    null,
+  );
+  assert.equal(
+    (await make({ 'x-next-page': '2', 'x-total-pages': '2' }, []).listRepositories('secret', 3, 2)).nextPage,
+    null,
+  );
+  assert.equal(
+    (await make({ 'x-next-page': '0', 'x-total-pages': '0' }, []).listRepositories('secret', 1)).nextPage,
+    null,
+  );
   for (const headers of [
     { 'x-next-page': '1' },
     { 'x-next-page': '0' },
@@ -86,14 +120,38 @@ test('repository pagination accepts a repeated last page only with a consistent 
     { 'x-next-page': '3', 'x-total-pages': '2' },
     { 'x-next-page': '3', 'x-total-pages': '4' },
     { 'x-next-page': '1', 'x-total-pages': 'invalid' },
-  ]) await assert.rejects(make(headers).listRepositories('secret', 1), error => error instanceof CodeupError && error.kind === 'invalid_response');
-  await assert.rejects(make({ 'x-next-page': '2', 'x-total-pages': '2' }).listRepositories('secret', 3), error => error instanceof CodeupError && error.kind === 'invalid_response');
-  await assert.rejects(make({ 'x-next-page': '0', 'x-total-pages': '0' }).listRepositories('secret', 1), error => error instanceof CodeupError && error.kind === 'invalid_response');
+  ])
+    await assert.rejects(
+      make(headers).listRepositories('secret', 1),
+      (error) => error instanceof CodeupError && error.kind === 'invalid_response',
+    );
+  await assert.rejects(
+    make({ 'x-next-page': '2', 'x-total-pages': '2' }).listRepositories('secret', 3),
+    (error) => error instanceof CodeupError && error.kind === 'invalid_response',
+  );
+  await assert.rejects(
+    make({ 'x-next-page': '0', 'x-total-pages': '0' }).listRepositories('secret', 1),
+    (error) => error instanceof CodeupError && error.kind === 'invalid_response',
+  );
 });
 
 test('Codeup errors do not expose upstream details or token', async () => {
-  const api = new CodeupClient({ endpoint: 'https://devops.example', fetch: async () => new Response('secret', { status: 401 }) });
-  await assert.rejects(api.getUser('secret'), (error) => error instanceof CodeupError && error.kind === 'invalid_credential' && !error.message.includes('secret'));
-  const unavailable = new CodeupClient({ endpoint: 'https://devops.example', fetch: async () => { throw new Error('secret'); } });
-  await assert.rejects(unavailable.getUser('secret'), (error) => error.kind === 'unavailable' && !error.message.includes('secret'));
+  const api = new CodeupClient({
+    endpoint: 'https://devops.example',
+    fetch: async () => new Response('secret', { status: 401 }),
+  });
+  await assert.rejects(
+    api.getUser('secret'),
+    (error) => error instanceof CodeupError && error.kind === 'invalid_credential' && !error.message.includes('secret'),
+  );
+  const unavailable = new CodeupClient({
+    endpoint: 'https://devops.example',
+    fetch: async () => {
+      throw new Error('secret');
+    },
+  });
+  await assert.rejects(
+    unavailable.getUser('secret'),
+    (error) => error.kind === 'unavailable' && !error.message.includes('secret'),
+  );
 });

@@ -5,6 +5,7 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
+COPY migrations ./migrations
 RUN npm run build && npm prune --omit=dev && mkdir -p /data && chown node:node /data
 USER node
 ENV NODE_ENV=production CODEHARBOR_BIND=0.0.0.0 CODEHARBOR_DATA_DIR=/data PORT=8080

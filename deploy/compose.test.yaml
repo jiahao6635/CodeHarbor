@@ -1,0 +1,19 @@
+# Local test database only. Plain TCP, trust-free password auth, no persistence.
+# Usage: npm run test:db:up && npm test
+services:
+  postgres-test:
+    image: ${CODEHARBOR_POSTGRES_IMAGE:-postgres:17}
+    environment:
+      POSTGRES_USER: codeharbor_test
+      POSTGRES_PASSWORD: codeharbor_test
+      POSTGRES_DB: postgres
+    command: postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+    ports:
+      - "${CODEHARBOR_TEST_POSTGRES_PORT:-54329}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U codeharbor_test -d postgres']
+      interval: 2s
+      timeout: 3s
+      retries: 20

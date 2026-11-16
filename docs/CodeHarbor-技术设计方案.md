@@ -48,23 +48,23 @@ WeKnora 已覆盖文档知识，CodeHarbor 用来补充代码结构知识，使 
 
 | 层次 | 当前 MVP 实际使用 | 后续生产化建议 | 选择原因与边界 |
 |---|---|---|---|
-| 开发语言 | **TypeScript 5.9.3**，编译为 JavaScript | 继续使用 TypeScript | 同一语言覆盖管理 API、MCP 网关及任务调度，类型可约束接口；不要求 CodeGraph 与服务运行在同一个进程 |
+| 开发语言 | **TypeScript 5.9.3**（`strict`），编译为 JavaScript；**Biome** 统一 lint 与格式（`biome.json`） | 继续使用 TypeScript | 同一语言覆盖管理 API、MCP 网关及任务调度，类型可约束接口；不要求 CodeGraph 与服务运行在同一个进程 |
 | 运行时 | **Node.js 22**，项目要求 `>=22.13.0 <23` | 使用仍受支持的 Node.js LTS 版本，并先完成升级验证 | 当前实际构建和目标运行版本；升级运行时需验证内置 SQLite、MCP SDK、CodeGraph 及原生依赖兼容性 |
-| 管理 API 框架 | **Node.js 原生 `node:http`**，手写路由与输入校验；没有 Express、Fastify 或 NestJS | 生产化建议采用 **Fastify 5**；迁移需另行实施与验证 | 当前接口数量有限，先避免引入额外框架；后续使用 Fastify 组织路由、统一校验和插件，**当前尚未接入** |
+| 管理 API 框架 | **Fastify 5**：按资源拆分的路由模块（`src/routes/*`）、全局 onRequest/onSend/错误处理钩子；仅 `/mcp` 以 `reply.hijack()` 接管原始流 | 延续 Fastify，按需补充插件 | 路由、Host/Origin 校验、请求 ID、审计和指标统一在框架层处理；鉴权在 `onRequest` 阶段完成，避免慢请求体占用未认证连接 |
 | MCP 实现 | 官方 TypeScript SDK **`@modelcontextprotocol/sdk` 1.32.2**；外部 Streamable HTTP，内部连接 CodeGraph stdio | 延续 SDK，并按兼容性测试升级 | 复用协议编解码、工具声明和远程传输；用户鉴权、仓库授权及路径映射仍由 CodeHarbor 实现。参考 [MCP SDK 文档](https://ts.sdk.modelcontextprotocol.io/server) |
-| 参数校验 | 管理 API 主要是手写校验；`zod` **4.6.7** 已作为依赖安装，当前业务代码未直接使用 | 接口规模增长时统一采用 schema 校验并生成 API 文档 | 不将已安装的依赖误写为已经覆盖所有接口；升级框架或校验方案时要保留现有安全测试 |
+| 参数校验 | **zod 4**：请求体用 `strictObject` 拒绝未知字段，路径/查询参数有独立 schema；数据库行也经 zod 解析，`BIGINT` 统一转为 number | 结合 OpenAPI 文档联动校验 | 校验失败返回固定错误码（400 `INVALID_ARGUMENT` / 404），不回显输入 |
 | 代码图引擎 | **`@colbymchenry/codegraph` 1.6.2**；每仓库独立索引，通过共享 MCP 会话查询 | 固定版本并通过兼容测试后升级 | 利用 CodeGraph 已有代码解析和图查询能力；不自行重建代码图引擎 |
 | 代码图存储 | **CodeGraph 自带 SQLite 索引文件**，每个仓库/版本独立 | 延续每仓库独立索引，按实际性能与隔离要求调整 | 这是 CodeGraph 的图索引；平台元数据改用 PostgreSQL 不会自动迁移或替换它 |
-| 平台元数据数据库 | **SQLite**，通过 Node.js 内置 `node:sqlite`、WAL；存用户、Key、仓库和任务 | 建议 **PostgreSQL 17** 存储平台元数据和任务状态 | MVP 单进程易于启动；Node 22 的 `node:sqlite` 仍有实验性提示，且同步数据库调用、并发和备份限制需要评估。实际主版本按企业托管服务支持情况确定；生产化前需迁移、备份恢复与性能测试 |
-| 任务队列 / 定时任务 | SQLite `jobs` 表 + **同一 Node 进程内的 Worker** + 定时器 | 先采用 **PostgreSQL 任务表**；多 Worker 场景实现事务领取、租约、续租、超时恢复和 fencing | 当前不具备跨进程锁与 fencing。PostgreSQL 的 `SKIP LOCKED` 可用于队列领取，但不能单独保证故障恢复和防止旧任务发布，仍须实现完整租约机制。参考 [PostgreSQL SELECT 文档](https://www.postgresql.org/docs/current/sql-select.html) |
+| 平台元数据数据库 | **PostgreSQL 17**（所有环境）；`pg` 连接池处理业务查询与事务，一条专用会话持有 `pg_advisory_lock` 实例锁；schema 由 `migrations/NNNN_name.sql` + `schema_migrations` 版本表管理 | 多实例时引入任务租约与 fencing | SQLite 支持已移除；锁会话断开后所有操作 fail-closed。CodeGraph 自己的索引文件仍是 SQLite，与平台库无关 |
+| 任务队列 / 定时任务 | PostgreSQL `jobs` 表 + **同一 Node 进程内的 Worker** + 定时器 | 多 Worker 场景实现事务领取、租约、续租、超时恢复和 fencing | 当前不具备跨进程锁与 fencing。PostgreSQL 的 `SKIP LOCKED` 可用于队列领取，但不能单独保证故障恢复和防止旧任务发布，仍须实现完整租约机制。参考 [PostgreSQL SELECT 文档](https://www.postgresql.org/docs/current/sql-select.html) |
 | 缓存 / 消息中间件 | **没有 Redis，也没有独立消息队列**；仓库查询按请求向云效核权 | 暂不引入；经吞吐、延迟、限流或失效需求验证后再评估 Redis/MQ | 减少运维组件；任何权限缓存都要明确撤权延迟和故障时拒绝访问的策略 |
 | 代码拉取 | **Git CLI**，通过云效可信 HTTPS 地址和指定 PAT 只读拉取 | 延续 Git CLI，限制可访问主机，并在隔离运行环境执行 | 不执行仓库构建脚本，默认不拉取子模块或 LFS；实际云效凭证及网络规则仍需联调 |
 | 仓库文件 | **本地持久化文件系统**：仓库版本目录、工作树和索引 | 单机先用持久化磁盘；多节点时另行设计存储与发布一致性 | 源码和索引按源码等级保护。对象存储可用于备份/归档，不能直接假定适合实时 Git 工作树或 SQLite |
 | PAT 与密钥 | Node.js `node:crypto`：PAT **AES-256-GCM** 加密后存 SQLite，主密钥由环境变量提供；API Key 保存 **SHA-256 哈希** | 使用企业 **KMS / Vault** 管理加密密钥或凭证 | 当前并未接入 KMS/Vault；主密钥和数据库备份需分开保护，轮换与恢复需验证 |
 | 入口与 TLS | 服务默认监听本地 HTTP；未内置 TLS / Nginx | 通过企业已有 **Nginx / Ingress / API 网关**提供 HTTPS 和访问控制 | MCP 地址与管理 API 可由同一入口提供；公网和 Webhook 入口的网络可达性单独配置 |
 | 构建与部署 | `npm` + 锁文件、`tsc`、Docker；基础镜像为 **`node:22-bookworm-slim`** | 单节点容器部署；需要扩容时再评估企业容器平台 | 当前支持单实例；临时目录和数据目录需允许执行凭证助手，并限制访问。容器不是自动完成仓库级隔离的保证 |
-| 测试 | Node.js **`node:test`** + **`tsx` 4.20.6**；模拟云效及真实 CodeGraph 测试 | 增加真实云效测试账号、客户端兼容性和多节点故障测试 | 云端 Node 22 容器已运行现有测试；真实企业云效 PAT、仓库权限和 Webhook 尚未联调 |
-| 日志、监控、审计 | 少量进程日志与健康检查；**尚无完整审计日志或指标系统** | 优先接入公司现有日志/监控；也可评估结构化日志、Prometheus/Grafana | 日志不记录 PAT、Key 和源码；监控与审计是生产准备工作，不声称当前已实现 |
+| 测试 | Node.js **`node:test`** + **`tsx`**；所有测试运行在 Docker 启动的真实 PostgreSQL 上（`deploy/compose.test.yaml`），每个用例独立数据库；模拟云效及真实 CodeGraph 测试 | 增加真实云效测试账号、客户端兼容性和多节点故障测试 | 真实企业云效 PAT、仓库权限和 Webhook 尚未联调 |
+| 日志、监控、审计 | **pino** 结构化日志（`src/logger.ts`，Fastify 与 Worker 共用）；Prometheus 文本指标 `/metrics`；审计事件批量写入 `audit_events` 表 | 接入公司现有日志/监控与告警 | 日志不记录 PAT、Key、查询内容和源码 |
 
 **建议的生产组合**：TypeScript + Node.js LTS + Fastify 5 + 官方 MCP SDK + CodeGraph + PostgreSQL 17 + 企业 KMS/Vault + 现有 HTTPS 网关和监控。Fastify 和 PostgreSQL 属于后续建议，并未包含在当前 MVP 中。PostgreSQL 承担平台元数据与任务表；CodeGraph 继续使用自己的仓库索引文件。Redis、独立 MQ、Elasticsearch、Neo4j 均不作为一期必选项，只有实际规模或功能需求证明必要时再引入。
 

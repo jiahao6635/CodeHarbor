@@ -10,7 +10,14 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
     "dev": "tsx src/main.ts",
-    "test": "tsx --test tests/*.test.ts tests/*.test.mjs"
+    "lint": "biome check src tests",
+    "lint:fix": "biome check --write src tests",
+    "format": "biome format --write src tests",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "npm run typecheck && npm run lint",
+    "test": "tsx --test tests/*.test.ts tests/*.test.mjs",
+    "test:db:up": "docker compose -f deploy/compose.test.yaml -p codeharbor-test up -d --wait",
+    "test:db:down": "docker compose -f deploy/compose.test.yaml -p codeharbor-test down -v"
   },
   "dependencies": {
     "@colbymchenry/codegraph": "1.6.2",
@@ -19,10 +26,12 @@
     "@modelcontextprotocol/sdk": "1.32.2",
     "fastify": "5.12.8",
     "pg": "8.23.1",
+    "pino": "10.4.0",
     "tar-stream": "3.2.2",
     "zod": "4.6.7"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.6.8",
     "@types/node": "22.20.5",
     "@types/pg": "8.23.1",
     "@types/tar-stream": "3.1.5",

@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { join, relative, resolve } from 'node:path';
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { join, relative, resolve } from 'node:path';
 
 /** The caller must obtain cloneUrl from Codeup, not from an API client. */
 export interface IndexRequest {
@@ -49,8 +49,14 @@ export function validateRequest(request: IndexRequest): string {
   } catch {
     throw new IndexError('INVALID_REMOTE', 'Invalid Git remote');
   }
-  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash ||
-      !request.allowedGitHosts.some(host => host.toLowerCase() === url.host.toLowerCase())) {
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !request.allowedGitHosts.some((host) => host.toLowerCase() === url.host.toLowerCase())
+  ) {
     throw new IndexError('INVALID_REMOTE', 'Git remote is not an allowed HTTPS host');
   }
   return url.href;
@@ -69,32 +75,74 @@ function environment(home: string): NodeJS.ProcessEnv {
     DO_NOT_TRACK: '1',
     CODEGRAPH_NO_DOWNLOAD: '1',
   };
-  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR']) {
+  for (const key of [
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'NO_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'no_proxy',
+    'SSL_CERT_FILE',
+    'SSL_CERT_DIR',
+  ]) {
     if (process.env[key]) env[key] = process.env[key];
   }
   return env;
 }
 
-const gitOptions = ['-c', 'core.hooksPath=/dev/null', '-c', 'credential.helper=', '-c', 'protocol.file.allow=never', '-c', 'protocol.ext.allow=never', '-c', 'http.followRedirects=false'];
+const gitOptions = [
+  '-c',
+  'core.hooksPath=/dev/null',
+  '-c',
+  'credential.helper=',
+  '-c',
+  'protocol.file.allow=never',
+  '-c',
+  'protocol.ext.allow=never',
+  '-c',
+  'http.followRedirects=false',
+];
 const generationPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ownershipMarker = '.codeharbor-generation.json';
 
 async function gitEnvironment(home: string, request: IndexRequest): Promise<NodeJS.ProcessEnv> {
   const askpass = join(home, 'askpass');
-  await writeFile(askpass,
+  await writeFile(
+    askpass,
     '#!/bin/sh\ncase "$1" in *sername*) printf "%s\\n" "$CODEHARBOR_GIT_USERNAME" ;; *) printf "%s\\n" "$CODEHARBOR_GIT_TOKEN" ;; esac\n',
-    { mode: 0o700, flag: 'wx' });
-  return { ...environment(home), GIT_ASKPASS: askpass, CODEHARBOR_GIT_USERNAME: request.gitUsername, CODEHARBOR_GIT_TOKEN: request.token };
+    { mode: 0o700, flag: 'wx' },
+  );
+  return {
+    ...environment(home),
+    GIT_ASKPASS: askpass,
+    CODEHARBOR_GIT_USERNAME: request.gitUsername,
+    CODEHARBOR_GIT_TOKEN: request.token,
+  };
 }
 
-async function run(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, timeoutMs: number, step: string): Promise<string> {
+async function run(
+  command: string,
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+  step: string,
+): Promise<string> {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], shell: false, detached: process.platform !== 'win32' });
+    const child = spawn(command, args, {
+      cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,
+      detached: process.platform !== 'win32',
+    });
     const killTree = () => {
       try {
         if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL');
         else child.kill('SIGKILL');
-      } catch { /* The process may already have exited. */ }
+      } catch {
+        /* The process may already have exited. */
+      }
     };
     let output = '';
     let tooMuch = false;
@@ -108,10 +156,14 @@ async function run(command: string, args: string[], cwd: string, env: NodeJS.Pro
     child.stderr.resume();
     const timer = setTimeout(killTree, timeoutMs);
     timer.unref();
-    child.on('error', () => { clearTimeout(timer); reject(new IndexError('EXECUTION_FAILED', `${step} could not start`)); });
-    child.on('close', code => {
+    child.on('error', () => {
       clearTimeout(timer);
-      if (code === 2 && step === 'git ls-remote') reject(new IndexError('BRANCH_NOT_FOUND', 'Remote branch does not exist'));
+      reject(new IndexError('EXECUTION_FAILED', `${step} could not start`));
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 2 && step === 'git ls-remote')
+        reject(new IndexError('BRANCH_NOT_FOUND', 'Remote branch does not exist'));
       else if (code !== 0 || tooMuch) reject(new IndexError('EXECUTION_FAILED', `${step} failed or timed out`));
       else resolveRun(output.trim());
     });
@@ -120,8 +172,7 @@ async function run(command: string, args: string[], cwd: string, env: NodeJS.Pro
 
 async function rejectSymlinks(root: string): Promise<void> {
   const pending = [root];
-  while (pending.length) {
-    const dir = pending.pop()!;
+  for (let dir = pending.pop(); dir !== undefined; dir = pending.pop()) {
     for (const entry of await readdir(dir, { withFileTypes: true })) {
       if (dir === root && entry.name === '.git') continue;
       const path = join(dir, entry.name);
@@ -136,22 +187,39 @@ function completeStatus(output: string): boolean {
   try {
     const status = JSON.parse(output);
     const pending = status.pendingChanges;
-    return status.initialized === true && status.index?.state === 'complete' && !!pending &&
-      pending.added === 0 && pending.modified === 0 && pending.removed === 0 && status.worktreeMismatch === null;
+    return (
+      status.initialized === true &&
+      status.index?.state === 'complete' &&
+      !!pending &&
+      pending.added === 0 &&
+      pending.modified === 0 &&
+      pending.removed === 0 &&
+      status.worktreeMismatch === null
+    );
   } catch {
     return false;
   }
 }
 
 /** Verify a previously published checkout and its index before skipping a rebuild. */
-export async function isPublishedIndexHealthy(request: IndexRequest, worktree: string, commit: string): Promise<boolean> {
+export async function isPublishedIndexHealthy(
+  request: IndexRequest,
+  worktree: string,
+  commit: string,
+): Promise<boolean> {
   try {
     validateRequest(request);
     if (!/^[0-9a-f]{40,64}$/.test(commit)) return false;
     const versions = resolve(request.dataDir, 'repositories', request.repositoryId, 'versions');
     const parts = relative(versions, resolve(worktree)).split(/[\\/]/);
     if (parts.length !== 2 || !/^[0-9a-f-]{36}$/.test(parts[0]) || parts[1] !== 'worktree') return false;
-    for (const path of [versions, join(versions, parts[0]), worktree, join(worktree, '.git'), join(worktree, '.codegraph')]) {
+    for (const path of [
+      versions,
+      join(versions, parts[0]),
+      worktree,
+      join(worktree, '.git'),
+      join(worktree, '.codegraph'),
+    ]) {
       const info = await lstat(path);
       if (!info.isDirectory() || info.isSymbolicLink()) return false;
     }
@@ -160,9 +228,16 @@ export async function isPublishedIndexHealthy(request: IndexRequest, worktree: s
       const env = environment(home);
       const timeout = request.timeoutMs ?? 10 * 60_000;
       const git = (args: string[]) => run('git', [...gitOptions, ...args], worktree, env, timeout, `git ${args[0]}`);
-      if (await git(['rev-parse', 'HEAD^{commit}']) !== commit) return false;
+      if ((await git(['rev-parse', 'HEAD^{commit}'])) !== commit) return false;
       if (await git(['status', '--porcelain', '--untracked-files=no'])) return false;
-      const status = await run(request.codegraphBin ?? 'codegraph', ['status', worktree, '--json'], home, env, timeout, 'CodeGraph status');
+      const status = await run(
+        request.codegraphBin ?? 'codegraph',
+        ['status', worktree, '--json'],
+        home,
+        env,
+        timeout,
+        'CodeGraph status',
+      );
       return completeStatus(status);
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -172,7 +247,11 @@ export async function isPublishedIndexHealthy(request: IndexRequest, worktree: s
   }
 }
 
-async function readRemoteHead(git: (args: string[]) => Promise<string>, remote: string, branch: string): Promise<string> {
+async function readRemoteHead(
+  git: (args: string[]) => Promise<string>,
+  remote: string,
+  branch: string,
+): Promise<string> {
   const output = await git(['ls-remote', '--exit-code', '--heads', remote, `refs/heads/${branch}`]);
   const lines = output.split('\n');
   const [commit, ref] = (lines[0] ?? '').split(/\s+/);
@@ -188,7 +267,8 @@ export async function getRemoteHead(request: IndexRequest): Promise<string> {
   const home = await mkdtemp(join(tmpdir(), 'codeharbor-git-'));
   try {
     const env = await gitEnvironment(home, request);
-    const git = (args: string[]) => run('git', [...gitOptions, ...args], home, env, request.timeoutMs ?? 10 * 60_000, `git ${args[0]}`);
+    const git = (args: string[]) =>
+      run('git', [...gitOptions, ...args], home, env, request.timeoutMs ?? 10 * 60_000, `git ${args[0]}`);
     await git(['check-ref-format', '--branch', request.branch]);
     return await readRemoteHead(git, remote, request.branch);
   } finally {
@@ -210,12 +290,17 @@ export async function buildIndexCandidate(request: IndexRequest): Promise<IndexC
   const worktree = join(directory, 'worktree');
   const home = join(directory, 'home');
   try {
-    await writeFile(join(directory, ownershipMarker), JSON.stringify({ version: 1, repositoryId: request.repositoryId, generation }), { mode: 0o600, flag: 'wx' });
+    await writeFile(
+      join(directory, ownershipMarker),
+      JSON.stringify({ version: 1, repositoryId: request.repositoryId, generation }),
+      { mode: 0o600, flag: 'wx' },
+    );
     await mkdir(home, { mode: 0o700 });
     const baseEnv = environment(home);
     const gitEnv = await gitEnvironment(home, request);
     const timeout = request.timeoutMs ?? 10 * 60_000;
-    const git = (args: string[], cwd = home) => run('git', [...gitOptions, ...args], cwd, gitEnv, timeout, `git ${args[0]}`);
+    const git = (args: string[], cwd = home) =>
+      run('git', [...gitOptions, ...args], cwd, gitEnv, timeout, `git ${args[0]}`);
     await git(['check-ref-format', '--branch', request.branch]);
     await git(['clone', '--no-checkout', '--single-branch', '--branch', request.branch, '--', remote, worktree]);
     const commit = await git(['rev-parse', 'HEAD^{commit}'], worktree);
@@ -225,7 +310,7 @@ export async function buildIndexCandidate(request: IndexRequest): Promise<IndexC
     try {
       const existing = join(worktree, '.codegraph');
       const metadata = await lstat(existing);
-      if (!metadata.isDirectory() || (await readdir(existing)).some(name => name !== '.gitignore')) {
+      if (!metadata.isDirectory() || (await readdir(existing)).some((name) => name !== '.gitignore')) {
         throw new IndexError('UNSAFE_TREE', 'Repository contains existing CodeGraph state');
       }
     } catch (error) {
@@ -233,7 +318,14 @@ export async function buildIndexCandidate(request: IndexRequest): Promise<IndexC
     }
     const codegraph = request.codegraphBin ?? 'codegraph';
     await run(codegraph, ['init', worktree, '--yes'], home, baseEnv, timeout, 'CodeGraph init');
-    const statusOutput = await run(codegraph, ['status', worktree, '--json'], home, baseEnv, timeout, 'CodeGraph status');
+    const statusOutput = await run(
+      codegraph,
+      ['status', worktree, '--json'],
+      home,
+      baseEnv,
+      timeout,
+      'CodeGraph status',
+    );
     if (!completeStatus(statusOutput)) {
       throw new IndexError('INDEX_INCOMPLETE', 'CodeGraph index is incomplete or stale');
     }
@@ -249,7 +341,11 @@ export async function buildIndexCandidate(request: IndexRequest): Promise<IndexC
 }
 
 /** Called only while queries and version publication are exclusively locked. */
-export async function pruneIndexVersions(dataDir: string, repositoryId: string, retainedPaths: Array<string | null>): Promise<void> {
+export async function pruneIndexVersions(
+  dataDir: string,
+  repositoryId: string,
+  retainedPaths: Array<string | null>,
+): Promise<void> {
   if (!/^[a-zA-Z0-9_-]{1,128}$/.test(repositoryId)) return;
   const versions = resolve(dataDir, 'repositories', repositoryId, 'versions');
   const retained = new Set(retainedPaths.filter((path): path is string => !!path).map((path) => resolve(path)));
@@ -267,9 +363,13 @@ export async function pruneIndexVersions(dataDir: string, repositoryId: string, 
         const owner = JSON.parse(await readFile(marker, 'utf8'));
         if (owner.version !== 1 || owner.repositoryId !== repositoryId || owner.generation !== entry.name) continue;
         await rm(generationDir, { recursive: true, force: true });
-      } catch { /* Retain unrecognized or inaccessible directories. */ }
+      } catch {
+        /* Retain unrecognized or inaccessible directories. */
+      }
     }
-  } catch { /* Missing/inaccessible version storage must not break publication. */ }
+  } catch {
+    /* Missing/inaccessible version storage must not break publication. */
+  }
 }
 
 export interface WebhookInput {

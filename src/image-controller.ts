@@ -1,9 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import { DockerImageQueryBackend } from './docker-image-query.js';
-import { FileImageCreationFence } from './image-creation-fence.js';
-import { getTrustedImage, serveImageBuilder } from './image-build-socket.js';
-import { serveImageRuntime } from './image-runtime-socket.js';
 import { SocketImageAuthorizer } from './image-authorizer.js';
+import { getTrustedImage, serveImageBuilder } from './image-build-socket.js';
+import { FileImageCreationFence } from './image-creation-fence.js';
+import { serveImageRuntime } from './image-runtime-socket.js';
+import { createLogger } from './logger.js';
 import { queryConcurrency } from './query-concurrency.js';
 
 function required(name: string): string {
@@ -33,17 +34,40 @@ async function main() {
   const uid = process.getuid?.();
   if (uid === undefined) throw new Error('Image controller requires Unix');
   const authorizer = new SocketImageAuthorizer(authSocket, authToken.trim());
-  const backend = new DockerImageQueryBackend(async (digest, repoId, commit) => {
-    const record = await getTrustedImage(allowlistPath, digest, uid);
-    return !!record && record.repositoryId === repoId && record.commit === commit && record.runtimeImage === runtimeId &&
-      await authorizer.authorize(digest, repoId, commit);
-  }, 'docker', 30_000, controllerId, new FileImageCreationFence(fenceDirectory, controllerId));
+  const backend = new DockerImageQueryBackend(
+    async (digest, repoId, commit) => {
+      const record = await getTrustedImage(allowlistPath, digest, uid);
+      return (
+        !!record &&
+        record.repositoryId === repoId &&
+        record.commit === commit &&
+        record.runtimeImage === runtimeId &&
+        (await authorizer.authorize(digest, repoId, commit))
+      );
+    },
+    'docker',
+    30_000,
+    controllerId,
+    new FileImageCreationFence(fenceDirectory, controllerId),
+  );
   let builder: Awaited<ReturnType<typeof serveImageBuilder>> | undefined;
   let runtime: Awaited<ReturnType<typeof serveImageRuntime>> | undefined;
   try {
-    builder = await serveImageBuilder({ path: buildSocket, token: buildToken.trim(), runtimeImage: runtimeId,
-      allowlistPath, workDir, socketMode: 0o660 });
-    runtime = await serveImageRuntime({ path: querySocket, token: queryToken.trim(), backend, socketMode: 0o660, maxConcurrent });
+    builder = await serveImageBuilder({
+      path: buildSocket,
+      token: buildToken.trim(),
+      runtimeImage: runtimeId,
+      allowlistPath,
+      workDir,
+      socketMode: 0o660,
+    });
+    runtime = await serveImageRuntime({
+      path: querySocket,
+      token: queryToken.trim(),
+      backend,
+      socketMode: 0o660,
+      maxConcurrent,
+    });
     // Recovery must happen only after the unique controller socket is bound.
     await backend.probe(AbortSignal.timeout(30_000));
   } catch (error) {
@@ -53,12 +77,27 @@ async function main() {
   }
   let stopping = false;
   async function shutdown() {
-    if (stopping) return; stopping = true;
-    try { await runtime!.close(); await builder!.close(); process.exitCode = 0; }
-    catch { process.exitCode = 1; }
+    if (stopping) return;
+    stopping = true;
+    try {
+      await runtime?.close();
+      await builder?.close();
+      process.exitCode = 0;
+    } catch {
+      process.exitCode = 1;
+    }
   }
-  process.on('SIGINT', () => { void shutdown(); });
-  process.on('SIGTERM', () => { void shutdown(); });
+  process.on('SIGINT', () => {
+    void shutdown();
+  });
+  process.on('SIGTERM', () => {
+    void shutdown();
+  });
 }
 
-main().catch(() => { console.error('Image controller startup failed; check protected configuration and recovery state'); process.exitCode = 1; });
+main().catch(() => {
+  createLogger({ name: 'codeharbor-image-controller' }).fatal(
+    'Image controller startup failed; check protected configuration and recovery state',
+  );
+  process.exitCode = 1;
+});

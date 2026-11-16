@@ -2,7 +2,7 @@ import { BUILD_DURATION_BUCKETS_MS, type JobMetrics } from './store.js';
 
 /** A rolling database snapshot: these values are gauges, not cumulative counters. */
 export function renderJobMetrics(metrics: JobMetrics, nowMs: number): string {
-  const seconds = (value: number | null) => value === null ? 'NaN' : String(value / 1000);
+  const seconds = (value: number | null) => (value === null ? 'NaN' : String(value / 1000));
   const wait = metrics.oldestQueuedAt === null ? 0 : Math.max(0, nowMs - metrics.oldestQueuedAt) / 1000;
   const ratio = metrics.completed24h === 0 ? 'NaN' : String(metrics.failed24h / metrics.completed24h);
   const average = metrics.builds24h === 0 ? null : metrics.buildDurationSumMs24h / metrics.builds24h;
@@ -35,7 +35,9 @@ export function renderJobMetrics(metrics: JobMetrics, nowMs: number): string {
     '# HELP codeharbor_index_build_duration_24h_bucket Cumulative counts by build duration upper bound in seconds for the last 24 hours.',
     '# TYPE codeharbor_index_build_duration_24h_bucket gauge',
   ];
-  BUILD_DURATION_BUCKETS_MS.forEach((bound, index) => output.push(`codeharbor_index_build_duration_24h_bucket{le="${bound / 1000}"} ${metrics.buildBuckets24h[index]}`));
+  BUILD_DURATION_BUCKETS_MS.forEach((bound, index) => {
+    output.push(`codeharbor_index_build_duration_24h_bucket{le="${bound / 1000}"} ${metrics.buildBuckets24h[index]}`);
+  });
   output.push(`codeharbor_index_build_duration_24h_bucket{le="+Inf"} ${metrics.builds24h}`);
   return `${output.join('\n')}\n`;
 }
