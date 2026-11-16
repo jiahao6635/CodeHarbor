@@ -21,6 +21,8 @@ export CODEHARBOR_MCP_LISTEN_PORT=18080
 export CODEHARBOR_MCP_ALLOWED_HOSTS=10.29.23.237:18080
 export CODEHARBOR_INTERNAL_MCP_SOCKET_DIR=/path/to/dedicated-mcp-socket-dir
 export CODEHARBOR_INTERNAL_MCP_TOKEN_HOST_FILE=/path/to/private-internal-mcp-token
+# 控制台「MCP 接入」页展示的内网地址；公网 /mcp 已关闭
+export CODEHARBOR_UI_MCP_URL=http://10.29.23.237:18080/mcp
 ```
 
 `CODEHARBOR_MCP_ALLOWED_HOSTS` 与客户端请求的 HTTP `Host` 严格匹配，默认端口以外的地址要包含端口；如果还需要经过可信代理或健康检查访问，应明确加入相应 Host，多个值以逗号分隔。非浏览器 MCP 客户端一般不发送 `Origin`；浏览器客户端仅在确有需要时设置 `CODEHARBOR_MCP_ALLOWED_ORIGINS`，填入允许的完整 Origin。
