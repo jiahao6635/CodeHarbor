@@ -282,6 +282,20 @@ export const openApiDocument = {
         },
       },
     },
+    '/api/v1/admin/repositories': {
+      get: {
+        tags: ['管理'],
+        summary: '列出全部已接入仓库（含已禁用）',
+        description: '面向平台管理员；普通仓库列表不包含已禁用仓库。',
+        responses: {
+          '200': ok(
+            '仓库列表。',
+            object({ repositories: { type: 'array', items: ref('AdminRepository') } }, ['repositories']),
+          ),
+          ...common,
+        },
+      },
+    },
     '/api/v1/admin/users': {
       get: {
         tags: ['管理'],
@@ -388,6 +402,18 @@ export const openApiDocument = {
         summary: '查看索引任务',
         parameters: [pathParam('jobId', '索引任务 ID')],
         responses: { '200': ok('任务状态。', ref('Job')), ...common },
+      },
+    },
+    '/api/v1/repositories/{repoId}/jobs': {
+      get: {
+        tags: ['仓库与索引'],
+        summary: '查看仓库的索引任务历史',
+        description: '最新的任务在前，最多返回 50 条。',
+        parameters: [pathParam('repoId', 'CodeHarbor 仓库 ID')],
+        responses: {
+          '200': ok('任务列表。', object({ jobs: { type: 'array', items: ref('Job') } }, ['jobs'])),
+          ...common,
+        },
       },
     },
     '/api/v1/api-keys': {
@@ -517,11 +543,19 @@ export const openApiDocument = {
         },
         ['token', 'prefix', 'scope', 'expires_in'],
       ),
-      Me: object({ id: { type: 'string' }, username: { type: 'string' }, key_scope: scope }, [
-        'id',
-        'username',
-        'key_scope',
-      ]),
+      Me: object(
+        {
+          id: { type: 'string' },
+          username: { type: 'string' },
+          key_scope: scope,
+          key_prefix: { type: 'string' },
+          key_repos: repoScope,
+          key_expires_at: { type: 'integer', nullable: true, description: 'Unix 毫秒时间戳。' },
+          can_write: { type: 'boolean', description: '密钥可执行平台管理与触发索引。' },
+          is_admin: { type: 'boolean', description: '无限定仓库范围的 write 密钥，由配置允许的用户持有。' },
+        },
+        ['id', 'username', 'key_scope', 'key_prefix', 'key_repos', 'key_expires_at', 'can_write', 'is_admin'],
+      ),
       CodeupRepository: object(
         {
           id: { type: 'string' },
@@ -534,6 +568,7 @@ export const openApiDocument = {
       Repository: object(
         {
           repo_id: { type: 'string' },
+          codeup_id: { type: 'string', description: '云效仓库数字 ID。' },
           name: { type: 'string' },
           branch: { type: 'string' },
           status: { type: 'string' },
@@ -541,8 +576,50 @@ export const openApiDocument = {
           indexed_at: { type: 'string', format: 'date-time', nullable: true },
           stale: { type: 'boolean' },
           error: { type: 'string', nullable: true },
+          webhook_path: { type: 'string', description: 'Codeup Webhook 路径；token 仅在接入时返回。' },
         },
-        ['repo_id', 'name', 'branch', 'status', 'indexed_commit', 'indexed_at', 'stale', 'error'],
+        [
+          'repo_id',
+          'codeup_id',
+          'name',
+          'branch',
+          'status',
+          'indexed_commit',
+          'indexed_at',
+          'stale',
+          'error',
+          'webhook_path',
+        ],
+      ),
+      AdminRepository: object(
+        {
+          repo_id: { type: 'string' },
+          codeup_id: { type: 'string' },
+          name: { type: 'string' },
+          branch: { type: 'string' },
+          status: { type: 'string' },
+          indexed_commit: { type: 'string', nullable: true },
+          indexed_at: { type: 'string', format: 'date-time', nullable: true },
+          stale: { type: 'boolean' },
+          error: { type: 'string', nullable: true },
+          webhook_path: { type: 'string' },
+          owner: { type: 'string', description: '接入者用户 ID。' },
+          sync_owner: { type: 'string', description: '当前同步凭证持有人用户 ID。' },
+        },
+        [
+          'repo_id',
+          'codeup_id',
+          'name',
+          'branch',
+          'status',
+          'indexed_commit',
+          'indexed_at',
+          'stale',
+          'error',
+          'webhook_path',
+          'owner',
+          'sync_owner',
+        ],
       ),
       CreatedRepository: object(
         {

@@ -18,6 +18,7 @@ export function publicRepository(repo: RepositoryRecord) {
   const view = mcpRepository(repo);
   return {
     repo_id: view.id,
+    codeup_id: repo.codeup_id,
     name: view.name,
     branch: repo.branch,
     status: view.status,
@@ -25,7 +26,13 @@ export function publicRepository(repo: RepositoryRecord) {
     indexed_at: view.indexedAt,
     stale: view.stale,
     error: repo.error,
+    webhook_path: `/api/v1/hooks/codeup/${repo.id}`,
   };
+}
+
+/** Administrative view: adds ownership so operators can see who synchronises a repository. */
+export function adminRepository(repo: RepositoryRecord) {
+  return { ...publicRepository(repo), owner: repo.owner, sync_owner: repo.sync_owner };
 }
 
 export function internalRepository(repo: RepositoryRecord): InternalMcpRepository {

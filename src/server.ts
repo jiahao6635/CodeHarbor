@@ -19,6 +19,7 @@ import { openApiDocument } from './openapi.js';
 import { RateLimiter } from './rate-limit.js';
 import { registerAdminRoutes } from './routes/admin.js';
 import { registerAuthRoutes } from './routes/auth.js';
+import { registerConsoleRoutes, UI_ASSET_ROUTE, UI_CSP, UI_ROUTE } from './routes/console.js';
 import { registerHookRoutes } from './routes/hooks.js';
 import { registerKeyRoutes } from './routes/keys.js';
 import { registerMcpRoute } from './routes/mcp.js';
@@ -161,7 +162,17 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
     // Raw headers survive reply.hijack(), which the MCP route relies on.
     reply.raw.setHeader('x-request-id', request.id);
     reply.raw.setHeader('x-content-type-options', 'nosniff');
-    if (!DOCS_ROUTE.test(request.url)) reply.raw.setHeader('cache-control', 'no-store');
+    if (UI_ASSET_ROUTE.test(request.url)) {
+      // Vite emits content-hashed asset names, so they can be cached indefinitely.
+      reply.raw.setHeader('cache-control', 'public, max-age=31536000, immutable');
+    } else if (!DOCS_ROUTE.test(request.url)) {
+      reply.raw.setHeader('cache-control', 'no-store');
+    }
+    if (UI_ROUTE.test(request.url)) {
+      reply.raw.setHeader('content-security-policy', UI_CSP);
+      reply.raw.setHeader('referrer-policy', 'same-origin');
+      reply.raw.setHeader('x-frame-options', 'DENY');
+    }
     reply.raw.once('finish', () => {
       const seconds = Number(process.hrtime.bigint() - started) / 1e9;
       const status = reply.raw.statusCode;
@@ -175,7 +186,13 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
       }
     });
     const { host, origin } = request.headers;
-    if (!host || !config.allowedHosts.includes(host) || (origin && !config.allowedOrigins?.includes(origin))) {
+    if (!host || !config.allowedHosts.includes(host)) {
+      return reply.code(403).send({ error: 'FORBIDDEN' });
+    }
+    // A page served from an allowed host (the bundled console) is same-origin by construction; browsers
+    // still send Origin on non-GET requests, so it must pass without being listed separately.
+    const sameOrigin = origin === `https://${host}` || origin === `http://${host}`;
+    if (origin && !sameOrigin && !config.allowedOrigins?.includes(origin)) {
       return reply.code(403).send({ error: 'FORBIDDEN' });
     }
   });
@@ -214,6 +231,7 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
   registerRepositoryRoutes(fastify, ctx);
   registerKeyRoutes(fastify, ctx);
   registerAdminRoutes(fastify, ctx);
+  registerConsoleRoutes(fastify, ctx);
 
   const internalMcp = createInternalMcpBackend({ store, graph, authorization, audit: emitAudit });
 

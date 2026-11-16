@@ -52,6 +52,9 @@ export DATABASE_URL='postgres://codeharbor_test:codeharbor_test@127.0.0.1:54329/
 | `CODEHARBOR_ACCESS_TTL_MS` | 无范围 read Key 的云效仓库权限缓存有效期，默认 6 小时（`21600000`）；到期后按需或由后台复核 |
 | `CODEHARBOR_TRUST_PROXY` | `true` 时客户端地址取 `X-Forwarded-For` 最后一跳；仅在可信反向代理后开启 |
 | `CODEHARBOR_DOCS_ENABLED` | 是否提供 `/docs` 与 `/openapi.json`；生产默认 `false` |
+| `CODEHARBOR_UI_ENABLED` | 是否在 `/ui` 提供管理控制台，默认 `true`；需要先构建 `web/dist`（`npm run build:web`），显式设为 `true` 但缺少构建产物时启动失败 |
+| `CODEHARBOR_UI_DIR` | 可选，覆盖控制台构建产物目录，默认 `web/dist` |
+| `CODEHARBOR_UI_MCP_URL` | 可选，控制台「MCP 接入」页展示的 MCP 地址；公网入口关闭时应填内网地址 |
 | `CODEHARBOR_MCP_KEY_RATE_PER_MIN` | 每个 Key 每分钟的 `/mcp` 请求配额，默认 `120`，超出返回 429 |
 | `CODEHARBOR_AUTH_FAILURE_RATE_PER_MIN` | 每个客户端地址每分钟允许的 Bearer 认证失败次数，默认 `30` |
 | `CODEHARBOR_AUDIT_RETENTION_DAYS` | 持久化审计事件保留天数，默认 `180` |
@@ -64,6 +67,20 @@ export DATABASE_URL='postgres://codeharbor_test:codeharbor_test@127.0.0.1:54329/
 运行 `npm start`。`NODE_ENV=production` 会强制要求 PostgreSQL 验证服务端证书和 Vault Transit，不能退回本地密钥。服务使用一条专用会话持有实例互斥锁（`pg_advisory_lock`）并执行迁移，业务查询和事务走独立连接池（默认 10 个连接）；因此数据库连接应直连或使用 session pooling，不可使用事务池。锁会话断开后所有读写拒绝执行，需由 supervisor 重启。业务进程与 Worker 同实例运行，仍不能横向扩容。
 
 本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者检查数据库，工作树模式下检查上游 MCP 工具 schema，镜像模式下检查镜像调度控制器。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 与索引队列指标，不包含源码、仓库或用户标签；仅限内网采集。指标含义和查询示例见[队列监控](docs/queue-metrics.md)。结构化 HTTP 和审计事件输出到 stdout，同时批量写入数据库 `audit_events` 表（代码查询只记录 SHA-256 摘要，不记录内容），管理员可通过 `GET /api/v1/admin/audit` 查询；生产环境仍须配置访问受控的日志采集、留存和告警。`/metrics` 额外暴露 `codeharbor_runtime_fenced{component}`（镜像运行时/图客户端进入 fail-closed 状态时为 1，需人工介入）和 `codeharbor_audit_dropped_total`，应接入告警。
+
+## 管理控制台
+
+服务在 `/ui` 同源托管一个浏览器控制台（设计见 [前端设计方案](docs/frontend-design.md)），覆盖首次绑定云效 PAT 并领取 Key、仓库接入与索引状态、Key 管理、MCP 接入指引，以及管理员的仓库启停删除、用户与 Key 治理、审计查询。页面能力由登录所用 Key 的类型推导，权限仍由服务端判定。
+
+```sh
+npm run install:web   # 安装前端依赖（独立于后端 package.json）
+npm run build:web     # 产物输出到 web/dist，服务启动时自动托管
+npm run check:web && npm run test:web
+```
+
+前端源码在 `web/`（Vite + React + TypeScript + Tailwind），同样使用 Biome 规范；设计 token 见 [design-system/codeharbor-console/MASTER.md](design-system/codeharbor-console/MASTER.md)。开发时 `npm --prefix web run dev` 会把 `/api` 代理到本机 8080 端口的服务。`docker build` 会在独立阶段构建控制台并把产物复制进运行镜像。
+
+控制台的 Key 只保存在浏览器 `sessionStorage`，关闭标签页即失效；PAT 仅在绑定向导提交时经 TLS 发送，不落盘。同源页面发出的请求会自动通过 Origin 校验，无需额外配置 `CODEHARBOR_ALLOWED_ORIGINS`；控制台响应带 `default-src 'self'` 的 CSP，不引用任何外部资源。本地预览（含模拟云效与示例数据）：`npm run test:db:up && npm run build:web && npx tsx scripts/console-preview.ts`。
 
 ## 接口文档
 

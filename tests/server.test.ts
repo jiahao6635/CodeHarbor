@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -272,8 +272,34 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal(kickCount, 1);
     const repo = created.body.repository.repo_id as string;
     const job = created.body.job_id as string;
+    assert.equal(created.body.repository.codeup_id, '11');
+    assert.equal(created.body.repository.webhook_path, `/api/v1/hooks/codeup/${repo}`);
+    assert.equal(created.body.webhook_path, created.body.repository.webhook_path);
     assert.equal((await request('GET', `/api/v1/jobs/${job}`, alice)).status, 200);
     assert.equal((await request('GET', `/api/v1/jobs/${job}`, bob)).status, 404);
+    const history = await request('GET', `/api/v1/repositories/${repo}/jobs`, alice);
+    assert.equal(history.status, 200);
+    assert.deepEqual(
+      history.body.jobs.map((entry: { id: string }) => entry.id),
+      [job],
+    );
+    assert.equal((await request('GET', `/api/v1/repositories/${repo}/jobs`, bob)).status, 404);
+    const me = await request('GET', '/api/v1/me', alice);
+    assert.equal(me.status, 200);
+    assert.equal(me.body.is_admin, true);
+    assert.equal(me.body.can_write, true);
+    assert.equal(me.body.key_repos, null);
+    assert.equal(me.body.key_prefix, aliceKey.body.prefix);
+    assert.equal(typeof me.body.key_expires_at, 'number');
+    const bobMe = await request('GET', '/api/v1/me', bob);
+    assert.equal(bobMe.body.is_admin, false);
+    assert.equal(bobMe.body.can_write, false);
+    // The bundled console is same-origin: its Origin header must pass without being listed.
+    assert.equal(
+      (await request('GET', '/api/v1/me', alice, undefined, { origin: `http://127.0.0.1:${address.port}` })).status,
+      200,
+    );
+    assert.equal((await request('GET', '/api/v1/me', alice, undefined, { origin: 'http://127.0.0.1:1' })).status, 403);
     assert.equal((await request('GET', `/api/v1/repositories/${repo}`, bob)).status, 404);
     assert.equal((await request('GET', '/api/v1/repositories', bob)).body.repositories.length, 0);
     const duplicate = await request('POST', '/api/v1/repositories', alice, {
@@ -305,6 +331,15 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     deniedCloneTokens.delete('bob-pat');
     await app.store.updateRepository(repo, { status: 'disabled' });
     assert.equal((await request('GET', `/api/v1/repositories/${repo}`, bobScoped.token)).status, 404);
+    // Disabled repositories disappear from the user list but stay visible to administrators.
+    assert.equal((await request('GET', '/api/v1/repositories', alice)).body.repositories.length, 0);
+    const adminRepos = await request('GET', '/api/v1/admin/repositories', alice);
+    assert.equal(adminRepos.status, 200);
+    assert.deepEqual(
+      adminRepos.body.repositories.map((entry: Record<string, unknown>) => [entry.repo_id, entry.status, entry.owner]),
+      [[repo, 'disabled', 'alice']],
+    );
+    assert.equal((await request('GET', '/api/v1/admin/repositories', bob)).status, 403);
     await app.store.updateRepository(repo, { status: 'pending' });
     assert.equal((await request('POST', `/api/v1/repositories/${repo}/sync`, bobScoped.token)).status, 403);
     await app.store.updateRepository(repo, {
@@ -665,6 +700,68 @@ test('metrics use a separate credential and contain only bounded aggregate label
     const errorBody = await unavailable.text();
     assert.match(errorBody, /METRICS_UNAVAILABLE/);
     assert.ok(!errorBody.includes('database secret'));
+  } finally {
+    await app.close();
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('console build is served under /ui with client-side routing fallback and strict headers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codeharbor-ui-'));
+  const uiDir = join(dir, 'web-dist');
+  mkdirSync(join(uiDir, 'assets'), { recursive: true });
+  writeFileSync(
+    join(uiDir, 'index.html'),
+    '<!doctype html><title>CodeHarbor Console</title><script src="/ui/assets/app-abc.js"></script>',
+  );
+  writeFileSync(join(uiDir, 'assets', 'app-abc.js'), 'console.log("ui")');
+  writeFileSync(join(dir, 'outside.txt'), 'secret');
+  const allowedHosts: string[] = [];
+  const db = await openTestStore();
+  const app = createApp(
+    {
+      dataDir: dir,
+      credentialKey: randomBytes(32),
+      codeupEndpoint: 'https://devops.example',
+      allowedGitHosts: ['git.example'],
+      allowedHosts,
+      writeUsers: [],
+      codegraphBin: 'codegraph',
+      uiDir,
+      uiMcpUrl: 'https://mcp.internal.example/mcp',
+    },
+    { store: db.store, graph: { async probe() {}, async close() {} } as never, worker: { async stop() {} } as never },
+  );
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  const address = app.server.address();
+  assert.ok(address && typeof address === 'object');
+  allowedHosts.push(`127.0.0.1:${address.port}`);
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    for (const path of ['/ui', '/ui/', '/ui/repositories/some-id', '/ui/admin/audit?since=1']) {
+      const page = await fetch(`${base}${path}`);
+      assert.equal(page.status, 200, path);
+      assert.match(page.headers.get('content-type') ?? '', /text\/html/);
+      assert.match(await page.text(), /CodeHarbor Console/);
+      assert.equal(page.headers.get('cache-control'), 'no-store');
+      assert.match(page.headers.get('content-security-policy') ?? '', /default-src 'self'/);
+      assert.match(page.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
+      assert.equal(page.headers.get('x-frame-options'), 'DENY');
+    }
+    const asset = await fetch(`${base}/ui/assets/app-abc.js`);
+    assert.equal(asset.status, 200);
+    assert.equal(asset.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+    assert.match(asset.headers.get('content-type') ?? '', /javascript/);
+    // Nothing outside the build directory and nothing from the API surface is reachable through /ui.
+    for (const path of ['/ui/../outside.txt', '/ui/..%2foutside.txt', '/ui/%2e%2e/outside.txt']) {
+      const traversal = await fetch(`${base}${path}`);
+      assert.doesNotMatch(await traversal.text(), /secret/, path);
+    }
+    assert.equal((await fetch(`${base}/api/v1/console`)).status, 401);
+    assert.equal((await fetch(`${base}/health/live`)).headers.get('content-security-policy'), null);
+    assert.equal((await fetch(`${base}/uix`)).status, 404);
+    assert.equal((await fetch(`${base}/ui/`, { headers: { origin: 'https://untrusted.example' } })).status, 403);
   } finally {
     await app.close();
     await db.close();

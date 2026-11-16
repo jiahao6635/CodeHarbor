@@ -1,7 +1,8 @@
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { AuditWriter } from './audit-writer.js';
 import { databaseUrl, indexBackend as resolveIndexBackend, validateProduction } from './config.js';
 import { imageAuthorization } from './image-authorization.js';
@@ -19,6 +20,20 @@ import { queryConcurrency } from './query-concurrency.js';
 import { createApp } from './server.js';
 
 const logger = createLogger({ name: 'codeharbor' });
+
+/** The console build lives in web/dist next to src/ or dist/; an explicit opt-in without a build is an error. */
+function consoleDirectory(enabled: boolean): string | undefined {
+  if (!enabled) return undefined;
+  const dir = process.env.CODEHARBOR_UI_DIR
+    ? resolve(process.env.CODEHARBOR_UI_DIR)
+    : fileURLToPath(new URL('../web/dist', import.meta.url));
+  if (existsSync(join(dir, 'index.html'))) return dir;
+  if (process.env.CODEHARBOR_UI_ENABLED === 'true' || process.env.CODEHARBOR_UI_DIR) {
+    throw new Error(`Console build not found in ${dir}`);
+  }
+  logger.warn({ dir }, 'console_build_missing');
+  return undefined;
+}
 
 async function main() {
   const dataDir = resolve(process.env.CODEHARBOR_DATA_DIR ?? './data');
@@ -56,6 +71,11 @@ async function main() {
     return parsed;
   };
   const docsEnabled = flag('CODEHARBOR_DOCS_ENABLED', process.env.NODE_ENV !== 'production');
+  const uiDir = consoleDirectory(flag('CODEHARBOR_UI_ENABLED', true));
+  const uiMcpUrl = process.env.CODEHARBOR_UI_MCP_URL || undefined;
+  if (uiMcpUrl !== undefined && !/^https?:\/\/[^\s/]+(\/\S*)?$/.test(uiMcpUrl)) {
+    throw new Error('Invalid CODEHARBOR_UI_MCP_URL');
+  }
   const trustProxy = flag('CODEHARBOR_TRUST_PROXY', false);
   const accessTtlMs = integer('CODEHARBOR_ACCESS_TTL_MS', 6 * 3_600_000, 60_000, 7 * 86_400_000);
   const mcpKeyRatePerMinute = integer('CODEHARBOR_MCP_KEY_RATE_PER_MIN', 120, 1, 100_000);
@@ -153,6 +173,8 @@ async function main() {
         metricsToken,
         publicMcpDisabled,
         docsEnabled,
+        uiDir,
+        uiMcpUrl,
         trustProxy,
         accessTtlMs,
         mcpKeyRatePerMinute,

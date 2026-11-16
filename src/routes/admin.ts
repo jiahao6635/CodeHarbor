@@ -12,7 +12,7 @@ import {
   singleQuery,
   userId,
 } from '../http/validation.js';
-import { publicKey } from '../http/views.js';
+import { adminRepository, publicKey } from '../http/views.js';
 
 const PAGE_SIZE = 100;
 
@@ -41,6 +41,12 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AppContext): void
   app.get('/api/v1/admin/users', admin, async (request) => {
     await assertActiveWrite(ctx, request);
     return { users: await store.listUsers() };
+  });
+
+  /** Every repository including disabled ones, which the user-facing list hides. */
+  app.get('/api/v1/admin/repositories', admin, async (request) => {
+    await assertActiveWrite(ctx, request);
+    return { repositories: (await store.listRepositories()).map(adminRepository) };
   });
 
   app.get('/api/v1/admin/api-keys', admin, async (request) => {

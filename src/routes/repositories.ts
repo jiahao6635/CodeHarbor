@@ -18,6 +18,7 @@ import type { RepositoryRecord } from '../store.js';
 
 const idParams = z.object({ id: identifier });
 const pageQuery = z.object({ page: singleQuery(positivePage).default(1) });
+const JOB_HISTORY_LIMIT = 50;
 
 const GIT_REF_FORBIDDEN = /[ ~^:?*[]/;
 const branchName = text(255).refine(
@@ -51,7 +52,16 @@ export function registerRepositoryRoutes(app: FastifyInstance, ctx: AppContext):
   app.get('/api/v1/me', { onRequest: authenticate }, async (request) => {
     const key = principalOf(request);
     const user = await ownerOf(request);
-    return { id: user.id, username: user.username, key_scope: key.scope };
+    return {
+      id: user.id,
+      username: user.username,
+      key_scope: key.scope,
+      key_prefix: key.prefix,
+      key_repos: key.repos,
+      key_expires_at: key.expires_at,
+      can_write: authorization.isWrite(key),
+      is_admin: authorization.isAdmin(key),
+    };
   });
 
   app.get('/api/v1/codeup/repositories', { onRequest: authenticate }, async (request) => {
@@ -253,6 +263,15 @@ export function registerRepositoryRoutes(app: FastifyInstance, ctx: AppContext):
       await store.deleteRepository(repo.id);
       return { deleted: true };
     });
+  });
+
+  app.get<{ Params: { id: string } }>('/api/v1/repositories/:id/jobs', { onRequest: authenticate }, async (request) => {
+    const { id } = parseParams(idParams, request.params);
+    const repo = await authorization.visible(principalOf(request), id);
+    request.actor = { ...request.actor, repo_id: repo.id };
+    const jobs = await store.listJobs(repo.id);
+    // Newest first; the store returns creation order.
+    return { jobs: jobs.slice(-JOB_HISTORY_LIMIT).reverse() };
   });
 
   app.get<{ Params: { id: string } }>('/api/v1/jobs/:id', { onRequest: authenticate }, async (request) => {

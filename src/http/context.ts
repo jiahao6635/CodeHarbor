@@ -59,6 +59,10 @@ export interface AppConfig {
   publicMcpDisabled?: boolean;
   /** Serve Swagger UI and /openapi.json; disabled in production by default. */
   docsEnabled?: boolean;
+  /** Directory with the built console (web/dist); the console is served under /ui when set. */
+  uiDir?: string;
+  /** MCP endpoint shown by the console; defaults to the page origin plus /mcp. */
+  uiMcpUrl?: string;
   /** Take the client address from the last X-Forwarded-For hop set by a trusted reverse proxy. */
   trustProxy?: boolean;
   /** Maximum age of a cached Codeup permission check before it is re-verified (default 6h). */

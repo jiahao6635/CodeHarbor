@@ -1,8 +1,20 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.6.8/schema.json",
-  "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
   "files": {
-    "includes": ["src/**", "tests/**", "*.json", "!dist/**", "!node_modules/**", "!codegraph-readonly/**"]
+    "includes": [
+      "src/**",
+      "tests/**",
+      "scripts/**",
+      "*.json",
+      "!dist/**",
+      "!node_modules/**",
+      "!codegraph-readonly/**"
+    ]
   },
   "formatter": {
     "enabled": true,
@@ -28,27 +40,57 @@
       },
       "suspicious": {
         "noExplicitAny": "error",
-        "noConsole": { "level": "error", "options": { "allow": [] } }
+        "noConsole": {
+          "level": "error",
+          "options": {
+            "allow": []
+          }
+        }
       },
       "complexity": {
-        "noExcessiveCognitiveComplexity": { "level": "warn", "options": { "maxAllowedComplexity": 25 } }
+        "noExcessiveCognitiveComplexity": {
+          "level": "warn",
+          "options": {
+            "maxAllowedComplexity": 25
+          }
+        }
       }
     }
   },
   "overrides": [
     {
-      "includes": ["tests/**"],
+      "includes": [
+        "tests/**",
+        "scripts/**"
+      ],
       "linter": {
         "rules": {
-          "style": { "noNonNullAssertion": "off" },
-          "suspicious": { "noConsole": "off", "noExplicitAny": "off" },
-          "complexity": { "noExcessiveCognitiveComplexity": "off" }
+          "style": {
+            "noNonNullAssertion": "off"
+          },
+          "suspicious": {
+            "noConsole": "off",
+            "noExplicitAny": "off"
+          },
+          "complexity": {
+            "noExcessiveCognitiveComplexity": "off"
+          }
         }
       }
     },
     {
-      "includes": ["src/cli.ts", "src/mcp-main.ts", "src/image-controller.ts"],
-      "linter": { "rules": { "suspicious": { "noConsole": "off" } } }
+      "includes": [
+        "src/cli.ts",
+        "src/mcp-main.ts",
+        "src/image-controller.ts"
+      ],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
     }
   ]
 }
