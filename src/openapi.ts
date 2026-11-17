@@ -41,10 +41,11 @@ const scope = {
 };
 const expiresIn = {
   type: 'integer',
+  nullable: true,
   minimum: 60,
   maximum: 7776000,
   default: 2592000,
-  description: '有效期，单位秒；默认 30 天，最多 90 天。',
+  description: '有效期，单位秒；省略时默认 30 天，有限期限最多 90 天；显式 null 表示无限期（无截止日期），仍可撤销。',
 };
 const repoScope = {
   ...strings,
@@ -430,7 +431,7 @@ export const openApiDocument = {
         tags: ['API Key'],
         summary: '创建 API Key',
         description:
-          '需要 write。read Key 必须提供明确的 repos 仓库 ID 列表；新密钥的范围不能超过当前密钥，过期时间不能晚于当前密钥。Key 的 owner 固定为调用者，不支持指定目标用户；代发时审计主体仍是签发者，可用 Key 前缀区分。密钥明文仅返回一次。',
+          '需要 write。read Key 必须提供明确的 repos 仓库 ID 列表；新密钥的范围不能超过当前密钥，过期时间不能晚于当前密钥；只有无截止日期的父 Key 才能创建无限期下级 Key。Key 的 owner 固定为调用者，不支持指定目标用户；代发时审计主体仍是签发者，可用 Key 前缀区分。密钥明文仅返回一次。',
         requestBody: request(object({ scope, repos: repoScope, expires_in: expiresIn }, ['scope'])),
         responses: { '201': ok('密钥创建成功。', ref('CreatedKey')), ...common },
       },
@@ -539,7 +540,7 @@ export const openApiDocument = {
           token: { type: 'string' },
           prefix: { type: 'string' },
           scope,
-          expires_in: { type: 'integer', description: '单位秒。' },
+          expires_in: { type: 'integer', nullable: true, description: '单位秒；null 表示无限期（无截止日期）。' },
         },
         ['token', 'prefix', 'scope', 'expires_in'],
       ),
@@ -694,7 +695,7 @@ export const openApiDocument = {
           prefix: { type: 'string' },
           scope,
           repos: repoScope,
-          expires_at: { type: 'integer', description: 'Unix 毫秒时间戳。' },
+          expires_at: { type: 'integer', nullable: true, description: 'Unix 毫秒时间戳；null 表示无截止日期。' },
         },
         ['token', 'prefix', 'scope', 'repos', 'expires_at'],
       ),

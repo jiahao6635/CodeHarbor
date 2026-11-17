@@ -143,7 +143,8 @@ export interface StoreAccess {
   revokeUserKeys(owner: string): Promise<void>;
 
   createRepository(repo: RepositoryInput): Promise<void>;
-  getRepository(id: string): Promise<RepositoryRecord | undefined>;
+  /** forUpdate locks the row until the surrounding transaction finishes; use only through tx. */
+  getRepository(id: string, options?: { forUpdate?: boolean }): Promise<RepositoryRecord | undefined>;
   getRepositoryByCodeupId(codeupId: string): Promise<RepositoryRecord | undefined>;
   getRepositoriesByIds(ids: string[]): Promise<RepositoryRecord[]>;
   listRepositories(): Promise<RepositoryRecord[]>;

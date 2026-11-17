@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { createAccessKey, hashAccessKey } from '../auth.js';
+import { constantTimeEqual, createAccessKey, hashAccessKey } from '../auth.js';
 import { bearerToken } from '../authorization.js';
 import type { AppContext } from '../http/context.js';
 import { fail } from '../http/errors.js';
@@ -32,6 +32,14 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
             await tx.createUser({ id: user.id, username: user.username, credential: encrypted, credential_version: 1 });
             return;
           }
+          let sameCredential = false;
+          try {
+            // Ciphertexts use random IVs; compare decrypted values only after live Codeup validation.
+            sameCredential = constantTimeEqual(cipher.decrypt(existing.credential, user.id), pat);
+          } catch {
+            // A verified PAT can repair an unreadable credential, but must require fresh sync authorization.
+          }
+          if (sameCredential) return;
           await tx.updateUserCredential(user.id, user.username, encrypted);
           for (const repo of await tx.listRepositories()) {
             if (repo.sync_owner === user.id && repo.status !== 'disabled' && repo.status !== 'branch_deleted') {
@@ -72,7 +80,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
       if (!session) fail(401, 'UNAUTHENTICATED');
       const input = parseBody(bootstrapBody, request.body);
       if (input.scope === 'write' && !ctx.config.writeUsers.includes(session.userId)) fail(403, 'FORBIDDEN');
-      const seconds = input.expires_in ?? 30 * 86_400;
+      const seconds = input.expires_in === undefined ? 30 * 86_400 : input.expires_in;
       return authorization.mutate(async () => {
         // The session is single-use: whichever concurrent request reaches this point first wins.
         if (sessions.get(hash) !== session || session.expires <= Date.now() || !sessions.delete(hash)) {
@@ -84,7 +92,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
           owner: session.userId,
           scope: input.scope,
           repos: null,
-          expires_at: Date.now() + seconds * 1000,
+          expires_at: seconds === null ? null : Date.now() + seconds * 1000,
           revoked: 0,
         });
         return reply.code(201).send({ token: key.token, prefix: key.prefix, scope: input.scope, expires_in: seconds });

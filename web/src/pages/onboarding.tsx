@@ -17,8 +17,9 @@ import { Input, NativeSelect } from '@/components/ui/input';
 import { describedBy, Field } from '@/components/ui/label';
 import { cn } from '@/lib/cn';
 import { describeError } from '@/lib/errors';
+import { formatKeyLifetime } from '@/lib/format';
 import { toastError } from '@/lib/toast';
-import { EXPIRY_OPTIONS, pat } from '@/lib/validation';
+import { DEFAULT_EXPIRES_IN, EXPIRY_OPTIONS, parseExpiry, pat, UNLIMITED_EXPIRY_HELP } from '@/lib/validation';
 
 const STEPS = ['绑定云效账号', '申请 Key', '保存 Key'] as const;
 
@@ -110,7 +111,9 @@ function BindStep({ onBound }: { onBound: (session: BootstrapSession) => void })
         </div>
       </Field>
       <Alert tone="warning">
-        重新绑定 PAT 会使你此前授权同步的仓库进入「需重新授权」状态，需要在仓库详情页重新授权一次。
+        只有更换为不同的
+        PAT，才会使你此前授权同步的仓库进入「需重新授权」状态，需要在仓库详情页重新授权一次；重新绑定同一个 PAT
+        不影响已有同步授权。
       </Alert>
       <div className="flex justify-end">
         <Button type="submit" loading={form.formState.isSubmitting}>
@@ -131,7 +134,7 @@ function KeyStep({
   onExpired: () => void;
 }) {
   const [scope, setScope] = useState<Scope>('read');
-  const [expiresIn, setExpiresIn] = useState<number>(30 * 86_400);
+  const [expiresIn, setExpiresIn] = useState<number | null>(DEFAULT_EXPIRES_IN);
   const [submitting, setSubmitting] = useState(false);
   const [remaining, setRemaining] = useState(session.expires_in);
   const scopeId = useId();
@@ -194,10 +197,15 @@ function KeyStep({
           description="接入仓库、触发索引与平台管理；需要管理员预先将你的云效用户 ID 加入 CODEHARBOR_WRITE_USERS，否则会被拒绝。write Key 本身不能查询代码。"
         />
       </fieldset>
-      <Field id={expiryId} label="有效期">
-        <NativeSelect id={expiryId} value={expiresIn} onChange={(event) => setExpiresIn(Number(event.target.value))}>
+      <Field id={expiryId} label="有效期" helper={expiresIn === null ? UNLIMITED_EXPIRY_HELP : undefined}>
+        <NativeSelect
+          id={expiryId}
+          value={String(expiresIn)}
+          onChange={(event) => setExpiresIn(parseExpiry(event.target.value))}
+          aria-describedby={describedBy(expiryId, { helper: expiresIn === null })}
+        >
           {EXPIRY_OPTIONS.map((option) => (
-            <option key={option.seconds} value={option.seconds}>
+            <option key={String(option.seconds)} value={String(option.seconds)}>
               {option.label}
             </option>
           ))}
@@ -303,7 +311,7 @@ export default function OnboardingPage() {
         title="你的 CodeHarbor Key"
         description={
           created
-            ? `类型 ${created.scope}，前缀 ${created.prefix}，有效期 ${Math.round(created.expires_in / 86_400)} 天。`
+            ? `类型 ${created.scope}，前缀 ${created.prefix}，有效期 ${formatKeyLifetime(created.expires_in)}。`
             : ''
         }
         items={created ? [{ label: 'CodeHarbor Key', value: created.token }] : []}

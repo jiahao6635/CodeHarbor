@@ -32,9 +32,9 @@ export function registerKeyRoutes(app: FastifyInstance, ctx: AppContext): void {
     if (input.scope === 'read' && repos === null) fail(400, 'REPOSITORY_SCOPE_REQUIRED');
     // A restricted key can only mint keys within its own repository set.
     if (key.repos !== null && (repos === null || repos.some((id) => !key.repos?.includes(id)))) fail(403, 'FORBIDDEN');
-    const seconds = input.expires_in ?? 30 * 86_400;
-    const expiry = Date.now() + seconds * 1000;
-    if (key.expires_at !== null && expiry > key.expires_at) fail(403, 'FORBIDDEN');
+    const seconds = input.expires_in === undefined ? 30 * 86_400 : input.expires_in;
+    const expiry = seconds === null ? null : Date.now() + seconds * 1000;
+    if (key.expires_at !== null && (expiry === null || expiry > key.expires_at)) fail(403, 'FORBIDDEN');
     return authorization.mutate(async () => {
       await assertActiveWrite(ctx, request);
       const next = createAccessKey();

@@ -158,8 +158,12 @@ function access(db: Queryable, guard: () => void): StoreAccess {
         ],
       );
     },
-    getRepository: (id) =>
-      one(repositoryRowSchema.parse, `SELECT ${REPOSITORY_COLUMNS} FROM repositories WHERE id = $1`, [id]),
+    getRepository: (id, options) =>
+      one(
+        repositoryRowSchema.parse,
+        `SELECT ${REPOSITORY_COLUMNS} FROM repositories WHERE id = $1${options?.forUpdate ? ' FOR UPDATE' : ''}`,
+        [id],
+      ),
     getRepositoryByCodeupId: (codeupId) =>
       one(repositoryRowSchema.parse, `SELECT ${REPOSITORY_COLUMNS} FROM repositories WHERE codeup_id = $1`, [codeupId]),
     getRepositoriesByIds: (ids) =>

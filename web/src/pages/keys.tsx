@@ -1,5 +1,5 @@
 import { Key as KeyIcon, Plus, Trash } from '@phosphor-icons/react';
-import { useId, useMemo, useState } from 'react';
+import { useId, useState } from 'react';
 import { toast } from 'sonner';
 import { useCreateKey, useKeys, useRepositories, useRevokeKey } from '@/api/hooks';
 import type { CreatedKey, KeyInfo, Scope } from '@/api/types';
@@ -22,12 +22,12 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { NativeSelect } from '@/components/ui/input';
-import { Field, Label } from '@/components/ui/label';
+import { describedBy, Field, Label } from '@/components/ui/label';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatAbsolute, formatExpiry } from '@/lib/format';
 import { toastError } from '@/lib/toast';
-import { EXPIRY_OPTIONS } from '@/lib/validation';
+import { childExpiryOptions, parseExpiry, resolveChildExpiry, UNLIMITED_EXPIRY_HELP } from '@/lib/validation';
 
 export function KeyScopeCell({ info }: { info: Pick<KeyInfo, 'scope' | 'repos'> }) {
   if (info.repos === null) {
@@ -54,25 +54,23 @@ function CreateKeyDialog({
   const create = useCreateKey();
   const [scope, setScope] = useState<Scope>('read');
   const [selected, setSelected] = useState<string[]>([]);
-  const [chosenExpiry, setChosenExpiry] = useState<number | null>(null);
+  const [chosenExpiry, setChosenExpiry] = useState<number | null | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const scopeId = useId();
   const expiryId = useId();
 
-  const parentExpiry = me?.key_expires_at ?? null;
-  const expiryOptions = useMemo(
-    () =>
-      EXPIRY_OPTIONS.filter((option) => parentExpiry === null || Date.now() + option.seconds * 1000 <= parentExpiry),
-    [parentExpiry],
-  );
-  // The longest option that still fits inside the parent key's lifetime is the default.
-  const expiresIn =
-    chosenExpiry !== null && expiryOptions.some((option) => option.seconds === chosenExpiry)
-      ? chosenExpiry
-      : (expiryOptions.at(-1)?.seconds ?? 0);
+  const parentExpiry = me?.key_expires_at;
+  const expiryOptions = childExpiryOptions(parentExpiry);
+  // Default to the longest finite option; null is only used when explicitly selected.
+  const expiresIn = resolveChildExpiry(expiryOptions, chosenExpiry);
 
   const submit = () => {
     setError(null);
+    // Recheck at submission in case the parent's remaining lifetime has shrunk.
+    if (expiresIn === undefined || !childExpiryOptions(parentExpiry).some((option) => option.seconds === expiresIn)) {
+      setError('当前 Key 的剩余有效期不足，请重新选择或更换 Key。');
+      return;
+    }
     if (scope === 'read' && selected.length === 0) {
       setError('read Key 必须至少选择一个仓库。');
       return;
@@ -152,14 +150,15 @@ function CreateKeyDialog({
             )}
           </fieldset>
         ) : null}
-        <Field id={expiryId} label="有效期">
+        <Field id={expiryId} label="有效期" helper={expiresIn === null ? UNLIMITED_EXPIRY_HELP : undefined}>
           <NativeSelect
             id={expiryId}
-            value={expiresIn}
-            onChange={(event) => setChosenExpiry(Number(event.target.value))}
+            value={expiresIn === undefined ? '' : String(expiresIn)}
+            onChange={(event) => setChosenExpiry(parseExpiry(event.target.value))}
+            aria-describedby={describedBy(expiryId, { helper: expiresIn === null })}
           >
             {expiryOptions.map((option) => (
-              <option key={option.seconds} value={option.seconds}>
+              <option key={String(option.seconds)} value={String(option.seconds)}>
                 {option.label}
               </option>
             ))}
@@ -296,7 +295,9 @@ export default function KeysPage() {
         open={created !== null}
         title="新的 CodeHarbor Key"
         description={
-          created ? `类型 ${created.scope}，前缀 ${created.prefix}，到期 ${formatAbsolute(created.expires_at)}。` : ''
+          created
+            ? `类型 ${created.scope}，前缀 ${created.prefix}，${created.expires_at === null ? '无限期（无截止日期）' : `到期 ${formatAbsolute(created.expires_at)}`}。`
+            : ''
         }
         items={created ? [{ label: 'CodeHarbor Key', value: created.token }] : []}
         onClose={() => setCreated(null)}

@@ -36,7 +36,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     },
     async listRepositories(token: string) {
       userFor(token);
-      if (token === 'alice-pat' && delayOldCredential) {
+      if (token === 'alice-pat-2' && delayOldCredential) {
         await delayOldCredential();
         throw new CodeupError('invalid_credential', 401);
       }
@@ -509,9 +509,22 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
       /matching code/,
     );
     revokedTokens.delete('alice-pat');
-    const previousVersion = (await app.store.getUser('alice'))!.credential_version;
+    const userBeforeRebind = (await app.store.getUser('alice'))!;
+    const repositoriesBeforeRebind = await app.store.listRepositories();
+    const samePat = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat' });
+    assert.equal(samePat.status, 200);
+    assert.deepEqual(await app.store.getUser('alice'), userBeforeRebind);
+    assert.deepEqual(await app.store.listRepositories(), repositoriesBeforeRebind);
+    const samePatKey = await request('POST', '/api/v1/auth/bootstrap/keys', samePat.body.bootstrap_token, {
+      scope: 'read',
+    });
+    assert.equal(samePatKey.status, 201);
+    assert.equal((await request('GET', '/api/v1/me', alice)).status, 200);
+
+    // A genuinely different PAT still invalidates each repository's prior authorization.
+    const previousVersion = userBeforeRebind.credential_version;
     const originalSyncVersion = (await app.store.getRepository(repo))!.sync_credential_version;
-    const rebound = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat' });
+    const rebound = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat-2' });
     assert.equal(rebound.status, 200);
     assert.equal((await app.store.getUser('alice'))!.credential_version, previousVersion + 1);
     assert.equal((await app.store.getRepository(repo))!.sync_credential_version, originalSyncVersion);
@@ -566,7 +579,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     };
     const delayedRequest = request('GET', '/api/v1/codeup/repositories', fresh.body.token);
     await started;
-    const reboundAgain = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat-2' });
+    const reboundAgain = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat' });
     const newer = await request('POST', '/api/v1/auth/bootstrap/keys', reboundAgain.body.bootstrap_token, {
       scope: 'write',
     });
@@ -598,7 +611,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     const slowSync = partialRequest('PUT', syncCredentialPath, newer.body.token, '{"authorize_automatic_sync":');
     await new Promise((resolve) => setTimeout(resolve, 50));
     const repoVersionBefore = (await app.store.getRepository(repo))!.sync_credential_version;
-    const reboundDuringRequest = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat' });
+    const reboundDuringRequest = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'alice-pat-2' });
     assert.equal(reboundDuringRequest.status, 200);
     assert.equal((await slowSync.finish('true}')).status, 401);
     assert.equal((await app.store.getRepository(repo))!.sync_credential_version, repoVersionBefore);
@@ -651,6 +664,143 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     await app.close();
     await db.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keys can have no expiry without bypassing parent lifetimes or revocation', async () => {
+  const db = await openTestStore();
+  const allowedHosts: string[] = [];
+  const app = createApp(
+    {
+      dataDir: '/unused',
+      credentialKey: randomBytes(32),
+      codeupEndpoint: 'https://devops.example',
+      allowedGitHosts: ['git.example'],
+      allowedHosts,
+      writeUsers: ['expiry-user'],
+    },
+    {
+      store: db.store,
+      codeup: {
+        async getUser() {
+          return { id: 'expiry-user', username: 'expiry-user', name: 'Expiry User' };
+        },
+        async listRepositories() {
+          return { repositories: [], nextPage: null };
+        },
+      } as never,
+      graph: { async probe() {}, async close() {} } as never,
+      worker: { async stop() {} } as never,
+    },
+  );
+  try {
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const address = app.server.address();
+    assert.ok(address && typeof address === 'object');
+    allowedHosts.push(`127.0.0.1:${address.port}`);
+    const base = `http://127.0.0.1:${address.port}`;
+    async function request(method: string, path: string, token?: string, body?: unknown) {
+      const response = await fetch(`${base}${path}`, {
+        method,
+        headers: {
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+          ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      });
+      return { status: response.status, body: (await response.json()) as Record<string, any> };
+    }
+    async function bootstrap() {
+      const bound = await request('POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'expiry-test-pat' });
+      assert.equal(bound.status, 200);
+      assert.equal(bound.body.expires_in, 300, 'bootstrap sessions must still expire');
+      return bound.body.bootstrap_token as string;
+    }
+
+    const bootstrapToken = await bootstrap();
+    for (const invalid of [0, -1, 90 * 86_400 + 1, 'never']) {
+      assert.equal(
+        (await request('POST', '/api/v1/auth/bootstrap/keys', bootstrapToken, { scope: 'write', expires_in: invalid }))
+          .status,
+        400,
+      );
+    }
+    const unlimited = await request('POST', '/api/v1/auth/bootstrap/keys', bootstrapToken, {
+      scope: 'write',
+      expires_in: null,
+    });
+    assert.equal(unlimited.status, 201);
+    assert.equal(unlimited.body.expires_in, null);
+    const root = unlimited.body.token as string;
+    assert.equal((await db.store.getKey(hashAccessKey(root)))?.expires_at, null);
+    const me = await request('GET', '/api/v1/me', root);
+    assert.equal(me.status, 200);
+    assert.equal(me.body.key_expires_at, null);
+    assert.equal(me.body.is_admin, true);
+
+    const child = await request('POST', '/api/v1/api-keys', root, {
+      scope: 'read',
+      repos: ['repo-1'],
+      expires_in: null,
+    });
+    assert.equal(child.status, 201);
+    assert.equal(child.body.expires_at, null);
+    assert.equal((await request('GET', '/api/v1/me', child.body.token)).status, 200);
+    assert.equal((await request('DELETE', `/api/v1/api-keys/${child.body.prefix}`, root)).status, 200);
+    assert.equal((await request('GET', '/api/v1/me', child.body.token)).status, 401);
+
+    const finite = await request('POST', '/api/v1/api-keys', root, {
+      scope: 'write',
+      repos: ['repo-1'],
+      expires_in: 3600,
+    });
+    assert.equal(finite.status, 201);
+    assert.ok(finite.body.expires_at > Date.now());
+    for (const expiry of [null, 7200]) {
+      assert.equal(
+        (
+          await request('POST', '/api/v1/api-keys', finite.body.token, {
+            scope: 'read',
+            repos: ['repo-1'],
+            expires_in: expiry,
+          })
+        ).status,
+        403,
+      );
+    }
+    assert.equal(
+      (
+        await request('POST', '/api/v1/api-keys', finite.body.token, {
+          scope: 'read',
+          repos: ['repo-1'],
+          expires_in: 60,
+        })
+      ).status,
+      201,
+    );
+    const defaultStart = Date.now();
+    const defaultChild = await request('POST', '/api/v1/api-keys', root, { scope: 'write', repos: null });
+    assert.equal(defaultChild.status, 201);
+    assert.ok(defaultChild.body.expires_at >= defaultStart + 30 * 86_400_000);
+    assert.ok(defaultChild.body.expires_at <= Date.now() + 30 * 86_400_000);
+
+    const readKey = await request('POST', '/api/v1/auth/bootstrap/keys', await bootstrap(), {
+      scope: 'read',
+      expires_in: null,
+    });
+    assert.equal(readKey.status, 201);
+    assert.equal(readKey.body.expires_in, null);
+    assert.equal((await request('GET', '/api/v1/me', readKey.body.token)).body.key_expires_at, null);
+    assert.equal(
+      (await request('POST', '/api/v1/api-keys', readKey.body.token, { scope: 'write', expires_in: null })).status,
+      403,
+    );
+    const defaultKey = await request('POST', '/api/v1/auth/bootstrap/keys', await bootstrap(), { scope: 'read' });
+    assert.equal(defaultKey.status, 201);
+    assert.equal(defaultKey.body.expires_in, 30 * 86_400);
+  } finally {
+    await app.close();
+    await db.close();
   }
 });
 

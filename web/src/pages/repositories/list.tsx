@@ -9,6 +9,7 @@ import { EmptyState } from '@/components/empty-state';
 import { ErrorNotice } from '@/components/error-notice';
 import { PageHeader } from '@/components/page-header';
 import { RelativeTime } from '@/components/relative-time';
+import { RepositoryCreatePermission } from '@/components/repository-create-permission';
 import { RepositoryStatusBadge, repositoryStatusLabel } from '@/components/status-badge';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -80,16 +81,15 @@ export default function RepositoriesPage() {
         title="仓库"
         description="当前 Key 可访问的已接入仓库及其索引状态。"
         actions={
-          isAdmin ? (
-            <Button asChild>
-              <Link to="/repositories/new">
-                <Plus aria-hidden="true" />
-                接入仓库
-              </Link>
-            </Button>
-          ) : null
+          <Button asChild>
+            <Link to="/repositories/new">
+              <Plus aria-hidden="true" />
+              接入仓库
+            </Link>
+          </Button>
         }
       />
+      <RepositoryCreatePermission />
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end">
         <div className="flex flex-1 flex-col gap-1.5">
           <Label htmlFor="repo-search">搜索</Label>
@@ -143,11 +143,9 @@ export default function RepositoriesPage() {
           icon={GitBranch}
           title={isAdmin ? '还没有接入任何仓库' : '当前 Key 没有可访问的仓库'}
           action={
-            isAdmin ? (
-              <Button asChild>
-                <Link to="/repositories/new">接入第一个仓库</Link>
-              </Button>
-            ) : undefined
+            <Button asChild>
+              <Link to="/repositories/new">接入第一个仓库</Link>
+            </Button>
           }
         />
       ) : filtered.length === 0 ? (

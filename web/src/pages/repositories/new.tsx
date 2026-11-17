@@ -11,6 +11,7 @@ import type { CodeupRepository, CreatedRepository } from '@/api/types';
 import { useAbility } from '@/auth/session';
 import { ErrorNotice } from '@/components/error-notice';
 import { PageHeader } from '@/components/page-header';
+import { RepositoryCreatePermission } from '@/components/repository-create-permission';
 import { SecretReveal } from '@/components/secret-reveal';
 import { Alert } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -132,7 +133,37 @@ function CodeupPicker({ selectedId, onSelect }: { selectedId: string; onSelect: 
 }
 
 export default function RepositoryNewPage() {
-  const { isAdmin, isUnrestricted } = useAbility();
+  const { isAdmin } = useAbility();
+
+  return (
+    <>
+      <nav aria-label="面包屑" className="mb-3 flex items-center gap-1 text-sm text-muted-foreground">
+        <Link to="/repositories" className="hover:text-foreground">
+          仓库
+        </Link>
+        <CaretRight className="size-3.5" aria-hidden="true" />
+        <span className="text-foreground">接入仓库</span>
+      </nav>
+      <PageHeader
+        title="接入云效仓库"
+        description="平台将用你当前绑定的 PAT 克隆并构建索引，之后按 Webhook、手动同步和定期对账更新。"
+      />
+      {isAdmin ? (
+        <RepositoryCreateForm />
+      ) : (
+        <>
+          <RepositoryCreatePermission />
+          <Button asChild variant="secondary">
+            <Link to="/repositories">返回仓库列表</Link>
+          </Button>
+        </>
+      )}
+    </>
+  );
+}
+
+function RepositoryCreateForm() {
+  const { isUnrestricted } = useAbility();
   const navigate = useNavigate();
   const create = useCreateRepository();
   const [created, setCreated] = useState<CreatedRepository | null>(null);
@@ -143,10 +174,6 @@ export default function RepositoryNewPage() {
     defaultValues: { codeup_repository_id: '', branch: 'main', authorize: undefined as unknown as true },
   });
   const authorizeId = useId();
-
-  if (!isAdmin) {
-    return <Alert tone="warning">接入仓库需要平台管理 Key。</Alert>;
-  }
 
   const onSubmit = form.handleSubmit((values) => {
     setServerError(null);
@@ -177,17 +204,6 @@ export default function RepositoryNewPage() {
 
   return (
     <>
-      <nav aria-label="面包屑" className="mb-3 flex items-center gap-1 text-sm text-muted-foreground">
-        <Link to="/repositories" className="hover:text-foreground">
-          仓库
-        </Link>
-        <CaretRight className="size-3.5" aria-hidden="true" />
-        <span className="text-foreground">接入仓库</span>
-      </nav>
-      <PageHeader
-        title="接入云效仓库"
-        description="平台将用你当前绑定的 PAT 克隆并构建索引，之后按 Webhook、手动同步和定期对账更新。"
-      />
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_380px]">
         <Card className="flex flex-col gap-4">
           <Tabs defaultValue={isUnrestricted ? 'pick' : 'manual'}>
