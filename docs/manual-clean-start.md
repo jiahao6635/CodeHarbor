@@ -160,10 +160,10 @@
 
 ## 第 8 步：用 Postman 查询
 
-公网 Swagger 页面显示了 `/mcp` 接口说明，但该公网入口已关闭。这里用 Postman 的 MCP 请求连接独立内网入口。需要 Postman 支持 MCP 请求，并确保运行 Postman 的电脑可以访问公司内网；管理页面能打开不等于内网 MCP 地址可达。以下操作基于 [Postman 官方 MCP 请求说明](https://learning.postman.com/docs/use/send-requests/protocols/mcp-requests/create)，不同版本的界面名称可能略有不同。
+Swagger 页面显示的 `/mcp` 接口说明属于平台进程，该入口已关闭；MCP 由独立服务提供，经 Nginx 转发到与控制台相同的域名。这里用 Postman 的 MCP 请求连接它。需要 Postman 支持 MCP 请求，并确保运行 Postman 的电脑可以访问公司内网（`codegraph.sigmob.com` 仅内网可达）。以下操作基于 [Postman 官方 MCP 请求说明](https://learning.postman.com/docs/use/send-requests/protocols/mcp-requests/create)，不同版本的界面名称可能略有不同。
 
 1. 打开 Postman 桌面版，进入一个工作区。在左侧选择 **Add → MCP**，创建 MCP 请求；有些版本入口为 **New → MCP**。
-2. 选择 **HTTP**，在地址栏填写 `http://10.29.23.237:18080/mcp`。这是公司内网地址，该连接中的 Key、查询和结果均以明文传输，只能在可信网络使用。
+2. 选择 **HTTP**，在地址栏填写 `https://codegraph.sigmob.com/mcp`。旧的内网端口 `http://10.29.23.237:18080/mcp` 暂时仍可用，但其中的 Key、查询和结果以明文传输，只能在可信网络使用。
 3. 打开请求的 **Authorization** 标签，在 **Auth Type** 选择 **Bearer Token**。在 **Token** 填入第 7 步的**查询密钥**，只填密钥本身，不要输入 `Bearer ` 前缀；Postman 会自动添加。不要填写云效 PAT 或管理密钥。建议将密钥保存在 [Postman 本地保管库](https://learning.postman.com/docs/use/postman-vault/manage-vault-secrets)，不要将其分享到工作区或聊天。
 4. 点击 **Load Capabilities**（部分版本叫 **Load Methods**）。Postman 会连接服务并加载工具；如果看到访问许可提示，检查后按界面完成授权。
 5. 在 **Tools** 中选择 `list_repositories`，参数填写 `{}`，点击 **Run**。在 **Response** 中检查是否出现新仓库。

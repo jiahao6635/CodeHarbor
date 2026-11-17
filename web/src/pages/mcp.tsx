@@ -5,6 +5,7 @@ import { PageHeader } from '@/components/page-header';
 import { Alert } from '@/components/ui/alert';
 import { Card, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { mcpEndpoint, mcpOnSeparateAddress } from '@/lib/mcp';
 
 const PLACEHOLDER = '<CodeHarbor Key>';
 
@@ -35,8 +36,8 @@ function Snippet({ code, label }: { code: string; label: string }) {
 export default function McpPage() {
   const { me } = useAbility();
   const config = useConsoleConfig();
-  const mcpUrl = config.data?.mcp_url ?? `${window.location.origin}/mcp`;
-  const publicDisabled = config.data?.public_mcp_disabled ?? false;
+  const mcpUrl = mcpEndpoint(config.data, window.location.origin);
+  const separateAddress = mcpOnSeparateAddress(config.data, window.location.origin);
 
   const jsonConfig = JSON.stringify(
     { mcpServers: { codeharbor: { url: mcpUrl, headers: { Authorization: `Bearer ${PLACEHOLDER}` } } } },
@@ -58,10 +59,10 @@ export default function McpPage() {
             read Key 供 Agent 使用。
           </Alert>
         ) : null}
-        {publicDisabled ? (
-          <Alert tone="warning" title="公网 MCP 入口已关闭">
-            MCP 查询需要通过内网地址访问；控制台能打开不代表 MCP 地址可达。
-            {config.data?.mcp_url ? null : ' 管理员尚未配置内网 MCP 地址（CODEHARBOR_UI_MCP_URL），请向管理员确认。'}
+        {separateAddress ? (
+          <Alert tone="warning" title="MCP 使用单独的地址">
+            MCP 不在当前控制台域名下提供，需要通过下方地址访问；控制台能打开不代表 MCP 地址可达。
+            {config.data?.mcp_url ? null : ' 管理员尚未配置 MCP 地址（CODEHARBOR_UI_MCP_URL），请向管理员确认。'}
           </Alert>
         ) : null}
         <Card>

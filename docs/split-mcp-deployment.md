@@ -1,8 +1,10 @@
 # 平台与内网 MCP 分离部署
 
-此方案在同一台主机运行平台、镜像控制器和独立 MCP 服务。平台继续提供管理 API、索引 Worker 和镜像构建；MCP 服务只监听内网并处理 MCP 请求。公网 Nginx 拒绝 `/mcp`，内部 MCP 服务通过专用 Unix socket 连接平台；MCP 容器不挂载 Docker socket、数据库凭据、Vault 凭据或云效 PAT。仓库镜像仍在本机 Docker 中，不能仅通过复制 MCP 容器将其部署到其他主机。
+此方案在同一台主机运行平台、镜像控制器和独立 MCP 服务。平台继续提供管理 API、索引 Worker 和镜像构建；MCP 服务只处理 MCP 请求。平台自身的 `/mcp` 始终关闭（`CODEHARBOR_PUBLIC_MCP_DISABLED=true`），Nginx 把 `/mcp` 转发给独立 MCP 服务；内部 MCP 服务通过专用 Unix socket 连接平台；MCP 容器不挂载 Docker socket、数据库凭据、Vault 凭据或云效 PAT。仓库镜像仍在本机 Docker 中，不能仅通过复制 MCP 容器将其部署到其他主机。
 
-用户已选择可信内网 HTTP：其他 ECS 的访问地址为 `http://10.29.23.237:18080/mcp`。**Bearer Key、查询和返回的源码内容在网络传输中均为明文**，必须确保该网络和所有中间设备可信，限制访问来源；后续可使用内网 TLS 并让客户端验证证书。网络和安全组规则由运维管理，此模板不会修改阿里云安全组。
+当前部署的 `codegraph.sigmob.com` 仅内网可达，MCP 的推荐地址为 `https://codegraph.sigmob.com/mcp`，与控制台同域、经 Nginx TLS。**只有在该域名仅对可信网络开放时才能使用此配置**；若域名可从公网访问，须先在 Nginx 的 `/mcp` 上限制来源 IP，或恢复为 `return 404` 只保留内网端口。
+
+内网端口 `http://10.29.23.237:18080/mcp` 继续保留，供尚未迁移的客户端使用。**该端口上 Bearer Key、查询和返回的源码内容在网络传输中均为明文**，必须确保该网络和所有中间设备可信，限制访问来源；客户端迁移完成后可关闭该端口。网络和安全组规则由运维管理，此模板不会修改阿里云安全组。
 
 ## 前提
 
@@ -18,11 +20,12 @@
 ```sh
 export CODEHARBOR_MCP_LISTEN_ADDR=10.29.23.237
 export CODEHARBOR_MCP_LISTEN_PORT=18080
-export CODEHARBOR_MCP_ALLOWED_HOSTS=10.29.23.237:18080
+# 内网端口与经 Nginx 转发的控制台域名（Nginx 传递不带端口的 $host）
+export CODEHARBOR_MCP_ALLOWED_HOSTS=10.29.23.237:18080,codegraph.sigmob.com
 export CODEHARBOR_INTERNAL_MCP_SOCKET_DIR=/path/to/dedicated-mcp-socket-dir
 export CODEHARBOR_INTERNAL_MCP_TOKEN_HOST_FILE=/path/to/private-internal-mcp-token
-# 控制台「MCP 接入」页展示的内网地址；公网 /mcp 已关闭
-export CODEHARBOR_UI_MCP_URL=http://10.29.23.237:18080/mcp
+# 控制台「MCP 接入」页展示的地址；与控制台同域时页面不再提示“单独地址”
+export CODEHARBOR_UI_MCP_URL=https://codegraph.sigmob.com/mcp
 ```
 
 `CODEHARBOR_MCP_ALLOWED_HOSTS` 与客户端请求的 HTTP `Host` 严格匹配，默认端口以外的地址要包含端口；如果还需要经过可信代理或健康检查访问，应明确加入相应 Host，多个值以逗号分隔。非浏览器 MCP 客户端一般不发送 `Origin`；浏览器客户端仅在确有需要时设置 `CODEHARBOR_MCP_ALLOWED_ORIGINS`，填入允许的完整 Origin。
@@ -36,7 +39,7 @@ docker compose -f deploy/compose.yaml -f deploy/compose.image.yaml -f deploy/com
 docker compose -f deploy/compose.yaml -f deploy/compose.image.yaml -f deploy/compose.split.yaml up -d --build
 ```
 
-首次启动或升级时应选择维护窗口，确认平台、镜像控制器和 MCP 都已就绪。内网访问仍使用已有 CodeHarbor Key，通过 `Authorization: Bearer <Key>` 认证；不要把云效 PAT 发给 MCP 客户端。已配置旧公网 MCP 地址的客户端需要迁移到内网地址。
+首次启动或升级时应选择维护窗口，确认平台、镜像控制器和 MCP 都已就绪。MCP 访问仍使用已有 CodeHarbor Key，通过 `Authorization: Bearer <Key>` 认证；不要把云效 PAT 发给 MCP 客户端。使用 `18080` 端口的客户端可改为 `https://codegraph.sigmob.com/mcp`；若客户端不信任站点证书，需先安装对应 CA。
 
 MCP 查询需要有效且 `repos` 明确包含目标仓库 ID 的 Key；旧 `repos: null` Key 不自动获得所有仓库的代码读取权。管理员应为使用者签发限定仓库范围的 Key。查询不再实时核验云效权限，云效撤权或 PAT 失效时已有 Key 仍可读取其范围内的旧索引，必须通过 CodeHarbor 撤销或替换 Key 收回访问；接入和同步仍使用对应授权 PAT。
 
@@ -44,11 +47,11 @@ MCP 查询需要有效且 `repos` 明确包含目标仓库 ID 的 Key；旧 `rep
 
 ## 验收与回退
 
-- 从另一台有访问权限的 ECS 检查内网地址，使用真实只读 Key 完成 MCP initialize、工具列表和已授权仓库查询；测试错误或已撤销 Key、无权仓库均被拒绝。
-- 验证 MCP 内网入口不能调用平台管理 API；检查公网 `https://codegraph.sigmob.com/mcp` 不再提供 MCP，而原有管理 API 和 Swagger 按既有策略可用。
+- 分别通过 `https://codegraph.sigmob.com/mcp` 和内网端口，使用真实只读 Key 完成 MCP initialize、工具列表和已授权仓库查询；测试错误或已撤销 Key、无权仓库均被拒绝。
+- 验证 MCP 入口不能调用平台管理 API：`/mcp/` 子路径返回 404，平台进程自身的 `/mcp` 保持关闭；原有管理 API 和 Swagger 按既有策略可用。
 - 验证索引构建期间与完成后 MCP 查询、CodeHarbor Key 撤销、平台重启和 MCP 重启；平台或内部 socket 不可用时应拒绝请求，不能绕过鉴权。另确认云效撤权不会自动撤销 Key，并按企业流程及时撤销对应 CodeHarbor Key。
 - 验证应用和 MCP 容器日志不包含 Bearer、内部 token 或查询源码；检查实际发布端口仅绑定目标内网 IP。`/health/ready` 不能替代一次实际仓库查询。
 
-如需回退，按原部署命令恢复之前的 Compose 组合和 Nginx 配置，并核对实际平台版本和监听端口。不要删除 PostgreSQL、Vault、镜像控制器状态或仓库镜像；回退前应通知使用新内网地址的客户端。公网 MCP 是否重新开放须由部署决策明确确认。
+如需回退，按原部署命令恢复之前的 Compose 组合和 Nginx 配置，并核对实际平台版本和监听端口。不要删除 PostgreSQL、Vault、镜像控制器状态或仓库镜像；回退前应通知使用域名地址的客户端改回内网端口。域名是否开放到公网须由部署决策明确确认，开放前须先关闭或限制 `/mcp`。
 
 独立 MCP 进程输出不包含令牌或查询内容的结构化 HTTP 访问日志；平台继续记录 MCP 工具审计。MCP 进程的 HTTP 请求不计入平台 `/metrics` 的 HTTP 请求数和耗时，需要独立采集日志或后续增加指标。

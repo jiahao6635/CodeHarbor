@@ -54,7 +54,7 @@ export DATABASE_URL='postgres://codeharbor_test:codeharbor_test@127.0.0.1:54329/
 | `CODEHARBOR_DOCS_ENABLED` | 是否提供 `/docs` 与 `/openapi.json`；生产默认 `false` |
 | `CODEHARBOR_UI_ENABLED` | 是否在 `/ui` 提供管理控制台，默认 `true`；需要先构建 `web/dist`（`npm run build:web`），显式设为 `true` 但缺少构建产物时启动失败 |
 | `CODEHARBOR_UI_DIR` | 可选，覆盖控制台构建产物目录，默认 `web/dist` |
-| `CODEHARBOR_UI_MCP_URL` | 可选，控制台「MCP 接入」页展示的 MCP 地址；公网入口关闭时应填内网地址 |
+| `CODEHARBOR_UI_MCP_URL` | 可选，控制台「MCP 接入」页展示的 MCP 地址；不填时使用控制台自身域名下的 `/mcp` |
 | `CODEHARBOR_MCP_KEY_RATE_PER_MIN` | 每个 Key 每分钟的 `/mcp` 请求配额，默认 `120`，超出返回 429 |
 | `CODEHARBOR_AUTH_FAILURE_RATE_PER_MIN` | 每个客户端地址每分钟允许的 Bearer 认证失败次数，默认 `30` |
 | `CODEHARBOR_AUDIT_RETENTION_DAYS` | 持久化审计事件保留天数，默认 `180` |
