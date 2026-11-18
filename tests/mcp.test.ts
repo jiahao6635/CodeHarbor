@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { CodeGraphClient } from '../src/codegraph.js';
+import { CODEGRAPH_TOOL_NAMES } from '../src/codegraph-tools.js';
 import { createMcpHandler, type McpRepository } from '../src/mcp.js';
 
 const repos: McpRepository[] = [
@@ -70,7 +71,7 @@ test('MCP routes authorized repositories without exposing server paths or mixing
     const tools = await client.listTools();
     assert.deepEqual(
       tools.tools.map((tool) => tool.name),
-      ['list_repositories', 'get_repository_status', 'codegraph_explore'],
+      ['list_repositories', 'get_repository_status', ...CODEGRAPH_TOOL_NAMES],
     );
     const listing = await client.callTool({ name: 'list_repositories', arguments: {} });
     assert.match(JSON.stringify(listing), /Alpha/);

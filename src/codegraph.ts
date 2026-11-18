@@ -3,11 +3,42 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/sdk/shared/stdio.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
+import {
+  assertCodeGraphToolSchema,
+  CODEGRAPH_MCP_TOOLS,
+  type CodeGraphToolCall,
+  type GraphToolQuery,
+  validCodeGraphToolCall,
+} from './codegraph-tools.js';
 
 /** The gateway and worker share these operations regardless of index storage. */
 export type GraphClient = Pick<CodeGraphClient, 'withQuery' | 'withExclusive' | 'probe' | 'close'> & {
   isUnsafe?(): boolean;
+  withToolQuery?<T>(operation: (callTool: GraphToolQuery) => Promise<T>, signal?: AbortSignal): Promise<T>;
 };
+
+/** Legacy explore-only adapters remain usable, but cannot silently drop new parameters. */
+export function withGraphToolQuery<T>(
+  graph: GraphClient,
+  operation: (callTool: GraphToolQuery) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (graph.withToolQuery) return graph.withToolQuery(operation, signal);
+  return graph.withQuery(
+    (explore) =>
+      operation((path, call, signal, identity) => {
+        if (
+          call.name !== 'codegraph_explore' ||
+          Object.keys(call.arguments).length !== 1 ||
+          typeof call.arguments.query !== 'string'
+        ) {
+          throw new Error('CodeGraph backend does not support this tool');
+        }
+        return explore(path, call.arguments.query, signal, identity);
+      }),
+    signal,
+  );
+}
 export type RepositoryIdentity = { repoId: string; commit: string };
 export type Explore = (
   path: string,
@@ -43,6 +74,7 @@ export class ManagedCodeGraphTransport implements Transport {
         CODEGRAPH_NO_DAEMON: '1',
         CODEGRAPH_NO_WATCH: '1',
         CODEGRAPH_NO_DOWNLOAD: '1',
+        CODEGRAPH_MCP_TOOLS,
         DO_NOT_TRACK: '1',
       },
       stdio: ['pipe', 'pipe', 'ignore'],
@@ -189,11 +221,19 @@ export class CodeGraphClient {
   }
 
   private async query(path: string, query: string, signal?: AbortSignal): Promise<string> {
+    return this.callTool(path, { name: 'codegraph_explore', arguments: { query } }, signal);
+  }
+
+  private async callTool(path: string, call: CodeGraphToolCall, signal?: AbortSignal): Promise<string> {
+    if (!validCodeGraphToolCall(call)) throw new Error('Invalid CodeGraph tool arguments');
+    const toolCall = { name: call.name, arguments: { ...call.arguments } };
     if (signal?.aborted) throw new Error('Request cancelled');
     try {
       const client = await this.connect();
+      const { tools } = await client.listTools(undefined, { timeout: this.timeoutMs, signal });
+      assertCodeGraphToolSchema(tools, toolCall);
       const result = await client.callTool(
-        { name: 'codegraph_explore', arguments: { projectPath: path, query } },
+        { name: toolCall.name, arguments: { ...toolCall.arguments, projectPath: path } },
         undefined,
         {
           timeout: this.timeoutMs,
@@ -217,6 +257,20 @@ export class CodeGraphClient {
     return this.serialized(() => {
       if (signal?.aborted) throw new Error('Request cancelled');
       return operation((path, query, signal) => this.query(path, query, signal));
+    });
+  }
+
+  /** Every code tool uses the same publication lock as explore. */
+  async withToolQuery<T>(operation: (callTool: GraphToolQuery) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.serialized(() => {
+      if (signal?.aborted) throw new Error('Request cancelled');
+      return operation((path, call, requestSignal) =>
+        this.callTool(
+          path,
+          call,
+          signal && requestSignal ? AbortSignal.any([signal, requestSignal]) : (requestSignal ?? signal),
+        ),
+      );
     });
   }
 

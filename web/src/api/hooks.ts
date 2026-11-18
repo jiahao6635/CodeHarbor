@@ -225,11 +225,14 @@ export function useDeleteRepository() {
   });
 }
 
+export function createKey(input: { scope: Scope; repos: string[] | null; expires_in: number | null }) {
+  return apiFetch<CreatedKey>('/api/v1/api-keys', { method: 'POST', body: input });
+}
+
 export function useCreateKey() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (input: { scope: Scope; repos: string[] | null; expires_in: number }) =>
-      apiFetch<CreatedKey>('/api/v1/api-keys', { method: 'POST', body: input }),
+    mutationFn: createKey,
     onSuccess: () => void client.invalidateQueries({ queryKey: queryKeys.keys }),
   });
 }
@@ -274,7 +277,7 @@ export function bindYunxiao(pat: string, signal?: AbortSignal) {
   });
 }
 
-export function createBootstrapKey(bootstrapToken: string, input: { scope: Scope; expires_in: number }) {
+export function createBootstrapKey(bootstrapToken: string, input: { scope: Scope; expires_in: number | null }) {
   return apiFetch<BootstrapKey>('/api/v1/auth/bootstrap/keys', { method: 'POST', body: input, token: bootstrapToken });
 }
 

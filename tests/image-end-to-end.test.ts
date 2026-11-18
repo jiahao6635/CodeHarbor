@@ -10,6 +10,7 @@ import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { CODEGRAPH_TOOL_NAMES, type CodeGraphToolCall } from '../src/codegraph-tools.js';
 import { DockerImageQueryBackend } from '../src/docker-image-query.js';
 import { getTrustedImage, SocketImageBuildExecutor, serveImageBuilder } from '../src/image-build-socket.js';
 import { buildRepositoryImage, RepositoryImageError } from '../src/image-builder.js';
@@ -59,11 +60,11 @@ test('real Git to trusted repository image and isolated readonly MCP query', {
     await mkdir(shimDir);
     await writeFile(
       join(source, 'fixture.py'),
-      'def orchidsentinel_reference():\n    return "orchidsentinel_fixture_marker"\n',
+      'def orchidsentinel_reference():\n    return "orchidsentinel_fixture_marker"\n\ndef entrypoint():\n    return orchidsentinel_reference()\n',
     );
     await writeFile(
       join(sourceBeta, 'fixture.py'),
-      'def magnoliasentinel_reference():\n    return "magnoliasentinel_fixture_marker"\n',
+      'def magnoliasentinel_reference():\n    return "magnoliasentinel_fixture_marker"\n\ndef entrypoint():\n    return magnoliasentinel_reference()\n',
     );
     const initializeGit = (directory: string) => {
       const runGit = (args: string[]) => execFileSync(git, args, { cwd: directory, stdio: 'ignore' });
@@ -143,6 +144,14 @@ test('real Git to trusted repository image and isolated readonly MCP query', {
             console.error('Fixture runtime failure', error instanceof Error ? error.message : 'unknown');
             throw error;
           }
+        },
+        callTool: async (request) => {
+          if (parallelGate) {
+            const gate = parallelGate;
+            if (++gate.arrived === 10) gate.enter();
+            await gate.release;
+          }
+          return backend.callTool(request);
         },
         probe: (signal) => backend.probe(signal),
         close: () => backend.close(),
@@ -322,7 +331,10 @@ test('real Git to trusted repository image and isolated readonly MCP query', {
         }),
       );
       const tools = await client.listTools();
-      assert.ok(tools.tools.some((tool) => tool.name === 'codegraph_explore'));
+      assert.deepEqual(
+        tools.tools.map((tool) => tool.name),
+        ['list_repositories', 'get_repository_status', ...CODEGRAPH_TOOL_NAMES],
+      );
       const listing = await client.callTool({ name: 'list_repositories', arguments: {} });
       assert.match(JSON.stringify(listing), new RegExp(own));
       assert.doesNotMatch(JSON.stringify(listing), new RegExp(denied));
@@ -338,6 +350,44 @@ test('real Git to trusted repository image and isolated readonly MCP query', {
       });
       assert.equal(denial.isError, true);
       assert.doesNotMatch(JSON.stringify(denial), new RegExp(deniedSymbol));
+      const calls: Array<[CodeGraphToolCall, RegExp]> = [
+        [
+          { name: 'codegraph_search', arguments: { query: ownSymbol, kind: 'function', limit: 3 } },
+          new RegExp(ownSymbol),
+        ],
+        [{ name: 'codegraph_callers', arguments: { symbol: ownSymbol, file: 'fixture.py', limit: 3 } }, /entrypoint/],
+        [
+          { name: 'codegraph_callees', arguments: { symbol: 'entrypoint', file: 'fixture.py', limit: 3 } },
+          new RegExp(ownSymbol),
+        ],
+        [{ name: 'codegraph_impact', arguments: { symbol: ownSymbol, file: 'fixture.py', depth: 2 } }, /entrypoint/],
+        [
+          { name: 'codegraph_node', arguments: { symbol: ownSymbol, file: 'fixture.py', line: 1, includeCode: true } },
+          new RegExp(ownSymbol),
+        ],
+        [{ name: 'codegraph_node', arguments: { file: 'fixture.py', offset: 2, limit: 1 } }, /2\t.*fixture_marker/],
+        [{ name: 'codegraph_node', arguments: { file: 'fixture.py', symbolsOnly: true } }, new RegExp(ownSymbol)],
+        [{ name: 'codegraph_explore', arguments: { query: ownSymbol, maxFiles: 1 } }, new RegExp(ownSymbol)],
+        [
+          {
+            name: 'codegraph_files',
+            arguments: { pattern: '*.py', format: 'flat', includeMetadata: true, maxDepth: 3 },
+          },
+          /fixture.py/,
+        ],
+      ];
+      for (const [call, expected] of calls) {
+        const response = await client.callTool({ name: call.name, arguments: { repo_id: own, ...call.arguments } });
+        assert.notEqual(response.isError, true, `${call.name}: ${JSON.stringify(response)}`);
+        assert.ok(Array.isArray(response.content) && response.content[0]?.type === 'text');
+        const payload = JSON.parse(response.content[0].text) as { result: string; indexed_commit: string };
+        assert.match(payload.result, expected, call.name);
+        assert.doesNotMatch(payload.result, new RegExp(deniedSymbol));
+        assert.doesNotMatch(payload.result, /\/workspace\/repo|oci:\/\//);
+        assert.equal(payload.indexed_commit, own === 'fixture-repo' ? commit : betaCommit);
+        const forbidden = await client.callTool({ name: call.name, arguments: { repo_id: denied, ...call.arguments } });
+        assert.equal(forbidden.isError, true);
+      }
     }
     const creates = (await readFile(dockerArgs, 'utf8'))
       .trim()

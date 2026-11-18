@@ -505,6 +505,96 @@ test('new PAT version requires explicit authorization before use for synchroniza
   }
 });
 
+test('reconciliation skips repositories awaiting credentials and resumes after explicit authorization', async () => {
+  const f = await fixture();
+  let maintenanceCalls = 0;
+  let builds = 0;
+  const worker = new IndexWorker({
+    ...f,
+    dataDir: '/unused',
+    allowedGitHosts: ['git.example.com'],
+    reconcileIntervalMs: 0,
+    maintenance: async () => {
+      maintenanceCalls++;
+    },
+    head: async () => 'a'.repeat(40),
+    healthy: async () => true,
+    build: async () => {
+      builds++;
+      return { path: '/candidate', commit: 'a'.repeat(40), generation: 'v1' };
+    },
+  });
+  try {
+    const original = (await f.store.getRepository('repo_1'))!;
+    await f.store.createRepository({ ...original, id: 'active_repo', codeup_id: '456', status: 'ready' });
+    await f.store.createRepository({ ...original, id: 'disabled_repo', codeup_id: '789', status: 'disabled' });
+    await f.store.updateUserCredential('user', 'user', f.cipher.encrypt('new-secret', 'user'));
+    await f.store.updateRepository('active_repo', { sync_credential_version: 2 });
+    await f.store.updateRepository('repo_1', {
+      status: 'credential_required',
+      error: 'SYNC_AUTHORIZATION_REQUIRED',
+      path: '/existing-index',
+      commit: 'a'.repeat(40),
+    });
+    const awaiting = await f.store.getRepository('repo_1');
+
+    // Exercise whole rounds deterministically without relying on wall-clock timers.
+    const reconcile = () => (worker as unknown as { reconcile(): Promise<void> }).reconcile();
+    await reconcile();
+    await reconcile();
+    assert.equal(maintenanceCalls, 2);
+    assert.deepEqual(await f.store.getRepository('repo_1'), awaiting);
+    assert.deepEqual(await f.store.listJobs('repo_1'), []);
+    assert.deepEqual(await f.store.listJobs('disabled_repo'), []);
+    assert.equal((await f.store.listJobs('active_repo')).length, 1);
+    assert.equal((await f.store.listJobs('active_repo'))[0].reason, 'reconcile');
+
+    // The explicit reauthorization path still works and re-enables later rounds.
+    await f.store.updateRepository('repo_1', { sync_credential_version: 2 });
+    const authorized = await worker.enqueue('repo_1', 'credential_changed');
+    await worker.start();
+    await waitFor(async () => (await f.store.getJob(authorized.id))?.status === 'succeeded');
+    assert.equal((await f.store.getRepository('repo_1'))?.status, 'ready');
+    await worker.stop();
+    await reconcile();
+    assert.ok((await f.store.listJobs('repo_1')).some((job) => job.reason === 'reconcile'));
+    assert.equal(builds, 1); // Only the active repository needed a new index.
+  } finally {
+    await worker.stop();
+    await f.close();
+  }
+});
+
+test('reconciliation rechecks credentials after reading a stale repository list', async (t) => {
+  const f = await fixture();
+  const worker = new IndexWorker({
+    ...f,
+    dataDir: '/unused',
+    allowedGitHosts: ['git.example.com'],
+    reconcileIntervalMs: 0,
+  });
+  try {
+    const listRepositories = f.store.listRepositories.bind(f.store);
+    t.mock.method(f.store, 'listRepositories', async () => {
+      const snapshot = await listRepositories();
+      // Simulate PAT rotation after the round's snapshot but before the enqueue transaction.
+      await f.store.updateUserCredential('user', 'user', f.cipher.encrypt('new-secret', 'user'));
+      await f.store.updateRepository('repo_1', {
+        status: 'credential_required',
+        error: 'SYNC_AUTHORIZATION_REQUIRED',
+      });
+      return snapshot;
+    });
+    await (worker as unknown as { reconcile(): Promise<void> }).reconcile();
+    assert.deepEqual(await f.store.listJobs('repo_1'), []);
+    assert.equal((await f.store.getRepository('repo_1'))?.status, 'credential_required');
+    assert.equal((await f.store.getRepository('repo_1'))?.error, 'SYNC_AUTHORIZATION_REQUIRED');
+  } finally {
+    await worker.stop();
+    await f.close();
+  }
+});
+
 test('PAT rotation during indexing blocks publication', async () => {
   const f = await fixture();
   let release!: () => void;

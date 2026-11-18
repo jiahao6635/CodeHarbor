@@ -30,6 +30,10 @@ export function formatDuration(ms: number | null | undefined): string {
   return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分`;
 }
 
+export function formatKeyLifetime(expiresIn: number | null): string {
+  return expiresIn === null ? '无限期（无截止日期）' : `${Math.round(expiresIn / 86_400)} 天`;
+}
+
 /** Remaining validity expressed for humans; expired keys read as such. */
 export function formatExpiry(expiresAt: number | null): string {
   if (expiresAt === null) return '永不过期';

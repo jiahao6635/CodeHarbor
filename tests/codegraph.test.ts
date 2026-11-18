@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 import { CodeGraphClient } from '../src/codegraph.js';
+import type { CodeGraphToolCall } from '../src/codegraph-tools.js';
 
 const bin = resolve(process.env.CODEGRAPH_TEST_BIN ?? './node_modules/.bin/codegraph');
 const run = promisify(execFile);
@@ -25,7 +26,10 @@ test('real CodeGraph queries two independent indexes and switches the published 
       await mkdir(path);
       const name = i === 1 ? 'beta_symbol' : 'alpha_symbol';
       const marker = ['ALPHA_OLD', 'BETA_ONLY', 'ALPHA_NEW'][i];
-      await writeFile(join(path, 'app.py'), `def ${name}():\n    return "${marker}"\n`);
+      await writeFile(
+        join(path, 'app.py'),
+        `def ${name}():\n    return "${marker}"\n\ndef entrypoint():\n    return ${name}()\n`,
+      );
       await run(bin, ['init', path, '--yes'], {
         env: { ...process.env, DO_NOT_TRACK: '1', CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_NO_WATCH: '1' },
         timeout: 20_000,
@@ -39,6 +43,39 @@ test('real CodeGraph queries two independent indexes and switches the published 
     assert.match(beta, /BETA_ONLY/);
     assert.doesNotMatch(beta, /ALPHA_OLD|ALPHA_NEW/);
     assert.doesNotMatch(alpha, new RegExp(root));
+
+    const calls: Array<[CodeGraphToolCall, RegExp]> = [
+      [{ name: 'codegraph_search', arguments: { query: 'alpha_symbol', kind: 'function', limit: 3 } }, /alpha_symbol/],
+      [{ name: 'codegraph_callers', arguments: { symbol: 'alpha_symbol', file: 'app.py', limit: 3 } }, /entrypoint/],
+      [{ name: 'codegraph_callees', arguments: { symbol: 'entrypoint', file: 'app.py', limit: 3 } }, /alpha_symbol/],
+      [{ name: 'codegraph_impact', arguments: { symbol: 'alpha_symbol', file: 'app.py', depth: 2 } }, /entrypoint/],
+      [
+        { name: 'codegraph_node', arguments: { symbol: 'alpha_symbol', includeCode: true, file: 'app.py', line: 1 } },
+        /ALPHA_OLD/,
+      ],
+      [{ name: 'codegraph_node', arguments: { file: 'app.py', offset: 2, limit: 1 } }, /2\t.*ALPHA_OLD/],
+      [{ name: 'codegraph_node', arguments: { file: 'app.py', symbolsOnly: true } }, /alpha_symbol/],
+      [{ name: 'codegraph_explore', arguments: { query: 'alpha_symbol', maxFiles: 1 } }, /ALPHA_OLD/],
+      [
+        { name: 'codegraph_files', arguments: { pattern: '*.py', format: 'flat', includeMetadata: true, maxDepth: 3 } },
+        /app.py/,
+      ],
+    ];
+    for (const [call, expected] of calls) {
+      const result = await graph.withToolQuery((callTool) => callTool(paths[0], call));
+      assert.match(result, expected, call.name);
+      assert.doesNotMatch(result, /BETA_ONLY|ALPHA_NEW/);
+      assert.ok(!result.includes(root));
+    }
+    await assert.rejects(
+      graph.withToolQuery((callTool) =>
+        callTool(paths[0], {
+          name: 'codegraph_node',
+          arguments: { file: '../beta-v1/app.py' },
+        }),
+      ),
+      /Invalid/,
+    );
 
     let currentPath = paths[0];
     let release!: () => void;

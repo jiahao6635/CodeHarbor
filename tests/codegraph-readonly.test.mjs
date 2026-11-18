@@ -21,7 +21,10 @@ test('real CodeGraph MCP reads a sealed index with a read-only root and no mount
     execFileSync('docker', args, { encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
   let client;
   try {
-    await writeFile(join(dir, 'example.py'), 'def magnolia_readonly_probe():\n    return "orchid-readonly-ok"\n');
+    await writeFile(
+      join(dir, 'example.py'),
+      'def magnolia_readonly_probe():\n    return "orchid-readonly-ok"\n\ndef orchid_caller():\n    return magnolia_readonly_probe()\n',
+    );
     await writeFile(
       join(dir, 'Dockerfile'),
       `${[
@@ -55,7 +58,18 @@ test('real CodeGraph MCP reads a sealed index with a read-only root and no mount
     client = new Client({ name: 'codeharbor-readonly-test', version: '1' });
     await client.connect(transport, { timeout: 30_000 });
     const { tools } = await client.listTools(undefined, { timeout: 30_000 });
-    assert.ok(tools.some((tool) => tool.name === 'codegraph_explore'));
+    assert.deepEqual(
+      tools.map((tool) => tool.name).sort(),
+      [
+        'codegraph_search',
+        'codegraph_callers',
+        'codegraph_callees',
+        'codegraph_impact',
+        'codegraph_node',
+        'codegraph_explore',
+        'codegraph_files',
+      ].sort(),
+    );
     const result = await client.callTool(
       {
         name: 'codegraph_explore',
@@ -69,6 +83,29 @@ test('real CodeGraph MCP reads a sealed index with a read-only root and no mount
     );
     assert.notEqual(result.isError, true);
     assert.match(JSON.stringify(result.content), /magnolia_readonly_probe/);
+    for (const [name, args, expected] of [
+      ['codegraph_search', { query: 'magnolia', kind: 'function', limit: 3 }, /magnolia_readonly_probe/],
+      ['codegraph_callers', { symbol: 'magnolia_readonly_probe', file: 'example.py', limit: 3 }, /orchid_caller/],
+      ['codegraph_callees', { symbol: 'orchid_caller', file: 'example.py', limit: 3 }, /magnolia_readonly_probe/],
+      ['codegraph_impact', { symbol: 'magnolia_readonly_probe', file: 'example.py', depth: 2 }, /orchid_caller/],
+      [
+        'codegraph_node',
+        { symbol: 'magnolia_readonly_probe', file: 'example.py', line: 1, includeCode: true },
+        /orchid-readonly-ok/,
+      ],
+      ['codegraph_node', { file: 'example.py', offset: 2, limit: 1 }, /2\t.*orchid-readonly-ok/],
+      ['codegraph_node', { file: 'example.py', symbolsOnly: true }, /magnolia_readonly_probe/],
+      ['codegraph_explore', { query: 'magnolia_readonly_probe', maxFiles: 1 }, /orchid-readonly-ok/],
+      ['codegraph_files', { pattern: '*.py', format: 'flat', includeMetadata: true, maxDepth: 3 }, /example.py/],
+    ]) {
+      const response = await client.callTool(
+        { name, arguments: { ...args, projectPath: '/workspace/repo' } },
+        undefined,
+        { timeout: 30_000 },
+      );
+      assert.notEqual(response.isError, true, `${name}: ${JSON.stringify(response)}`);
+      assert.match(response.content.map((part) => part.text).join('\n'), expected, name);
+    }
     await client.close();
     client = undefined;
     docker('wait', name);

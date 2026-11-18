@@ -281,13 +281,15 @@ Idempotency-Key: <client-generated-id>
 |---|---|---|
 | `list_repositories` | `cursor?`, `limit?` | 列出当前 Key 和用户可访问的已接入仓库 |
 | `get_repository_status` | `repo_id` | 获取索引 commit、更新时间、状态和滞后提示 |
-| `codegraph_explore` | `repo_id`, `query` | 查询相关源码、代码关系和上下文 |
-| `codegraph_search` | `repo_id`, `query`, `limit?` | 查询仓库符号，选配 |
-| `codegraph_callers` | `repo_id`, `symbol`, `limit?` | 查询调用方，选配 |
-| `codegraph_callees` | `repo_id`, `symbol`, `limit?` | 查询被调用方，选配 |
-| `codegraph_impact` | `repo_id`, `symbol`, `depth?` | 查询影响范围，选配 |
+| `codegraph_explore` | `repo_id`, `query`, `maxFiles?` | 主工具：源码、代码关系和上下文 |
+| `codegraph_search` | `repo_id`, `query`, `kind?`, `limit?` | 查询仓库符号位置 |
+| `codegraph_callers` | `repo_id`, `symbol`, `file?`, `limit?` | 查询调用方 |
+| `codegraph_callees` | `repo_id`, `symbol`, `file?`, `limit?` | 查询被调用方 |
+| `codegraph_impact` | `repo_id`, `symbol`, `file?`, `depth?` | 查询影响范围 |
+| `codegraph_node` | `repo_id`, `symbol?`, `file?`, `includeCode?`, `offset?`, `limit?`, `symbolsOnly?`, `line?` | 符号详情或带行号文件源码，至少指定 symbol/file 之一 |
+| `codegraph_files` | `repo_id`, `path?`, `pattern?`, `format?`, `includeMetadata?`, `maxDepth?` | 索引目录树与语言/符号统计 |
 
-表中为 CodeHarbor 对外拟定的稳定契约，具体参数须映射并限制到**固定上游版本的真实 schema**。默认优先只开放前三项；如开放其他 CodeGraph 工具，需配置对应的 `CODEGRAPH_MCP_TOOLS`，启动时 `tools/list` 检查名称和 schema，发现不兼容则 readiness 失败，不盲目透传。
+当前实现开放全部 9 项。7 个代码工具的功能参数映射到**固定上游 1.6.2 的真实 schema**，用必填 `repo_id` 替代 `projectPath`，并限制输入/输出、数量和深度。内部协议使用固定工具白名单和共享参数验证；查询时检查所调用工具的真实 schema，发现不兼容则拒绝调用，不盲目透传。运行时显式设置 `CODEGRAPH_MCP_TOOLS=search,callers,callees,impact,node,explore,files`；只读补丁确保显式工具配置不再被小仓库隐藏规则覆盖。镜像模式升级需要重建基础运行时与仓库镜像。
 
 结果包装示例：
 

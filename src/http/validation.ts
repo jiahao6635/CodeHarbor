@@ -16,11 +16,13 @@ export const identifier = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 export const userId = z.string().regex(/^[A-Za-z0-9_.@-]{1,128}$/);
 export const keyPrefix = z.string().regex(/^ch_[A-Za-z0-9_-]{8}$/);
 export const scope = z.enum(['read', 'write']);
+/** Explicit null means no deadline; omitted values keep the route's default lifetime. */
 export const expiresIn = z
   .number()
   .int()
   .min(60)
-  .max(90 * 86_400);
+  .max(90 * 86_400)
+  .nullable();
 export const positivePage = z.coerce.number().int().min(1);
 
 /** Query strings coerce to one value; repeated parameters are rejected. */

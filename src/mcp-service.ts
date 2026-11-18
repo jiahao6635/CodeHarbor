@@ -1,10 +1,17 @@
 import { createServer, type Server } from 'node:http';
 import net from 'node:net';
 import { isAbsolute } from 'node:path';
+import { type CodeGraphToolCall, validCodeGraphToolCall } from './codegraph-tools.js';
 import { createLogger } from './logger.js';
 import { createMcpHandler, type McpRepository } from './mcp.js';
 
 export interface McpServiceBackend {
+  callTool?(
+    authorization: string,
+    repoId: string,
+    call: CodeGraphToolCall,
+    signal: AbortSignal,
+  ): Promise<{ repository: McpRepository; result: string } | null>;
   authenticate(authorization: string): Promise<boolean>;
   list(authorization: string, signal?: AbortSignal): Promise<McpRepository[]>;
   get(authorization: string, repoId: string, signal?: AbortSignal): Promise<McpRepository | null>;
@@ -129,6 +136,16 @@ export class SocketMcpBackend implements McpServiceBackend {
     signal: AbortSignal,
   ): Promise<{ repository: McpRepository; result: string } | null> {
     const response = await this.request({ op: 'explore', authorization, repoId, query }, signal);
+    return this.queryResult(response);
+  }
+  async callTool(authorization: string, repoId: string, call: CodeGraphToolCall, signal: AbortSignal) {
+    if (!validCodeGraphToolCall(call)) throw new Error('Invalid tool arguments');
+    if (call.name === 'codegraph_explore' && Object.keys(call.arguments).length === 1) {
+      return this.explore(authorization, repoId, call.arguments.query as string, signal);
+    }
+    return this.queryResult(await this.request({ op: 'call_tool', authorization, repoId, call }, signal));
+  }
+  private queryResult(response: unknown): { repository: McpRepository; result: string } | null {
     if (response === null) return null;
     if (!response || typeof response !== 'object' || Array.isArray(response)) throw new Error('Invalid query response');
     const row = response as Record<string, unknown>;
@@ -167,6 +184,7 @@ export function createMcpService(options: {
   close(): Promise<void>;
 } {
   if (!options.allowedHosts.length) throw new Error('MCP allowed hosts are required');
+  const remoteCallTool = options.backend.callTool?.bind(options.backend);
   const handler = createMcpHandler<string>({
     allowedHosts: options.allowedHosts,
     allowedOrigins: options.allowedOrigins,
@@ -178,6 +196,7 @@ export function createMcpService(options: {
     listRepositories: (auth, signal) => options.backend.list(auth, signal),
     getRepository: (auth, id, signal) => options.backend.get(auth, id, signal),
     remoteExplore: (auth, id, query, signal) => options.backend.explore(auth, id, query, signal),
+    ...(remoteCallTool ? { remoteCallTool } : {}),
   });
   const server = createServer((req, res) => {
     const started = performance.now();

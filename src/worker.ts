@@ -85,7 +85,9 @@ export class IndexWorker {
       this.log.error({ err: error }, 'Index maintenance failed');
     }
     for (const repo of await this.options.store.listRepositories()) {
-      if (repo.status !== 'disabled') await this.enqueue(repo.id, 'reconcile');
+      // A timer cannot renew consent; wait for the explicit sync-credential authorization flow.
+      if (repo.status !== 'disabled' && repo.status !== 'credential_required')
+        await this.enqueueJob(repo.id, 'reconcile', true);
     }
   }
 
@@ -97,10 +99,17 @@ export class IndexWorker {
   }
 
   async enqueue(repoId: string, reason: string): Promise<JobRecord> {
+    const job = await this.enqueueJob(repoId, reason);
+    if (!job) throw new Error('Repository not found');
+    return job;
+  }
+
+  private async enqueueJob(repoId: string, reason: string, reconcile = false): Promise<JobRecord | null> {
     const store = this.options.store;
     const job = await store.transaction(async (tx) => {
-      const repo = await tx.getRepository(repoId);
-      if (!repo || repo.status === 'disabled') throw new Error('Repository not found');
+      // Lock the fresh row so PAT rotation cannot invalidate it between this check and the write.
+      const repo = await tx.getRepository(repoId, { forUpdate: reconcile });
+      if (!repo || repo.status === 'disabled' || (reconcile && repo.status === 'credential_required')) return null;
       const jobs = await tx.listJobs(repoId);
       const queued = jobs.find((item) => item.status === 'queued');
       const preserveDeletion = repo.status === 'branch_deleted' && jobs.some((item) => item.status === 'running');
@@ -126,7 +135,7 @@ export class IndexWorker {
         await tx.updateRepository(repoId, { status: repo.path ? 'updating' : 'pending', error: null });
       return created;
     });
-    this.kick();
+    if (job) this.kick();
     return job;
   }
 

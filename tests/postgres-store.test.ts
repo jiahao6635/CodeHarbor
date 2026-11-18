@@ -139,6 +139,24 @@ test('PostgreSQL store round-trips records, enforces the instance lock and fails
     assert.equal(empty.buildDurationSumMs24h, 0);
     assert.equal(empty.buildDurationMaxMs24h, null);
 
+    const contender = new pg.Client({ connectionString: database.url });
+    await contender.connect();
+    try {
+      await store.transaction(async (tx) => {
+        assert.equal((await tx.getRepository('r', { forUpdate: true }))?.id, 'r');
+        await assert.rejects(
+          contender.query('SELECT id FROM repositories WHERE id = $1 FOR UPDATE NOWAIT', ['r']),
+          (error: unknown) => error instanceof pg.DatabaseError && error.code === '55P03',
+        );
+      });
+      assert.equal(
+        (await contender.query('SELECT id FROM repositories WHERE id = $1 FOR UPDATE NOWAIT', ['r'])).rowCount,
+        1,
+      );
+    } finally {
+      await contender.end();
+    }
+
     await assert.rejects(
       store.transaction(async (tx) => {
         await tx.updateUserCredential('u', 'bad', 'bad');

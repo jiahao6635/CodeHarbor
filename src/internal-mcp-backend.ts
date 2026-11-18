@@ -1,13 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { Authorization, Principal } from './authorization.js';
-import type { GraphClient } from './codegraph.js';
+import { type GraphClient, withGraphToolQuery } from './codegraph.js';
+import { type CodeGraphToolCall, type CodeGraphToolName, validCodeGraphToolCall } from './codegraph-tools.js';
 import { type AuditEvent, hashQuery } from './http/context.js';
 import { HttpError } from './http/errors.js';
 import { internalRepository } from './http/views.js';
 import type { InternalMcpBackend } from './internal-mcp.js';
 import type { RepositoryRecord, StoreBackend } from './store.js';
 
-type InternalTool = 'list_repositories' | 'get_repository_status' | 'codegraph_explore';
+type InternalTool = 'list_repositories' | 'get_repository_status' | CodeGraphToolName;
 type Outcome = 'success' | 'error';
 
 const REPO_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -45,7 +46,55 @@ export function createInternalMcpBackend(deps: {
     });
   }
 
+  async function callTool(header: string, repoId: string, call: CodeGraphToolCall, signal: AbortSignal) {
+    if (!validCodeGraphToolCall(call)) throw new Error('Invalid tool arguments');
+    let principal: Principal | undefined;
+    let outcome: Outcome = 'error';
+    try {
+      return await withGraphToolQuery(
+        graph,
+        async (queryTool) => {
+          if (signal.aborted) throw new Error('Request cancelled');
+          principal = await principalFrom(header);
+          let repo: RepositoryRecord;
+          try {
+            repo = await authorization.queryVisible(principal, repoId, signal);
+          } catch (error) {
+            if (isNotFound(error)) return null;
+            throw error;
+          }
+          if (!repo.path || !repo.commit) return null;
+          const result = await queryTool(repo.path, call, signal, { repoId: repo.id, commit: repo.commit });
+          if (signal.aborted) throw new Error('Request cancelled');
+          const confirmed = await principalFrom(header);
+          let current: RepositoryRecord;
+          try {
+            current = await authorization.queryVisible(confirmed, repoId, signal);
+          } catch (error) {
+            if (isNotFound(error)) return null;
+            throw error;
+          }
+          if (signal.aborted || current.path !== repo.path || current.commit !== repo.commit) return null;
+          outcome = 'success';
+          return { repository: internalRepository(repo), result };
+        },
+        signal,
+      );
+    } finally {
+      record(
+        call.name,
+        outcome,
+        principal,
+        repoId,
+        call.name === 'codegraph_explore' && Object.keys(call.arguments).length === 1
+          ? (call.arguments.query as string)
+          : JSON.stringify(call),
+      );
+    }
+  }
+
   return {
+    callTool,
     async probe(signal) {
       await store.checkHealth();
       await graph.probe(signal);
@@ -86,39 +135,7 @@ export function createInternalMcpBackend(deps: {
         record('get_repository_status', outcome, principal, repoId);
       }
     },
-    async explore(header, repoId, query, signal) {
-      let principal: Principal | undefined;
-      let outcome: Outcome = 'error';
-      try {
-        return await graph.withQuery(async (explore) => {
-          if (signal.aborted) throw new Error('Request cancelled');
-          principal = await principalFrom(header);
-          let repo: RepositoryRecord;
-          try {
-            repo = await authorization.queryVisible(principal, repoId, signal);
-          } catch (error) {
-            if (isNotFound(error)) return null;
-            throw error;
-          }
-          if (!repo.path || !repo.commit) return null;
-          const result = await explore(repo.path, query, signal, { repoId: repo.id, commit: repo.commit });
-          if (signal.aborted) throw new Error('Request cancelled');
-          // Re-authorize after the query so a revocation during a long query is never leaked.
-          const confirmed = await principalFrom(header);
-          let current: RepositoryRecord;
-          try {
-            current = await authorization.queryVisible(confirmed, repoId, signal);
-          } catch (error) {
-            if (isNotFound(error)) return null;
-            throw error;
-          }
-          if (signal.aborted || current.path !== repo.path || current.commit !== repo.commit) return null;
-          outcome = 'success';
-          return { repository: internalRepository(repo), result };
-        }, signal);
-      } finally {
-        record('codegraph_explore', outcome, principal, repoId, query);
-      }
-    },
+    explore: (header, repoId, query, signal) =>
+      callTool(header, repoId, { name: 'codegraph_explore', arguments: { query } }, signal),
   };
 }

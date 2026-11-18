@@ -92,7 +92,7 @@ export interface CreatedKey {
   prefix: string;
   scope: Scope;
   repos: string[] | null;
-  expires_at: number;
+  expires_at: number | null;
 }
 
 export interface BootstrapSession {
@@ -105,7 +105,7 @@ export interface BootstrapKey {
   token: string;
   prefix: string;
   scope: Scope;
-  expires_in: number;
+  expires_in: number | null;
 }
 
 export interface UserSummary {

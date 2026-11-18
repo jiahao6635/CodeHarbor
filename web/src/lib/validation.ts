@@ -46,6 +46,35 @@ export const EXPIRY_OPTIONS = [
   { label: '7 天', seconds: 7 * 86_400 },
   { label: '30 天', seconds: 30 * 86_400 },
   { label: '90 天', seconds: 90 * 86_400 },
+  { label: '无限期（无截止日期）', seconds: null },
 ] as const;
 
+export const DEFAULT_EXPIRES_IN = 30 * 86_400;
 export const MAX_EXPIRES_IN = 90 * 86_400;
+export const UNLIMITED_EXPIRY_HELP = '无截止日期，仍可手动撤销；云效PAT失效仍可能影响使用';
+
+type ExpiryOption = (typeof EXPIRY_OPTIONS)[number];
+
+/** Native selects use "null" for unlimited validity, never an empty value or zero. */
+export function parseExpiry(value: string): number | null {
+  const option = EXPIRY_OPTIONS.find((option) => String(option.seconds) === value);
+  if (!option) throw new Error('Invalid key expiry');
+  return option.seconds;
+}
+
+export function childExpiryOptions(parentExpiry: number | null | undefined, now = Date.now()): ExpiryOption[] {
+  return EXPIRY_OPTIONS.filter(
+    (option) =>
+      parentExpiry === null ||
+      (parentExpiry !== undefined && option.seconds !== null && now + option.seconds * 1000 <= parentExpiry),
+  );
+}
+
+/** Undefined means unselected/unavailable; null is an explicit unlimited selection. */
+export function resolveChildExpiry(options: readonly ExpiryOption[], chosen: number | null | undefined) {
+  if (chosen !== undefined && options.some((option) => option.seconds === chosen)) return chosen;
+  return options
+    .map((option) => option.seconds)
+    .filter((seconds) => seconds !== null)
+    .at(-1);
+}

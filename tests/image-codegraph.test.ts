@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import test from 'node:test';
+import type { CodeGraphToolCall } from '../src/codegraph-tools.js';
 import {
   IMAGE_PROJECT_PATH,
   ImageCodeGraphClient,
@@ -364,4 +365,214 @@ test('overlarge upstream responses are discarded and cleaned up', async () => {
     /Invalid image query result/,
   );
   assert.equal(closed, 1);
+});
+
+const toolCalls: CodeGraphToolCall[] = [
+  { name: 'codegraph_search', arguments: { query: 'auth', kind: 'function', limit: 7 } },
+  { name: 'codegraph_callers', arguments: { symbol: 'login', file: 'src/auth.ts', limit: 8 } },
+  { name: 'codegraph_callees', arguments: { symbol: 'login', file: 'src/auth.ts', limit: 9 } },
+  { name: 'codegraph_impact', arguments: { symbol: 'login', file: 'src/auth.ts', depth: 3 } },
+  { name: 'codegraph_node', arguments: { symbol: 'login', file: 'src/auth.ts', includeCode: true, line: 20 } },
+  { name: 'codegraph_node', arguments: { file: 'src/auth.ts', offset: 10, limit: 12, symbolsOnly: false } },
+  { name: 'codegraph_explore', arguments: { query: 'auth login', maxFiles: 6 } },
+  {
+    name: 'codegraph_files',
+    arguments: { path: 'src', pattern: '**/*.ts', format: 'flat', includeMetadata: false, maxDepth: 4 },
+  },
+];
+
+test('image client forwards every tool argument with immutable identity and sanitizes every result', async () => {
+  const requests: unknown[] = [];
+  const client = new ImageCodeGraphClient(
+    backend({
+      callTool: async (request) => {
+        requests.push(request.call);
+        assert.equal(request.digest, digest);
+        assert.equal(request.repoId, identity.repoId);
+        assert.equal(request.commit, identity.commit);
+        assert.equal(request.projectPath, IMAGE_PROJECT_PATH);
+        assert.equal(request.readOnlyRoot, true);
+        return `${IMAGE_PROJECT_PATH}/src/auth.ts ${reference}`;
+      },
+      explore: async () => {
+        throw new Error('legacy path must not drop arguments');
+      },
+    }),
+  );
+  for (const call of toolCalls) {
+    assert.equal(
+      await client.withToolQuery((query) => query(reference, call, undefined, identity)),
+      '[repository]/src/auth.ts [repository]',
+    );
+  }
+  await client.withQuery((explore) => explore(reference, 'legacy', undefined, identity));
+  assert.deepEqual(requests, [...toolCalls, { name: 'codegraph_explore', arguments: { query: 'legacy' } }]);
+});
+
+test('invalid image tool names, injected paths and arguments never reach the backend or fence it', async () => {
+  let calls = 0;
+  let closes = 0;
+  const client = new ImageCodeGraphClient(
+    backend({
+      callTool: async () => {
+        calls++;
+        return 'ok';
+      },
+      close: async () => {
+        closes++;
+      },
+    }),
+  );
+  const invalid = [
+    { name: 'codegraph_status', arguments: {} },
+    { name: 'shell', arguments: {} },
+    { name: 'codegraph_explore', arguments: { query: 'auth', projectPath: IMAGE_PROJECT_PATH } },
+    { name: 'codegraph_explore', arguments: { query: 'auth', other: true } },
+    { name: 'codegraph_explore', arguments: { query: 'auth', maxFiles: 0 } },
+    { name: 'codegraph_search', arguments: { query: 'auth', limit: 1.5 } },
+    { name: 'codegraph_node', arguments: {} },
+    { name: 'codegraph_node', arguments: { file: '../secret' } },
+    { name: 'codegraph_callers', arguments: { symbol: 'auth', file: '/etc/passwd' } },
+    { name: 'codegraph_files', arguments: { path: 'src/../../secret' } },
+    { name: 'codegraph_files', arguments: { pattern: '..\\secret' } },
+  ];
+  for (const call of invalid) {
+    await assert.rejects(
+      client.withToolQuery((query) => query(reference, call as CodeGraphToolCall, undefined, identity)),
+      /Invalid CodeGraph tool call/,
+    );
+  }
+  await assert.rejects(
+    client.withToolQuery((query) => query('/tmp/repo', toolCalls[0], undefined, identity)),
+    /Invalid repository image reference/,
+  );
+  await assert.rejects(
+    client.withToolQuery((query) => query(reference, toolCalls[0])),
+    /identity required/,
+  );
+  assert.equal(calls, 0);
+  assert.equal(closes, 0);
+  assert.equal(client.isUnsafe(), false);
+});
+
+test('legacy image adapters support query-only explore and reject rather than drop new arguments', async () => {
+  const queries: string[] = [];
+  const client = new ImageCodeGraphClient(
+    backend({
+      explore: async ({ query }) => {
+        queries.push(query);
+        return 'ok';
+      },
+    }),
+  );
+  assert.equal(
+    await client.withToolQuery((query) =>
+      query(reference, { name: 'codegraph_explore', arguments: { query: 'legacy' } }, undefined, identity),
+    ),
+    'ok',
+  );
+  for (const call of toolCalls) {
+    await assert.rejects(
+      client.withToolQuery((query) => query(reference, call, undefined, identity)),
+      /does not support/,
+    );
+  }
+  await assert.rejects(
+    client.withQuery((explore) =>
+      explore(reference, { query: 'legacy', maxFiles: 2 } as unknown as string, undefined, identity),
+    ),
+    /Invalid query/,
+  );
+  assert.deepEqual(queries, ['legacy']);
+  assert.equal(client.isUnsafe(), false);
+});
+
+test('tool cancellation inherits the operation signal and holds the shared lock until cleanup before publication', async () => {
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let cleanup!: () => void;
+  const cleanupGate = new Promise<void>((resolve) => {
+    cleanup = resolve;
+  });
+  let aborted!: () => void;
+  const cancelled = new Promise<void>((resolve) => {
+    aborted = resolve;
+  });
+  const events: string[] = [];
+  const client = new ImageCodeGraphClient(
+    backend({
+      callTool: async ({ signal }) => {
+        entered();
+        await new Promise<void>((resolve) =>
+          signal.addEventListener(
+            'abort',
+            () => {
+              aborted();
+              resolve();
+            },
+            { once: true },
+          ),
+        );
+        await cleanupGate;
+        events.push('cleaned');
+        throw new ImageRuntimeCancelledError();
+      },
+      close: async () => {
+        events.push('close');
+      },
+      explore: async () => {
+        events.push('legacy');
+        return 'ok';
+      },
+    }),
+    undefined,
+    1,
+  );
+  const controller = new AbortController();
+  const pending = client.withToolQuery(
+    (query) => query(reference, toolCalls[0], undefined, identity),
+    controller.signal,
+  );
+  const rejected = assert.rejects(pending, ImageRuntimeCancelledError);
+  await started;
+  const publication = client.withExclusive(async () => {
+    events.push('publish');
+  });
+  controller.abort();
+  await cancelled;
+  assert.deepEqual(events, []);
+  cleanup();
+  await rejected;
+  await publication;
+  assert.deepEqual(events, ['cleaned', 'close', 'publish', 'close']);
+  assert.equal(client.isUnsafe(), false);
+});
+
+test('uncertain tool cleanup and oversized tool responses fence the same image runtime', async () => {
+  for (const oversized of [false, true]) {
+    let closes = 0;
+    const client = new ImageCodeGraphClient(
+      backend({
+        callTool: async () => {
+          if (!oversized) throw new Error('transport lost');
+          return 'x'.repeat(1024 * 1024 + 1);
+        },
+        close: async () => {
+          closes++;
+        },
+      }),
+    );
+    await assert.rejects(
+      client.withToolQuery((query) => query(reference, toolCalls[0], undefined, identity)),
+      oversized ? /Invalid image query result/ : /transport lost/,
+    );
+    assert.equal(closes, 1);
+    assert.equal(client.isUnsafe(), true);
+    await assert.rejects(
+      client.withQuery((explore) => explore(reference, 'legacy', undefined, identity)),
+      /restart required/,
+    );
+  }
 });

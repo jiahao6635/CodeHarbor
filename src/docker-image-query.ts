@@ -5,7 +5,14 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/sdk/shared/stdio.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
-import { IMAGE_PROJECT_PATH, type ImageDigest, type ImageQueryBackend, validImageIdentity } from './image-codegraph.js';
+import { assertCodeGraphToolSchema, CODEGRAPH_MCP_TOOLS, validCodeGraphToolCall } from './codegraph-tools.js';
+import {
+  IMAGE_PROJECT_PATH,
+  type ImageDigest,
+  type ImageQueryBackend,
+  type ImageToolQueryRequest,
+  validImageIdentity,
+} from './image-codegraph.js';
 import type { ImageCreationFence } from './image-creation-fence.js';
 import { ImageRuntimeRequestError, ImageRuntimeUncertainError } from './image-runtime-errors.js';
 
@@ -51,6 +58,8 @@ export function dockerCreateArguments(digest: string, name: string, owner: strin
     'HOME=/tmp',
     '--env',
     'CODEGRAPH_MCP_READ_ONLY=1',
+    '--env',
+    `CODEGRAPH_MCP_TOOLS=${CODEGRAPH_MCP_TOOLS}`,
     '--env',
     'CODEGRAPH_NO_DAEMON=1',
     '--env',
@@ -351,10 +360,31 @@ export class DockerImageQueryBackend implements ImageQueryBackend {
   }
 
   async explore(request: Parameters<ImageQueryBackend['explore']>[0]): Promise<string> {
+    if (
+      Object.keys(request).length !== 7 ||
+      !['digest', 'repoId', 'commit', 'query', 'projectPath', 'readOnlyRoot', 'signal'].every((key) =>
+        Object.hasOwn(request, key),
+      )
+    )
+      throw new ImageRuntimeRequestError('Invalid repository image request');
+    const { query, ...input } = request;
+    return this.callTool({ ...input, call: { name: 'codegraph_explore', arguments: { query } } });
+  }
+
+  async callTool(request: ImageToolQueryRequest): Promise<string> {
+    if (
+      Object.keys(request).length !== 7 ||
+      !['digest', 'repoId', 'commit', 'call', 'projectPath', 'readOnlyRoot', 'signal'].every((key) =>
+        Object.hasOwn(request, key),
+      ) ||
+      !validCodeGraphToolCall(request.call)
+    )
+      throw new ImageRuntimeRequestError('Invalid repository image request');
+    const call = { name: request.call.name, arguments: { ...request.call.arguments } };
     const controller = new AbortController();
     const signal = AbortSignal.any([request.signal, controller.signal]);
     this.controllers.add(controller);
-    const operation = this.execute({ ...request, signal });
+    const operation = this.execute({ ...request, call, signal });
     this.operations.add(operation);
     try {
       const result = await operation;
@@ -374,16 +404,14 @@ export class DockerImageQueryBackend implements ImageQueryBackend {
     }
   }
 
-  private async execute(request: Parameters<ImageQueryBackend['explore']>[0]): Promise<string> {
+  private async execute(request: ImageToolQueryRequest): Promise<string> {
     if (
       this.uncertain ||
       request.readOnlyRoot !== true ||
       request.projectPath !== IMAGE_PROJECT_PATH ||
       !imagePattern.test(request.digest) ||
       !validImageIdentity(request) ||
-      typeof request.query !== 'string' ||
-      !request.query.trim() ||
-      request.query.length > 2000
+      !validCodeGraphToolCall(request.call)
     )
       throw new Error('Invalid repository image request');
     if (
@@ -470,16 +498,9 @@ export class DockerImageQueryBackend implements ImageQueryBackend {
       this.clients.add(client);
       await client.connect(transport, { timeout: this.operationTimeoutMs, signal: request.signal });
       const { tools } = await client.listTools(undefined, { timeout: this.operationTimeoutMs, signal: request.signal });
-      const tool = tools.find((entry) => entry.name === 'codegraph_explore');
-      if (
-        !tool?.inputSchema?.properties ||
-        !('query' in tool.inputSchema.properties) ||
-        !('projectPath' in tool.inputSchema.properties)
-      ) {
-        throw new Error('Incompatible readonly CodeGraph runtime');
-      }
+      assertCodeGraphToolSchema(tools, request.call);
       const result = await client.callTool(
-        { name: 'codegraph_explore', arguments: { projectPath: IMAGE_PROJECT_PATH, query: request.query } },
+        { name: request.call.name, arguments: { ...request.call.arguments, projectPath: IMAGE_PROJECT_PATH } },
         undefined,
         { timeout: this.operationTimeoutMs, signal: request.signal },
       );
