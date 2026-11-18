@@ -1,7 +1,8 @@
-/** The path is internal to every repository image, never supplied by an MCP client. */
+import { type CodeGraphToolCall, type GraphToolQuery, validCodeGraphToolCall } from './codegraph-tools.js';
 import { ImageRuntimeRequestError } from './image-runtime-errors.js';
 import { queryConcurrency } from './query-concurrency.js';
 
+/** The path is internal to every repository image, never supplied by an MCP client. */
 export const IMAGE_PROJECT_PATH = '/workspace/repo' as const;
 
 export type ImageDigest = `sha256:${string}`;
@@ -16,21 +17,25 @@ export function validImageIdentity(identity: ImageRepositoryIdentity | undefined
   );
 }
 
+export type ImageToolQueryRequest = {
+  digest: ImageDigest;
+  repoId: string;
+  commit: string;
+  call: CodeGraphToolCall;
+  projectPath: typeof IMAGE_PROJECT_PATH;
+  readOnlyRoot: true;
+  signal: AbortSignal;
+};
+
 /**
  * A restricted runtime service, separate from the public gateway and Docker socket.
  * close() must terminate all in-flight queries and containers before resolving.
- * explore() must not execute anything from the repository or expose the runtime to it.
+ * explore()/callTool() must confirm per-request cleanup before settling, including cancellation,
+ * and must not execute repository code or expose the runtime to it.
  */
 export interface ImageQueryBackend {
-  explore(request: {
-    digest: ImageDigest;
-    repoId: string;
-    commit: string;
-    query: string;
-    projectPath: typeof IMAGE_PROJECT_PATH;
-    readOnlyRoot: true;
-    signal: AbortSignal;
-  }): Promise<string>;
+  explore(request: Omit<ImageToolQueryRequest, 'call'> & { query: string }): Promise<string>;
+  callTool?(request: ImageToolQueryRequest): Promise<string>;
   probe(signal: AbortSignal): Promise<void>;
   /** Fail-closed fence state, for monitoring; must never block on Docker. */
   status?(signal: AbortSignal): Promise<{ uncertain: boolean }>;
@@ -148,24 +153,42 @@ export class ImageCodeGraphClient {
     signal?: AbortSignal,
     identity?: ImageRepositoryIdentity,
   ): Promise<string> {
+    if (typeof query !== 'string' || !query.trim() || query.length > 2000) throw new Error('Invalid query');
+    return this.toolQuery(reference, { name: 'codegraph_explore', arguments: { query } }, signal, identity);
+  }
+
+  private async toolQuery(
+    reference: string,
+    call: CodeGraphToolCall,
+    signal?: AbortSignal,
+    identity?: ImageRepositoryIdentity,
+  ): Promise<string> {
     if (this.unsafe) throw new Error('Image runtime shutdown failed; restart required');
     const digest = parseImageReference(reference);
     if (!validImageIdentity(identity)) throw new Error('Repository image identity required');
-    if (typeof query !== 'string' || !query.trim() || query.length > 2000) throw new Error('Invalid query');
+    if (!validCodeGraphToolCall(call)) throw new Error('Invalid CodeGraph tool call');
+    const toolCall = { name: call.name, arguments: { ...call.arguments } };
+    const callTool = this.backend.callTool?.bind(this.backend);
+    if (!callTool && (toolCall.name !== 'codegraph_explore' || Object.keys(toolCall.arguments).length !== 1))
+      throw new Error('Image backend does not support this tool');
     const timeout = AbortSignal.timeout(this.timeoutMs);
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const request: ImageToolQueryRequest = {
+      digest,
+      ...identity,
+      call: toolCall,
+      projectPath: IMAGE_PROJECT_PATH,
+      readOnlyRoot: true,
+      signal: combined,
+    };
     try {
       // The backend confirms per-request cleanup after cancellation before it settles.
       const result = await this.wait(
-        () =>
-          this.backend.explore({
-            digest,
-            ...identity,
-            query,
-            projectPath: IMAGE_PROJECT_PATH,
-            readOnlyRoot: true,
-            signal: combined,
-          }),
+        () => {
+          if (callTool) return callTool(request);
+          const { call, ...legacy } = request;
+          return this.backend.explore({ ...legacy, query: call.arguments.query as string });
+        },
         AbortSignal.timeout(this.timeoutMs + 30_000),
       );
       if (this.unsafe || combined.aborted) throw new ImageRuntimeRequestError('Request cancelled');
@@ -199,6 +222,24 @@ export class ImageCodeGraphClient {
       () => {
         if (this.unsafe) throw new Error('Image runtime shutdown failed; restart required');
         return operation((reference, query, signal, identity) => this.query(reference, query, signal, identity));
+      },
+      signal,
+    );
+  }
+
+  async withToolQuery<T>(operation: (callTool: GraphToolQuery) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.schedule(
+      'read',
+      () => {
+        if (this.unsafe) throw new Error('Image runtime shutdown failed; restart required');
+        return operation((reference, call, requestSignal, identity) =>
+          this.toolQuery(
+            reference,
+            call,
+            signal && requestSignal ? AbortSignal.any([signal, requestSignal]) : (requestSignal ?? signal),
+            identity,
+          ),
+        );
       },
       signal,
     );

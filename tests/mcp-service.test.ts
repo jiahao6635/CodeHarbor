@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { CODEGRAPH_TOOL_NAMES } from '../src/codegraph-tools.js';
 import { createMcpService, type McpHttpAccessEvent, SocketMcpBackend } from '../src/mcp-service.js';
 
 const serviceToken = 'internal-token-000000000000000000000000';
@@ -114,7 +115,7 @@ test('isolated MCP service forwards the caller through Unix RPC and exposes no p
     const tools = await client.listTools();
     assert.deepEqual(
       tools.tools.map((tool) => tool.name),
-      ['list_repositories', 'get_repository_status', 'codegraph_explore'],
+      ['list_repositories', 'get_repository_status', ...CODEGRAPH_TOOL_NAMES],
     );
     const listing = await client.callTool({ name: 'list_repositories', arguments: {} });
     assert.match(JSON.stringify(listing), /Repo/);

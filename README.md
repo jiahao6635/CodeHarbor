@@ -7,7 +7,7 @@ CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库
 - 用户使用云效个人访问令牌（PAT）绑定身份，创建只读或平台读写 CodeHarbor Key。
 - 使用 Codeup 仓库 ID 接入仓库，首次及变化后以独立目录全量构建 CodeGraph 1.6.2 索引；相同 commit 不重复构建。
 - Codeup Push Webhook、手动同步和 15 分钟对账；保留上次成功索引，报告 commit 和新鲜度。
-- 单个 `/mcp` 地址，提供 `list_repositories`、`get_repository_status`、`codegraph_explore`；查询依据 CodeHarbor Key 中明确列出的仓库范围鉴权，不在每次查询时请求云效。
+- 单个 `/mcp` 地址，提供 `list_repositories`、`get_repository_status` 和全部 7 个代码工具：`codegraph_search`、`codegraph_callers`、`codegraph_callees`、`codegraph_impact`、`codegraph_node`、`codegraph_explore`、`codegraph_files`；全部代码工具必须传入 `repo_id`，按 Key 的仓库范围鉴权。
 - `write` Key 仅允许平台管理及触发索引，不能写云效代码。
 - 可选择仓库镜像后端：每个仓库的源码快照和索引打包为本机 Docker 镜像，查询容器使用经过适配的只读 CodeGraph；配置和迁移边界见 [镜像后端指南](docs/image-backend.md)。
 
@@ -132,7 +132,22 @@ CLI 隐藏 PAT 输入；CodeHarbor Key 明文只返回一次，使用者应自�
 
 当同步凭证持有人重新绑定 PAT 时，已有仓库不会自动使用新令牌：仓库进入 `credential_required`，该用户或仓库负责人需使用自己的 write Key 请求 `PUT /api/v1/repositories/{id}/sync-credential`，提交 `{"authorize_automatic_sync":true}`，明确授权当前 PAT 并重新排队。未发布索引和旧索引仍按各自的仓库权限保护。
 
-Agent 配置 MCP URL `https://<trusted-host>/mcp` 和 `Authorization: Bearer <CodeHarbor Key>`；具体配置格式取决于 MCP 客户端。先调用 `list_repositories`，然后在 `codegraph_explore` 中传入 `repo_id` 和 `query`。不要向 Agent 暴露云效 PAT。
+Agent 配置 MCP URL `https://<trusted-host>/mcp` 和 `Authorization: Bearer <CodeHarbor Key>`；具体配置格式取决于 MCP 客户端。先调用 `list_repositories` 获取 `repo_id`，优先使用 `codegraph_explore`。不要向 Agent 暴露云效 PAT。
+
+全部 7 个代码工具保留 CodeGraph 1.6.2 的功能参数，用必填 `repo_id` 替代 `projectPath`：
+
+| 工具 | 参数（除必填 `repo_id` 外） |
+| --- | --- |
+| `codegraph_search` | 必填 `query`；可选 `kind`、`limit`（1–100） |
+| `codegraph_callers` / `codegraph_callees` | 必填 `symbol`；可选 `file`、`limit`（1–100） |
+| `codegraph_impact` | 必填 `symbol`；可选 `file`、`depth`（1–10） |
+| `codegraph_node` | 至少传 `symbol` 或 `file`；可选 `includeCode`、`offset`、`limit`（1–2000）、`symbolsOnly`、`line` |
+| `codegraph_explore` | 必填 `query`；可选 `maxFiles`（1–50） |
+| `codegraph_files` | 可选 `path`、`pattern`、`format`（tree/flat/grouped）、`includeMetadata`、`maxDepth`（1–100） |
+
+`codegraph_node` 支持带行号的文件读取和符号详情两种模式。源码来自服务器已发布的 `indexed_commit`，不是客户端本地工作区。`file` / `path` 必须是仓库相对路径，禁止绝对路径、`..` 穿越及客户端 `projectPath`。所有工具共用调用前后鉴权、发布协调、审计、超时/取消和 1 MiB 输出上限。
+
+镜像模式升级时必须重新构建只读基础镜像与仓库查询镜像，不能只更新平台进程。新运行时显式启用 7 个工具并取消显式配置下的小仓库工具隐藏；旧镜像不兼容时查询会拒绝，不会退回无隔离运行。
 
 ## 测试
 

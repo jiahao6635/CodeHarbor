@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { chmod, lstat, unlink } from 'node:fs/promises';
 import net from 'node:net';
 import { dirname, isAbsolute } from 'node:path';
+import { type CodeGraphToolCall, validCodeGraphToolCall } from './codegraph-tools.js';
 
 export interface InternalMcpRepository {
   repo_id: string;
@@ -12,6 +13,12 @@ export interface InternalMcpRepository {
   stale: boolean;
 }
 export interface InternalMcpBackend {
+  callTool?(
+    authorization: string,
+    repoId: string,
+    call: CodeGraphToolCall,
+    signal: AbortSignal,
+  ): Promise<{ repository: InternalMcpRepository; result: unknown } | null>;
   probe(signal: AbortSignal): Promise<true>;
   authenticate(authorization: string): Promise<boolean>;
   list(authorization: string, signal: AbortSignal): Promise<InternalMcpRepository[]>;
@@ -172,7 +179,7 @@ export async function createInternalMcpHandler(options: {
           } else if (body.op === 'list' && keysMatch(body, ['op', 'token', 'authorization'])) {
             result = await options.backend.list(authorization, controller.signal);
           } else if (
-            (body.op === 'get' || body.op === 'explore') &&
+            (body.op === 'get' || body.op === 'explore' || body.op === 'call_tool') &&
             typeof body.repoId === 'string' &&
             repoIdPattern.test(body.repoId)
           ) {
@@ -186,6 +193,13 @@ export async function createInternalMcpHandler(options: {
               body.query.length <= 2000
             ) {
               result = await options.backend.explore(authorization, body.repoId, body.query, controller.signal);
+            } else if (
+              body.op === 'call_tool' &&
+              keysMatch(body, ['op', 'token', 'authorization', 'repoId', 'call']) &&
+              validCodeGraphToolCall(body.call) &&
+              options.backend.callTool
+            ) {
+              result = await options.backend.callTool(authorization, body.repoId, body.call, controller.signal);
             } else return reply({ ok: false });
           } else return reply({ ok: false });
           reply({ ok: true, result });

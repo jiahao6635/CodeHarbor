@@ -4,6 +4,7 @@ import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import type { CodeGraphToolCall } from '../src/codegraph-tools.js';
 import { IMAGE_PROJECT_PATH, type ImageDigest, type ImageQueryBackend } from '../src/image-codegraph.js';
 import {
   ImageRuntimeCancelledError,
@@ -324,14 +325,212 @@ test('a disconnected or malformed cleanup response is uncertain', async () => {
         readOnlyRoot: true,
         signal: new AbortController().signal,
       });
-    await assert.rejects(request(), ImageRuntimeUncertainError);
-    mode = 'disconnect';
-    await assert.rejects(request(), ImageRuntimeUncertainError);
-    mode = 'timeout';
-    await assert.rejects(request(), ImageRuntimeUncertainError);
+    const toolRequest = () =>
+      client.callTool({
+        digest,
+        ...identity,
+        call: { name: 'codegraph_search', arguments: { query: 'x', limit: 3 } },
+        projectPath: IMAGE_PROJECT_PATH,
+        readOnlyRoot: true,
+        signal: new AbortController().signal,
+      });
+    for (const scenario of ['malformed', 'disconnect', 'timeout'] as const) {
+      mode = scenario;
+      await assert.rejects(request(), ImageRuntimeUncertainError);
+      await assert.rejects(toolRequest(), ImageRuntimeUncertainError);
+    }
   } finally {
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const toolCalls: CodeGraphToolCall[] = [
+  { name: 'codegraph_search', arguments: { query: 'auth', kind: 'class', limit: 7 } },
+  { name: 'codegraph_callers', arguments: { symbol: 'login', file: 'src/auth.ts', limit: 8 } },
+  { name: 'codegraph_callees', arguments: { symbol: 'login', file: 'src/auth.ts', limit: 9 } },
+  { name: 'codegraph_impact', arguments: { symbol: 'login', file: 'src/auth.ts', depth: 3 } },
+  { name: 'codegraph_node', arguments: { symbol: 'login', file: 'src/auth.ts', includeCode: true, line: 20 } },
+  { name: 'codegraph_node', arguments: { file: 'src/auth.ts', offset: 10, limit: 12, symbolsOnly: true } },
+  { name: 'codegraph_explore', arguments: { query: 'auth login', maxFiles: 6 } },
+  {
+    name: 'codegraph_files',
+    arguments: { path: 'src', pattern: '**/*.ts', format: 'grouped', includeMetadata: false, maxDepth: 4 },
+  },
+];
+
+test('call_tool socket roundtrips all seven tools with fixed identity and rejects injection at both boundaries', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codeharbor-runtime-tools-'));
+  const path = join(dir, 'runtime.sock');
+  const calls: CodeGraphToolCall[] = [];
+  let legacy = 0;
+  const server = await serveImageRuntime({
+    path,
+    token,
+    backend: backend({
+      callTool: async (input) => {
+        assert.equal(input.digest, digest);
+        assert.equal(input.repoId, identity.repoId);
+        assert.equal(input.commit, identity.commit);
+        assert.equal(input.projectPath, IMAGE_PROJECT_PATH);
+        assert.equal(input.readOnlyRoot, true);
+        calls.push(input.call);
+        return JSON.stringify(input.call);
+      },
+      explore: async () => {
+        legacy++;
+        return 'legacy';
+      },
+    }),
+  });
+  try {
+    const client = new SocketImageQueryBackend(path, token);
+    const input = {
+      digest,
+      ...identity,
+      projectPath: IMAGE_PROJECT_PATH,
+      readOnlyRoot: true as const,
+      signal: new AbortController().signal,
+    };
+    for (const call of toolCalls) assert.equal(await client.callTool({ ...input, call }), JSON.stringify(call));
+    assert.deepEqual(calls, toolCalls);
+    assert.equal(await client.explore({ ...input, query: 'legacy' }), 'legacy');
+    const valid = { op: 'call_tool', token, digest, ...identity, call: toolCalls[0] };
+    for (const request of [
+      { ...valid, token: 'wrong' },
+      { ...valid, commit: 'bad' },
+      { ...valid, repoId: '../other' },
+      { ...valid, projectPath: '/elsewhere' },
+      { ...valid, query: 'extra' },
+      { ...valid, call: { name: 'codegraph_status', arguments: {} } },
+      { ...valid, call: { name: 'shell', arguments: {} } },
+      { ...valid, call: { name: 'codegraph_explore', arguments: { query: 'auth', projectPath: IMAGE_PROJECT_PATH } } },
+      { ...valid, call: { name: 'codegraph_node', arguments: { file: '../secret' } } },
+      { ...valid, call: { name: 'codegraph_files', arguments: { pattern: '/etc/*' } } },
+      { ...valid, call: { name: 'codegraph_files', arguments: { path: 'C:\\secret' } } },
+      { ...valid, call: { name: 'codegraph_search', arguments: { query: 'auth', limit: 0 } } },
+      { op: 'explore', token, digest, ...identity, query: 'auth', maxFiles: 3 },
+    ])
+      assert.match(await raw(path, request), /"ok":false/);
+    for (const call of [
+      { name: 'codegraph_files', arguments: { path: '../secret' } },
+      { name: 'codegraph_explore', arguments: { query: 'auth', projectPath: '/elsewhere' } },
+      { name: 'codegraph_status', arguments: {} },
+    ])
+      await assert.rejects(
+        client.callTool({ ...input, call: call as CodeGraphToolCall }),
+        /Invalid image runtime request/,
+      );
+    await assert.rejects(
+      client.explore({ ...input, query: 'auth', maxFiles: 3 } as Parameters<ImageQueryBackend['explore']>[0]),
+      /Invalid image runtime request/,
+    );
+    assert.equal(calls.length, toolCalls.length);
+    assert.equal(legacy, 1);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('tool and legacy socket requests share capacity and cancellation holds it until cleaned', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codeharbor-runtime-tools-cancel-'));
+  const path = join(dir, 'runtime.sock');
+  let enter!: () => void;
+  const started = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  let cancel!: () => void;
+  const cancelled = new Promise<void>((resolve) => {
+    cancel = resolve;
+  });
+  let cleanup!: () => void;
+  const cleanupGate = new Promise<void>((resolve) => {
+    cleanup = resolve;
+  });
+  const server = await serveImageRuntime({
+    path,
+    token,
+    maxConcurrent: 1,
+    backend: backend({
+      callTool: async ({ signal }) => {
+        enter();
+        await new Promise<void>((resolve) =>
+          signal.addEventListener(
+            'abort',
+            () => {
+              cancel();
+              resolve();
+            },
+            { once: true },
+          ),
+        );
+        await cleanupGate;
+        throw new ImageRuntimeCancelledError();
+      },
+    }),
+  });
+  try {
+    const client = new SocketImageQueryBackend(path, token, 5000);
+    const controller = new AbortController();
+    const input = {
+      digest,
+      ...identity,
+      projectPath: IMAGE_PROJECT_PATH,
+      readOnlyRoot: true as const,
+      signal: controller.signal,
+    };
+    const pending = client.callTool({ ...input, call: toolCalls[0] });
+    const rejected = assert.rejects(pending, ImageRuntimeCancelledError);
+    await started;
+    const legacy = () => client.explore({ ...input, query: 'legacy', signal: new AbortController().signal });
+    await assert.rejects(legacy(), ImageRuntimeRequestError);
+    await client.probe(new AbortController().signal);
+    controller.abort();
+    await cancelled;
+    await assert.rejects(legacy(), ImageRuntimeRequestError);
+    cleanup();
+    await rejected;
+    assert.equal(await legacy(), 'ok');
+  } finally {
+    cleanup();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('optional tool backend only falls back to query-only explore without silently dropping arguments', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codeharbor-runtime-tools-legacy-'));
+  const path = join(dir, 'runtime.sock');
+  let count = 0;
+  const server = await serveImageRuntime({
+    path,
+    token,
+    backend: backend({
+      explore: async () => {
+        count++;
+        return 'legacy';
+      },
+    }),
+  });
+  try {
+    const client = new SocketImageQueryBackend(path, token);
+    const input = {
+      digest,
+      ...identity,
+      projectPath: IMAGE_PROJECT_PATH,
+      readOnlyRoot: true as const,
+      signal: new AbortController().signal,
+    };
+    assert.equal(
+      await client.callTool({ ...input, call: { name: 'codegraph_explore', arguments: { query: 'legacy' } } }),
+      'legacy',
+    );
+    for (const call of toolCalls) await assert.rejects(client.callTool({ ...input, call }), ImageRuntimeRequestError);
+    assert.equal(count, 1);
+  } finally {
+    await server.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

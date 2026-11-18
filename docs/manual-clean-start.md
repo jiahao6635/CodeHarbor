@@ -179,6 +179,8 @@ Swagger 页面显示的 `/mcp` 接口说明属于平台进程，该入口已关�
    {"repo_id": "这里填CodeHarbor内部仓库ID", "query": "这里填函数名或代码问题"}
    ```
 
+加载后应看到 9 个工具：两个仓库工具，以及 `codegraph_search`、`codegraph_callers`、`codegraph_callees`、`codegraph_impact`、`codegraph_node`、`codegraph_explore`、`codegraph_files`。所有代码工具都必须填写 `repo_id`；可选参数以 Postman 加载的工具定义为准。`codegraph_node` 仅填 `file` 可读取带行号的文件源码，填 `symbol` 可查看符号详情；`file` 和 `path` 使用仓库相对路径，不能输入本机绝对路径或 `projectPath`。源码对应服务器的 `indexed_commit`，不是本机工作区。
+
 查询结果显示在 **Response** 中。若没有 MCP 请求入口，请检查 Postman 版本。若连接超时，请先核对电脑到内网地址的访问；其他 ECS 和本机直连尚未验证，必要时请网络运维协助。如果返回 401，检查查询密钥是否正确或过期；如果提示仓库不存在或无权访问，检查密钥的 `repos` 是否包含正确的内部 ID，以及第 6 步的索引状态。
 
 查询时系统依据 CodeHarbor 查询密钥的仓库范围授权，不会每次重新检查云效权限。云效撤权或 PAT 失效后，原查询密钥不会自动失效；需要管理员通过 `DELETE /api/v1/api-keys/{prefix}` 撤销。服务器重置前的 CodeHarbor Key 和 Webhook 已失效。

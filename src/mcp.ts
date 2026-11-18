@@ -3,7 +3,14 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import type { GraphClient } from './codegraph.js';
+import { type GraphClient, withGraphToolQuery } from './codegraph.js';
+import {
+  CODEGRAPH_TOOL_NAMES,
+  CODEGRAPH_TOOLS,
+  type CodeGraphToolCall,
+  isCodeGraphToolName,
+  validCodeGraphToolCall,
+} from './codegraph-tools.js';
 
 export interface McpRepository {
   id: string;
@@ -29,6 +36,12 @@ export interface McpDependencies<Principal> {
     principal: Principal,
     repoId: string,
     query: string,
+    signal: AbortSignal,
+  ) => Promise<{ repository: McpRepository; result: string } | null>;
+  remoteCallTool?: (
+    principal: Principal,
+    repoId: string,
+    call: CodeGraphToolCall,
     signal: AbortSignal,
   ) => Promise<{ repository: McpRepository; result: string } | null>;
   /** Exact browser origins allowed to use the endpoint. Non-browser clients can omit Origin. */
@@ -75,7 +88,8 @@ function rpcError(res: ServerResponse, status: number, message: string) {
 
 /** Creates a stateless MCP HTTP handler; never share a request's principal across clients. */
 export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
-  if (!!deps.codegraph === !!deps.remoteExplore) throw new Error('Exactly one MCP query backend is required');
+  if (!!deps.codegraph === !!(deps.remoteExplore || deps.remoteCallTool))
+    throw new Error('Exactly one MCP query backend is required');
   return async (req: IncomingMessage, res: ServerResponse, parsedBody?: unknown): Promise<void> => {
     const host = req.headers.host;
     const origin = req.headers.origin;
@@ -127,32 +141,26 @@ export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
           },
           annotations: { readOnlyHint: true },
         },
-        {
-          name: 'codegraph_explore',
-          description: 'Explore symbols and code relationships within one accessible indexed repository.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              repo_id: { type: 'string', maxLength: 128 },
-              query: { type: 'string', minLength: 1, maxLength: 2000 },
-            },
-            required: ['repo_id', 'query'],
-            additionalProperties: false,
-          },
-          annotations: { readOnlyHint: true },
-        },
+        ...CODEGRAPH_TOOLS,
       ],
     }));
     server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const args = request.params.arguments ?? {};
-      const allowed = ['list_repositories', 'get_repository_status', 'codegraph_explore'];
+      const allowed: string[] = ['list_repositories', 'get_repository_status', ...CODEGRAPH_TOOL_NAMES];
       const tool = allowed.includes(request.params.name) ? request.params.name : '<unknown>';
       let outcome: 'success' | 'error' = 'error';
       let authorizedRepo: string | undefined;
-      const queryHash =
-        request.params.name === 'codegraph_explore' && typeof args.query === 'string'
-          ? createHash('sha256').update(args.query).digest('hex')
-          : undefined;
+      const queryHash = isCodeGraphToolName(request.params.name)
+        ? createHash('sha256')
+            .update(
+              request.params.name === 'codegraph_explore' &&
+                Object.keys(args).length === 2 &&
+                typeof args.query === 'string'
+                ? args.query
+                : JSON.stringify({ name: request.params.name, arguments: args }),
+            )
+            .digest('hex')
+        : undefined;
       const success = (value: unknown) => {
         outcome = 'success';
         return textResult(value);
@@ -183,45 +191,50 @@ export function createMcpHandler<Principal>(deps: McpDependencies<Principal>) {
           authorizedRepo = repo.id;
           return success(publicRepository(repo));
         }
-        if (request.params.name === 'codegraph_explore') {
-          if (
-            !hasExactKeys(args, ['repo_id', 'query']) ||
-            !validRepoId(args.repo_id) ||
-            typeof args.query !== 'string' ||
-            !args.query.trim() ||
-            args.query.length > 2000
-          )
-            return toolError('Invalid arguments');
-          const { repo_id: repoId, query } = args;
-          if (deps.remoteExplore) {
-            const response = await deps.remoteExplore(caller, repoId, query, extra.signal);
+        if (isCodeGraphToolName(request.params.name)) {
+          if (!validRepoId(args.repo_id)) return toolError('Invalid arguments');
+          const { repo_id: repoId, ...toolArgs } = args;
+          const call = { name: request.params.name, arguments: toolArgs };
+          if (!validCodeGraphToolCall(call)) return toolError('Invalid arguments');
+          if (deps.remoteCallTool || deps.remoteExplore) {
+            if (!deps.remoteCallTool && (call.name !== 'codegraph_explore' || Object.keys(toolArgs).length !== 1)) {
+              return toolError('Backend tool unavailable');
+            }
+            const response = deps.remoteCallTool
+              ? await deps.remoteCallTool(caller, repoId, call, extra.signal)
+              : await deps.remoteExplore?.(caller, repoId, toolArgs.query as string, extra.signal);
             if (!response) return toolError('Repository not found or index changed');
             authorizedRepo = response.repository.id;
             return success({ ...publicRepository(response.repository), result: response.result });
           }
-          return await deps.codegraph!.withQuery(async (explore) => {
-            // A call can wait behind an index publication; recheck the key after it acquires the lock.
-            const current = await deps.authenticate(req);
-            if (current === null) return toolError('Authentication required');
-            const repo = await deps.getRepository(current, repoId, extra.signal);
-            if (!repo) return toolError('Repository not found');
-            authorizedRepo = repo.id;
-            if (!repo.projectPath || !repo.indexedCommit) return toolError('Repository index is not available');
-            const result = await explore(repo.projectPath, query, extra.signal, {
-              repoId: repo.id,
-              commit: repo.indexedCommit,
-            });
-            const confirmed = await deps.authenticate(req);
-            if (confirmed === null) return toolError('Authentication required');
-            const currentRepo = await deps.getRepository(confirmed, repoId, extra.signal);
-            if (
-              !currentRepo ||
-              currentRepo.projectPath !== repo.projectPath ||
-              currentRepo.indexedCommit !== repo.indexedCommit
-            )
-              return toolError('Repository not found or index changed');
-            return success({ ...publicRepository(repo), result });
-          }, extra.signal);
+          if (!deps.codegraph) return toolError('Backend tool unavailable');
+          return await withGraphToolQuery(
+            deps.codegraph,
+            async (callTool) => {
+              // A call can wait behind an index publication; recheck the key after it acquires the lock.
+              const current = await deps.authenticate(req);
+              if (current === null) return toolError('Authentication required');
+              const repo = await deps.getRepository(current, repoId, extra.signal);
+              if (!repo) return toolError('Repository not found');
+              authorizedRepo = repo.id;
+              if (!repo.projectPath || !repo.indexedCommit) return toolError('Repository index is not available');
+              const result = await callTool(repo.projectPath, call, extra.signal, {
+                repoId: repo.id,
+                commit: repo.indexedCommit,
+              });
+              const confirmed = await deps.authenticate(req);
+              if (confirmed === null) return toolError('Authentication required');
+              const currentRepo = await deps.getRepository(confirmed, repoId, extra.signal);
+              if (
+                !currentRepo ||
+                currentRepo.projectPath !== repo.projectPath ||
+                currentRepo.indexedCommit !== repo.indexedCommit
+              )
+                return toolError('Repository not found or index changed');
+              return success({ ...publicRepository(repo), result });
+            },
+            extra.signal,
+          );
         }
         return toolError('Unknown tool');
       } catch {

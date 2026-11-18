@@ -1,9 +1,11 @@
 import { strict as assert } from 'node:assert';
 import { randomUUID } from 'node:crypto';
+import { watch } from 'node:fs';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { CODEGRAPH_MCP_TOOLS, type CodeGraphToolCall } from '../src/codegraph-tools.js';
 import { DockerImageQueryBackend, dockerCreateArguments } from '../src/docker-image-query.js';
 import { IMAGE_PROJECT_PATH, type ImageDigest } from '../src/image-codegraph.js';
 import { FileImageCreationFence } from '../src/image-creation-fence.js';
@@ -29,6 +31,9 @@ test('Docker arguments fix read-only isolation and reject injected image identif
     assert.ok(args.includes(arg));
   assert.ok(args.includes('io.codeharbor.image-query-owner=controller_1'));
   assert.ok(args.includes('io.codeharbor.image-query-kind=readonly'));
+  const allowlist = `CODEGRAPH_MCP_TOOLS=${CODEGRAPH_MCP_TOOLS}`;
+  assert.equal(args[args.indexOf(allowlist) - 1], '--env');
+  assert.equal(CODEGRAPH_MCP_TOOLS, 'search,callers,callees,impact,node,explore,files');
   for (const arg of ['--volume', '-v', '--mount', '--privileged']) assert.ok(!args.includes(arg));
   assert.equal(args[args.indexOf('--entrypoint') + 1], '/usr/local/bin/node');
   assert.throws(() => dockerCreateArguments(`${digest};touch /tmp/untrusted`, name, owner));
@@ -49,10 +54,10 @@ test('a timed out create kills the CLI and fails closed if daemon outcome is unc
     const fence = new FileImageCreationFence(dir, owner);
     const backend = new DockerImageQueryBackend(async () => true, executable, 3000, owner, fence);
     const controller = new AbortController();
-    const request = backend.explore({
+    const request = backend.callTool({
       digest,
       ...identity,
-      query: 'symbol',
+      call: { name: 'codegraph_search', arguments: { query: 'symbol', limit: 5 } },
       projectPath: IMAGE_PROJECT_PATH,
       readOnlyRoot: true,
       signal: controller.signal,
@@ -126,10 +131,10 @@ test('cancellation while writing the fence clears it before any Docker create', 
     };
     const backend = new DockerImageQueryBackend(async () => true, executable, 3000, owner, waitingFence);
     const controller = new AbortController();
-    const request = backend.explore({
+    const request = backend.callTool({
       digest,
       ...identity,
-      query: 'symbol',
+      call: { name: 'codegraph_search', arguments: { query: 'symbol', limit: 5 } },
       projectPath: IMAGE_PROJECT_PATH,
       readOnlyRoot: true,
       signal: controller.signal,
@@ -267,8 +272,73 @@ test('cleanup fails closed when rm succeeds but the container still exists', asy
   }
 });
 
+const toolCalls: CodeGraphToolCall[] = [
+  { name: 'codegraph_search', arguments: { query: 'auth', kind: 'function', limit: 7 } },
+  { name: 'codegraph_callers', arguments: { symbol: 'login', file: 'src/auth.ts', limit: 8 } },
+  { name: 'codegraph_callees', arguments: { symbol: 'login', file: 'src/auth.ts', limit: 9 } },
+  { name: 'codegraph_impact', arguments: { symbol: 'login', file: 'src/auth.ts', depth: 3 } },
+  { name: 'codegraph_node', arguments: { symbol: 'login', file: 'src/auth.ts', includeCode: true, line: 20 } },
+  { name: 'codegraph_node', arguments: { file: 'src/auth.ts', offset: 10, limit: 12, symbolsOnly: true } },
+  { name: 'codegraph_explore', arguments: { query: 'auth login', maxFiles: 6 } },
+  {
+    name: 'codegraph_files',
+    arguments: { path: 'src', pattern: '**/*.ts', format: 'flat', includeMetadata: false, maxDepth: 4 },
+  },
+];
+
+/** Observed v1.6.2 schemas, deliberately independent from gateway definitions. */
+function upstreamTool(call: CodeGraphToolCall) {
+  const types: Record<CodeGraphToolCall['name'], Record<string, string>> = {
+    codegraph_search: { query: 'string', kind: 'string', limit: 'number' },
+    codegraph_callers: { symbol: 'string', file: 'string', limit: 'number' },
+    codegraph_callees: { symbol: 'string', file: 'string', limit: 'number' },
+    codegraph_impact: { symbol: 'string', file: 'string', depth: 'number' },
+    codegraph_node: {
+      symbol: 'string',
+      file: 'string',
+      includeCode: 'boolean',
+      offset: 'number',
+      limit: 'number',
+      symbolsOnly: 'boolean',
+      line: 'number',
+    },
+    codegraph_explore: { query: 'string', maxFiles: 'number' },
+    codegraph_files: {
+      path: 'string',
+      pattern: 'string',
+      format: 'string',
+      includeMetadata: 'boolean',
+      maxDepth: 'number',
+    },
+  };
+  const properties: Record<string, { type: string; enum?: string[] }> = { projectPath: { type: 'string' } };
+  for (const [key, type] of Object.entries(types[call.name])) properties[key] = { type };
+  if (call.name === 'codegraph_search')
+    properties.kind.enum = ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component'];
+  if (call.name === 'codegraph_files') properties.format.enum = ['tree', 'flat', 'grouped'];
+  const required =
+    call.name === 'codegraph_search' || call.name === 'codegraph_explore'
+      ? ['query']
+      : ['codegraph_callers', 'codegraph_callees', 'codegraph_impact'].includes(call.name)
+        ? ['symbol']
+        : [];
+  return { name: call.name, inputSchema: { type: 'object', properties, required } };
+}
+
+type ResponseMode =
+  | 'success'
+  | 'schema-missing'
+  | 'schema-type'
+  | 'schema-enum'
+  | 'error'
+  | 'nontext'
+  | 'oversized'
+  | 'cancel'
+  | 'close';
 async function runEffectiveConfigTest(
   scenario: 'safe' | 'wrong-image' | 'writable' | 'network' | 'volume' | 'malformed',
+  call?: CodeGraphToolCall,
+  mode: ResponseMode = 'success',
 ): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'codeharbor-docker-config-'));
   const id = 'e'.repeat(64);
@@ -276,6 +346,15 @@ async function runEffectiveConfigTest(
   const nameFile = join(dir, 'name');
   const removed = join(dir, 'removed');
   const started = join(dir, 'started');
+  const called = join(dir, 'called');
+  const expected: CodeGraphToolCall = call ?? { name: 'codegraph_explore', arguments: { query: 'symbol' } };
+  let invoked!: () => void;
+  const invocation = new Promise<void>((resolve) => {
+    invoked = resolve;
+  });
+  const watcher = watch(dir, (_event, filename) => {
+    if (filename === 'called') invoked();
+  });
   try {
     const labels = { 'io.codeharbor.image-query-owner': owner, 'io.codeharbor.image-query-kind': 'readonly' };
     const config =
@@ -287,9 +366,14 @@ async function runEffectiveConfigTest(
             JSON.stringify(scenario === 'network' ? 'bridge' : 'none'),
             JSON.stringify(scenario === 'volume' ? [{ Type: 'volume', Destination: '/workspace/repo' }] : []),
           ].join('|');
+    const tool = upstreamTool(expected);
+    if (mode === 'schema-type') tool.inputSchema.properties.projectPath.type = 'number';
+    if (mode === 'schema-enum') tool.inputSchema.properties.kind.enum = ['function'];
+    const tools =
+      mode === 'schema-missing' ? [] : [tool, { name: 'unrequested_tool', inputSchema: { type: 'object' } }];
     await writeFile(
       script,
-      `#!/usr/bin/env node\nconst fs=require('node:fs'); const cmd=process.argv[2];\nif(cmd==='ps') process.exit(0);\nelse if(cmd==='create') { fs.writeFileSync(${JSON.stringify(nameFile)},process.argv[process.argv.indexOf('--name')+1]); console.log(${JSON.stringify(id)}); }\nelse if(cmd==='inspect') { if(fs.existsSync(${JSON.stringify(removed)})) { process.stderr.write('Error response from daemon: No such container: '+process.argv.at(-1)); process.exit(1); } else if(process.argv.includes('{{json .Image}}|{{json .HostConfig.ReadonlyRootfs}}|{{json .HostConfig.NetworkMode}}|{{json .Mounts}}')) console.log(${JSON.stringify(config)}); else console.log(${JSON.stringify(`${id}|/`)}+fs.readFileSync(${JSON.stringify(nameFile)},'utf8')+${JSON.stringify(`|${JSON.stringify(labels)}`)}); }\nelse if(cmd==='rm') fs.writeFileSync(${JSON.stringify(removed)},process.argv.at(-1));\nelse if(cmd==='start') { fs.writeFileSync(${JSON.stringify(started)},'yes'); const rl=require('node:readline').createInterface({input:process.stdin}); rl.on('line',line=>{const req=JSON.parse(line);if(req.id===undefined)return;let result;if(req.method==='initialize')result={protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'test',version:'1'}};else if(req.method==='tools/list')result={tools:[{name:'codegraph_explore',inputSchema:{type:'object',properties:{query:{type:'string'},projectPath:{type:'string'}}}}]};else if(req.method==='tools/call')result={content:[{type:'text',text:'found'}]};else return;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:req.id,result})+'\\n')}); } else process.exit(1);\n`,
+      `#!/usr/bin/env node\nconst fs=require('node:fs'); const cmd=process.argv[2];\nif(cmd==='ps') process.exit(0);\nelse if(cmd==='create') { fs.writeFileSync(${JSON.stringify(nameFile)},process.argv[process.argv.indexOf('--name')+1]); console.log(${JSON.stringify(id)}); }\nelse if(cmd==='inspect') { if(fs.existsSync(${JSON.stringify(removed)})) { process.stderr.write('Error response from daemon: No such container: '+process.argv.at(-1)); process.exit(1); } else if(process.argv.includes('{{json .Image}}|{{json .HostConfig.ReadonlyRootfs}}|{{json .HostConfig.NetworkMode}}|{{json .Mounts}}')) console.log(${JSON.stringify(config)}); else console.log(${JSON.stringify(`${id}|/`)}+fs.readFileSync(${JSON.stringify(nameFile)},'utf8')+${JSON.stringify(`|${JSON.stringify(labels)}`)}); }\nelse if(cmd==='rm') fs.writeFileSync(${JSON.stringify(removed)},process.argv.at(-1));\nelse if(cmd==='start') { fs.writeFileSync(${JSON.stringify(started)},'yes'); const rl=require('node:readline').createInterface({input:process.stdin}); rl.on('line',line=>{const req=JSON.parse(line);if(req.id===undefined)return;let result;if(req.method==='initialize')result={protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'test',version:'1'}};else if(req.method==='tools/list')result={tools:${JSON.stringify(tools)}};else if(req.method==='tools/call') { fs.writeFileSync(${JSON.stringify(called)},JSON.stringify(req.params)); const mode=${JSON.stringify(mode)}; if(mode==='cancel'||mode==='close') return; if(mode==='nontext') result={content:[{type:'image',mimeType:'image/png',data:'AA=='}]}; else result={isError:mode==='error',content:[{type:'text',text:mode==='oversized'?'x'.repeat(1024*1024+1):'found'}]}; }else return;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:req.id,result})+'\\n')}); } else process.exit(1);\n`,
     );
     await chmod(script, 0o700);
     const fence = new FileImageCreationFence(dir, owner);
@@ -300,25 +384,40 @@ async function runEffectiveConfigTest(
       owner,
       fence,
     );
-    const request = runtime.explore({
+    const controller = new AbortController();
+    const input = {
       digest,
       ...identity,
-      query: 'symbol',
       projectPath: IMAGE_PROJECT_PATH,
-      readOnlyRoot: true,
-      signal: AbortSignal.timeout(5000),
-    });
-    if (scenario === 'safe') {
+      readOnlyRoot: true as const,
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+    };
+    const request = call ? runtime.callTool({ ...input, call }) : runtime.explore({ ...input, query: 'symbol' });
+    if (scenario === 'safe' && mode === 'success') {
       assert.equal(await request, 'found');
-      assert.equal(await readFile(started, 'utf8'), 'yes');
     } else {
-      await assert.rejects(request);
-      await assert.rejects(readFile(started), { code: 'ENOENT' });
+      const rejected = assert.rejects(request);
+      if (mode === 'cancel' || mode === 'close') {
+        await invocation;
+        if (mode === 'cancel') controller.abort();
+        else await runtime.close();
+      }
+      await rejected;
     }
+    if (scenario === 'safe') assert.equal(await readFile(started, 'utf8'), 'yes');
+    else await assert.rejects(readFile(started), { code: 'ENOENT' });
+    if (scenario === 'safe' && !mode.startsWith('schema-')) {
+      assert.deepEqual(JSON.parse(await readFile(called, 'utf8')), {
+        name: expected.name,
+        arguments: { ...expected.arguments, projectPath: IMAGE_PROJECT_PATH },
+      });
+    } else await assert.rejects(readFile(called), { code: 'ENOENT' });
     assert.equal(await readFile(removed, 'utf8'), id);
     await fence.assertClear();
+    assert.equal(runtime.isUncertain(), false);
     await runtime.close();
   } finally {
+    watcher.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -327,4 +426,100 @@ test('effective container inspection allows only the pinned no-mount read-only i
   await runEffectiveConfigTest('safe');
   for (const scenario of ['wrong-image', 'writable', 'network', 'volume', 'malformed'] as const)
     await runEffectiveConfigTest(scenario);
+});
+
+test('Docker backend forwards every seven-tool parameter using only the requested observed schema', async () => {
+  for (const call of toolCalls) await runEffectiveConfigTest('safe', call);
+});
+
+test('Docker tool calls preserve effective mount, rootfs, image and network verification', async () => {
+  for (const scenario of ['wrong-image', 'writable', 'network', 'volume', 'malformed'] as const)
+    await runEffectiveConfigTest(scenario, toolCalls[0]);
+});
+
+test('incompatible requested schemas are rejected before upstream invocation and cleaned', async () => {
+  for (const mode of ['schema-missing', 'schema-type', 'schema-enum'] as const)
+    await runEffectiveConfigTest('safe', toolCalls[0], mode);
+});
+
+test('tool failures, nontext and oversized upstream results all clean the container and fence', async () => {
+  for (const mode of ['error', 'nontext', 'oversized'] as const)
+    await runEffectiveConfigTest('safe', toolCalls[0], mode);
+});
+
+test('tool cancellation and controller close await immutable container cleanup and clear the durable fence', async () => {
+  for (const mode of ['cancel', 'close'] as const) await runEffectiveConfigTest('safe', toolCalls[4], mode);
+});
+
+test('invalid tools, projectPath, escaping paths and legacy extra arguments are refused before authorization', async () => {
+  let authorizations = 0;
+  const runtime = new DockerImageQueryBackend(
+    async () => {
+      authorizations++;
+      return true;
+    },
+    '/definitely/not/docker',
+    3000,
+    owner,
+  );
+  const input = {
+    digest,
+    ...identity,
+    projectPath: IMAGE_PROJECT_PATH,
+    readOnlyRoot: true as const,
+    signal: new AbortController().signal,
+  };
+  for (const call of [
+    { name: 'shell', arguments: {} },
+    { name: 'codegraph_status', arguments: {} },
+    { name: 'codegraph_explore', arguments: { query: 'auth', projectPath: IMAGE_PROJECT_PATH } },
+    { name: 'codegraph_explore', arguments: { query: 'auth', maxFiles: 51 } },
+    { name: 'codegraph_node', arguments: { file: '../secret' } },
+    { name: 'codegraph_callers', arguments: { symbol: 'auth', file: '/etc/passwd' } },
+    { name: 'codegraph_files', arguments: { path: 'src/../../secret' } },
+    { name: 'codegraph_files', arguments: { pattern: '..\\secret' } },
+  ])
+    await assert.rejects(runtime.callTool({ ...input, call: call as CodeGraphToolCall }));
+  await assert.rejects(
+    runtime.callTool({ ...input, projectPath: '/elsewhere' as typeof IMAGE_PROJECT_PATH, call: toolCalls[0] }),
+  );
+  await assert.rejects(runtime.callTool({ ...input, readOnlyRoot: false as true, call: toolCalls[0] }));
+  await assert.rejects(runtime.callTool({ ...input, commit: 'bad', call: toolCalls[0] }));
+  await assert.rejects(
+    runtime.explore({ ...input, query: 'auth', maxFiles: 2 } as Parameters<DockerImageQueryBackend['explore']>[0]),
+  );
+  await assert.rejects(runtime.explore({ ...input, query: { query: 'auth', maxFiles: 2 } as unknown as string }));
+  assert.equal(authorizations, 0);
+  assert.equal(runtime.isUncertain(), false);
+  await runtime.close();
+});
+
+test('every tool requires the unchanged digest, repository and commit authorization before Docker', async () => {
+  const checked: unknown[] = [];
+  const runtime = new DockerImageQueryBackend(
+    async (...args) => {
+      checked.push(args);
+      return false;
+    },
+    '/definitely/not/docker',
+    3000,
+    owner,
+  );
+  for (const call of toolCalls)
+    await assert.rejects(
+      runtime.callTool({
+        digest,
+        ...identity,
+        call,
+        projectPath: IMAGE_PROJECT_PATH,
+        readOnlyRoot: true,
+        signal: new AbortController().signal,
+      }),
+      /unavailable/,
+    );
+  assert.deepEqual(
+    checked,
+    toolCalls.map(() => [digest, identity.repoId, identity.commit]),
+  );
+  await runtime.close();
 });

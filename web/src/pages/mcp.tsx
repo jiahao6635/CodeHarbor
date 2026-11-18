@@ -101,7 +101,13 @@ export default function McpPage() {
         </Card>
         <Card>
           <CardHeader>
-            <CardTitle>可用工具</CardTitle>
+            <div>
+              <CardTitle>可用工具（9 个）</CardTitle>
+              <CardDescription>
+                7 个代码工具均需传入 repo_id；file/path 使用仓库相对路径，不能传 projectPath。源码对应服务器已发布的
+                indexed_commit，不是本机工作区文件。
+              </CardDescription>
+            </div>
           </CardHeader>
           <dl className="grid grid-cols-1 gap-3 text-sm md:grid-cols-3">
             <div>
@@ -114,7 +120,38 @@ export default function McpPage() {
             </div>
             <div>
               <dt className="font-mono text-xs">codegraph_explore</dt>
-              <dd className="text-muted-foreground">传入 repo_id 与 query，按符号、调用关系和源码片段探索代码。</dd>
+              <dd className="text-muted-foreground">
+                优先使用：传入 query，一次返回相关源码与调用关系；支持 maxFiles。
+              </dd>
+            </div>
+            <div>
+              <dt className="font-mono text-xs">codegraph_search</dt>
+              <dd className="text-muted-foreground">按 query 搜索符号位置，支持 kind 类型过滤与 limit。</dd>
+            </div>
+            <div>
+              <dt className="font-mono text-xs">codegraph_callers</dt>
+              <dd className="text-muted-foreground">查询谁调用 symbol；支持 file 消歧与 limit。</dd>
+            </div>
+            <div>
+              <dt className="font-mono text-xs">codegraph_callees</dt>
+              <dd className="text-muted-foreground">查询 symbol 调用了谁；支持 file 消歧与 limit。</dd>
+            </div>
+            <div>
+              <dt className="font-mono text-xs">codegraph_impact</dt>
+              <dd className="text-muted-foreground">分析修改 symbol 的影响范围；支持 file 与 depth（最多 10 层）。</dd>
+            </div>
+            <div>
+              <dt className="font-mono text-xs">codegraph_node</dt>
+              <dd className="text-muted-foreground">
+                传 file 读取带行号的源码，支持 offset、limit、symbolsOnly；传 symbol 查看定义与调用链，支持
+                includeCode、file、line。
+              </dd>
+            </div>
+            <div>
+              <dt className="font-mono text-xs">codegraph_files</dt>
+              <dd className="text-muted-foreground">
+                列出索引目录树，支持 path、pattern、format、includeMetadata 与 maxDepth。
+              </dd>
             </div>
           </dl>
         </Card>

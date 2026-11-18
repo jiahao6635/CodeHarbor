@@ -4,6 +4,10 @@ This image compiles upstream CodeGraph 1.6.2 from the pinned source archive. The
 archive SHA-256 is checked before extraction, `readonly-mcp.patch` selects the
 upstream read-only MCP engine and prevents the direct-mode writer lock when
 `CODEGRAPH_MCP_READ_ONLY=1`, and upstream's MIT license is retained in `LICENSE`.
+The runtime explicitly enables search, callers, callees, impact, node, explore
+and files. The patch preserves that explicit allowlist for small repositories;
+upstream otherwise hides some tools below 500 files. Both node modes operate on
+the published repository snapshot, never the client's local working copy.
 The final image uses a separate locked set of runtime dependencies and omits the
 upstream UI workspace; it does not contain the build-stage dev dependencies.
 

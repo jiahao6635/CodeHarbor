@@ -10,6 +10,7 @@ import test from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { CredentialCipher, createAccessKey } from '../src/auth.js';
+import { CODEGRAPH_TOOL_NAMES } from '../src/codegraph-tools.js';
 import { ImageCodeGraphClient } from '../src/image-codegraph.js';
 import { createInternalMcpHandler } from '../src/internal-mcp.js';
 import { type AuditEvent, createApp } from '../src/server.js';
@@ -202,7 +203,7 @@ test('split MCP process shares platform authorization and publication locking', 
     const first = await clientFor(key1.token);
     assert.deepEqual(
       (await first.listTools()).tools.map((tool) => tool.name),
-      ['list_repositories', 'get_repository_status', 'codegraph_explore'],
+      ['list_repositories', 'get_repository_status', ...CODEGRAPH_TOOL_NAMES],
     );
     assert.match(JSON.stringify(await first.callTool({ name: 'list_repositories', arguments: {} })), /fixture/);
     assert.match(

@@ -2,7 +2,14 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { chmod, lstat, unlink } from 'node:fs/promises';
 import net from 'node:net';
 import { dirname, isAbsolute } from 'node:path';
-import { IMAGE_PROJECT_PATH, type ImageDigest, type ImageQueryBackend, validImageIdentity } from './image-codegraph.js';
+import { validCodeGraphToolCall } from './codegraph-tools.js';
+import {
+  IMAGE_PROJECT_PATH,
+  type ImageDigest,
+  type ImageQueryBackend,
+  type ImageToolQueryRequest,
+  validImageIdentity,
+} from './image-codegraph.js';
 import {
   ImageRuntimeCancelledError,
   ImageRuntimeRequestError,
@@ -111,6 +118,7 @@ export class SocketImageQueryBackend implements ImageQueryBackend {
 
   async explore(input: Parameters<ImageQueryBackend['explore']>[0]): Promise<string> {
     if (
+      !exactKeys(input, ['digest', 'repoId', 'commit', 'query', 'projectPath', 'readOnlyRoot', 'signal']) ||
       input.readOnlyRoot !== true ||
       input.projectPath !== IMAGE_PROJECT_PATH ||
       !digestPattern.test(input.digest) ||
@@ -123,6 +131,27 @@ export class SocketImageQueryBackend implements ImageQueryBackend {
     const signal = AbortSignal.any([input.signal, AbortSignal.timeout(this.timeoutMs)]);
     const result = await this.request(
       { op: 'explore', digest: input.digest, repoId: input.repoId, commit: input.commit, query: input.query },
+      signal,
+      true,
+    );
+    if (typeof result !== 'string' || Buffer.byteLength(result) > 1024 * 1024)
+      throw new ImageRuntimeRequestError('Invalid image runtime result');
+    return result;
+  }
+
+  async callTool(input: ImageToolQueryRequest): Promise<string> {
+    if (
+      !exactKeys(input, ['digest', 'repoId', 'commit', 'call', 'projectPath', 'readOnlyRoot', 'signal']) ||
+      input.readOnlyRoot !== true ||
+      input.projectPath !== IMAGE_PROJECT_PATH ||
+      !digestPattern.test(input.digest) ||
+      !validImageIdentity(input) ||
+      !validCodeGraphToolCall(input.call)
+    )
+      throw new ImageRuntimeRequestError('Invalid image runtime request');
+    const signal = AbortSignal.any([input.signal, AbortSignal.timeout(this.timeoutMs)]);
+    const result = await this.request(
+      { op: 'call_tool', digest: input.digest, repoId: input.repoId, commit: input.commit, call: input.call },
       signal,
       true,
     );
@@ -263,33 +292,52 @@ export async function serveImageRuntime(options: {
               reply(null);
               return;
             }
+            const isExplore = request.op === 'explore';
             if (
-              request.op !== 'explore' ||
-              !exactKeys(request, ['op', 'token', 'digest', 'repoId', 'commit', 'query']) ||
+              (!isExplore && request.op !== 'call_tool') ||
+              !exactKeys(request, ['op', 'token', 'digest', 'repoId', 'commit', isExplore ? 'query' : 'call']) ||
               typeof request.digest !== 'string' ||
               !digestPattern.test(request.digest) ||
-              typeof request.query !== 'string' ||
-              !request.query.trim() ||
-              request.query.length > 2000 ||
               typeof request.repoId !== 'string' ||
               typeof request.commit !== 'string' ||
               !validImageIdentity({ repoId: request.repoId, commit: request.commit })
             )
               return fail();
+            const call = isExplore ? { name: 'codegraph_explore', arguments: { query: request.query } } : request.call;
+            if (!validCodeGraphToolCall(call)) return fail();
+            if (
+              !isExplore &&
+              !options.backend.callTool &&
+              (call.name !== 'codegraph_explore' || Object.keys(call.arguments).length !== 1)
+            )
+              return fail(true);
             if (activeQueries >= maxConcurrent) return fail(true);
             activeQueries++;
             active = true;
             try {
-              const result = await options.backend.explore({
+              const input: ImageToolQueryRequest = {
                 digest: request.digest as ImageDigest,
                 repoId: request.repoId,
                 commit: request.commit,
-                query: request.query,
+                call,
                 projectPath: IMAGE_PROJECT_PATH,
                 readOnlyRoot: true,
                 signal: abort.signal,
-              });
-              if (typeof result !== 'string' || Buffer.byteLength(result) > 1024 * 1024) return fail(true);
+              };
+              const result =
+                !isExplore && options.backend.callTool
+                  ? await options.backend.callTool(input)
+                  : await options.backend.explore({
+                      digest: input.digest,
+                      repoId: input.repoId,
+                      commit: input.commit,
+                      query: call.arguments.query as string,
+                      projectPath: IMAGE_PROJECT_PATH,
+                      readOnlyRoot: true,
+                      signal: abort.signal,
+                    });
+              if (abort.signal.aborted || typeof result !== 'string' || Buffer.byteLength(result) > 1024 * 1024)
+                return fail(true);
               reply(result);
             } catch (error) {
               fail(error instanceof ImageRuntimeRequestError);

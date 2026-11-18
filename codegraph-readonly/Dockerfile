@@ -25,7 +25,8 @@ COPY LICENSE ./LICENSE
 COPY seal-index.cjs ./seal-index.cjs
 USER node
 ENV HOME=/tmp CODEGRAPH_MCP_READ_ONLY=1 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-    CODEGRAPH_NO_DOWNLOAD=1 DO_NOT_TRACK=1
+    CODEGRAPH_NO_DOWNLOAD=1 DO_NOT_TRACK=1 \
+    CODEGRAPH_MCP_TOOLS=search,callers,callees,impact,node,explore,files
 WORKDIR /workspace/repo
 ENTRYPOINT ["node", "/readonly-codegraph/dist/bin/codegraph.js"]
 CMD ["serve", "--mcp", "--path", "/workspace/repo"]

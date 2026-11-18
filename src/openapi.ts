@@ -485,7 +485,7 @@ export const openApiDocument = {
         tags: ['MCP'],
         summary: 'MCP Streamable HTTP 入口',
         description:
-          '使用 CodeHarbor API Key，通过 MCP 客户端进行 initialize、tools/list 和 tools/call。工具包括 list_repositories、get_repository_status、codegraph_explore。明确仓库列表的 Key 按列表授权；无范围 read Key 按持有者当前云效权限授权并缓存复核。每个 Key 每分钟有请求配额，超出返回 429。write 不能修改仓库代码。',
+          '使用 CodeHarbor API Key，通过 MCP 客户端进行 initialize、tools/list 和 tools/call。工具包括 list_repositories、get_repository_status，以及 codegraph_search、codegraph_callers、codegraph_callees、codegraph_impact、codegraph_node、codegraph_explore、codegraph_files。代码工具必须传 repo_id；支持固定上游版本的参数（如 file、limit、maxFiles），不接受 projectPath 或仓库外路径。明确仓库列表的 Key 按列表授权；无范围 read Key 按持有者当前云效权限授权并缓存复核。每个 Key 每分钟有请求配额，超出返回 429。write 不能修改仓库代码。',
         requestBody: request({ type: 'object', description: 'MCP JSON-RPC 消息。' }, true),
         responses: {
           '200': { description: 'MCP 响应；格式和头部遵循 MCP 协议。' },
