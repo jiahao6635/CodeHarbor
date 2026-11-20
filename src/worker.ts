@@ -33,7 +33,7 @@ export type WorkerOptions = {
   build?: (request: IndexRequest) => Promise<IndexCandidate>;
   head?: (request: IndexRequest) => Promise<string>;
   healthy?: (request: IndexRequest, worktree: string, commit: string) => Promise<boolean>;
-  releaseCandidate?: (candidate: IndexCandidate) => void;
+  releaseCandidate?: (candidate: IndexCandidate, retainedReferences: string[]) => void | Promise<void>;
   probe?: (request: IndexRequest) => Promise<boolean>;
 };
 
@@ -356,7 +356,13 @@ export class IndexWorker {
         await this.enqueue(repo.id, 'branch_changed');
       }
     } finally {
-      if (candidate) this.options.releaseCandidate?.(candidate);
+      if (candidate && this.options.releaseCandidate) {
+        const latest = await store.getRepository(repo.id);
+        const retainedReferences = [latest?.path, latest?.previous_image].filter(
+          (reference): reference is string => !!reference && /^oci:\/\/sha256:[a-f0-9]{64}$/.test(reference),
+        );
+        await this.options.releaseCandidate(candidate, [...new Set(retainedReferences)]);
+      }
       // Only remove a path constructed for this repository and this generation.
       if (candidate && !published && /^[0-9a-f-]{36}$/.test(candidate.generation)) {
         const expected = resolve(

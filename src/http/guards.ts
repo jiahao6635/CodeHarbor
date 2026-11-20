@@ -7,28 +7,23 @@ import { fail } from './errors.js';
 type BearerRequest = Pick<IncomingMessage, 'headers' | 'socket'> & { durableAudit?: boolean };
 
 /** Reserves per-client authentication capacity before any bearer value can reach the key store. */
-export function admitBearerAuthentication(ctx: AppContext, request: BearerRequest): string {
-  const client = ctx.clientIp(request);
-  if (!ctx.limiters.authFailure.hit(client)) {
+export function admitBearerAuthentication(ctx: AppContext, request: BearerRequest): () => void {
+  const release = ctx.limiters.authFailure.reserve(ctx.clientIp(request));
+  if (!release) {
     request.durableAudit = false;
     fail(429, 'RATE_LIMITED');
   }
-  return client;
-}
-
-/** Successful authentication and backend errors do not consume the client's failure budget. */
-export function releaseBearerAuthentication(ctx: AppContext, client: string): void {
-  ctx.limiters.authFailure.release(client);
+  return release;
 }
 
 export async function authenticateBearerRequest(ctx: AppContext, request: BearerRequest): Promise<Principal | null> {
-  const client = admitBearerAuthentication(ctx, request);
+  const release = admitBearerAuthentication(ctx, request);
   try {
     const key = await ctx.authorization.authenticateBearer(request.headers.authorization ?? '');
-    if (key) releaseBearerAuthentication(ctx, client);
+    if (key) release();
     return key;
   } catch (error) {
-    releaseBearerAuthentication(ctx, client);
+    release();
     throw error;
   }
 }

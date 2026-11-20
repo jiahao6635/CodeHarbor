@@ -13,6 +13,16 @@ function required(name: string): string {
   return value;
 }
 
+function boundedInteger(name: string, fallback: number, minimum: number, maximum: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^[1-9][0-9]*$/.test(raw)) throw new Error('Invalid image controller storage limits');
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum)
+    throw new Error('Invalid image controller storage limits');
+  return value;
+}
+
 /** This process alone has Docker access; the gateway uses restricted Unix sockets. */
 async function main() {
   const maxConcurrent = queryConcurrency(process.env.CODEHARBOR_MCP_QUERY_CONCURRENCY);
@@ -26,6 +36,13 @@ async function main() {
   const fenceDirectory = required('CODEHARBOR_IMAGE_FENCE_DIR');
   const workDir = required('CODEHARBOR_IMAGE_BUILD_WORK_DIR');
   const controllerId = required('CODEHARBOR_IMAGE_CONTROLLER_ID');
+  const maxTrustedImages = boundedInteger('CODEHARBOR_IMAGE_MAX_IMAGES', 512, 3, 10_000);
+  const maxStorageBytes = boundedInteger(
+    'CODEHARBOR_IMAGE_STORAGE_BUDGET_BYTES',
+    64 * 1024 * 1024 * 1024,
+    2 * 1024 * 1024 * 1024,
+    Number.MAX_SAFE_INTEGER,
+  );
   const [queryToken, buildToken, authToken] = await Promise.all([
     readFile(required('CODEHARBOR_IMAGE_QUERY_TOKEN_FILE'), 'utf8'),
     readFile(required('CODEHARBOR_IMAGE_BUILD_TOKEN_FILE'), 'utf8'),
@@ -60,6 +77,8 @@ async function main() {
       allowlistPath,
       workDir,
       socketMode: 0o660,
+      maxTrustedImages,
+      maxStorageBytes,
     });
     runtime = await serveImageRuntime({
       path: querySocket,

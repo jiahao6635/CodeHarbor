@@ -49,4 +49,5 @@ export function validateProduction(env: NodeJS.ProcessEnv, dbUrl: string): void 
   validateDatabaseTls(env, dbUrl);
   if (env.NODE_ENV !== 'production') return;
   if (env.CODEHARBOR_KEY_PROVIDER !== 'vault-transit') throw new Error('Production requires Vault Transit');
+  if (indexBackend(env) !== 'image') throw new Error('Production requires the bounded image index backend');
 }

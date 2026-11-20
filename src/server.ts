@@ -96,7 +96,8 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
             build: (request: IndexRequest) => imagePipeline.build(request),
             healthy: (request: IndexRequest, reference: string, commit: string) =>
               imagePipeline.healthy(request, reference, commit),
-            releaseCandidate: (candidate: { path: string }) => imagePipeline.release(candidate.path),
+            releaseCandidate: (candidate: { path: string }, retainedReferences: string[]) =>
+              imagePipeline.release(candidate.path, retainedReferences),
           }
         : {}),
     });

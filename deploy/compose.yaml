@@ -4,6 +4,11 @@ services:
       context: ..
     restart: unless-stopped
     init: true
+    # The production image backend has one serial index worker. Keep its Git and
+    # CodeGraph children inside a host-preserving cgroup as well as bounded tmpfs.
+    cpus: ${CODEHARBOR_APP_CPUS:-2.0}
+    mem_limit: ${CODEHARBOR_APP_MEMORY_LIMIT:-4g}
+    pids_limit: ${CODEHARBOR_APP_PIDS_LIMIT:-256}
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]

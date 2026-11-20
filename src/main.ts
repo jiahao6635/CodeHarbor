@@ -148,8 +148,26 @@ async function main() {
         token: buildToken.trim(),
         runtimeImage: runtimeId,
       });
-      imagePipeline = new ImageIndexPipeline(runtimeId, graph, undefined, (request) =>
-        buildRepositoryImage(request, executor.execute),
+      const retainedImages = (await store.listRepositories())
+        .map((repository) => ({
+          repositoryId: repository.id,
+          imageIds: [...new Set([repository.path, repository.previous_image])]
+            .filter(
+              (reference): reference is string =>
+                typeof reference === 'string' && /^oci:\/\/sha256:[a-f0-9]{64}$/.test(reference),
+            )
+            .map((reference) => reference.slice('oci://'.length)),
+        }))
+        .filter((repository) => repository.imageIds.length > 0);
+      // No worker or authorizer is running yet, so this snapshot safely retires
+      // interrupted candidates and images belonging to deleted repositories.
+      await executor.reconcileAll(retainedImages);
+      imagePipeline = new ImageIndexPipeline(
+        runtimeId,
+        graph,
+        undefined,
+        (request) => buildRepositoryImage(request, executor.execute),
+        executor,
       );
       authorizer = await serveImageAuthorizer({
         path: authSocket,

@@ -6,6 +6,10 @@ import { buildRepositoryImage, type RepositoryImageBuildResult, type RepositoryI
 import { parseImageReference } from './image-codegraph.js';
 import { buildIndexCandidate, type IndexCandidate, type IndexRequest } from './indexer.js';
 
+export type ImageLifecycle = {
+  reconcileRepository(repositoryId: string, imageIds: string[]): Promise<void>;
+};
+
 /** Build checkouts are disposable and never become the published repository. */
 export class ImageIndexPipeline {
   private readonly candidates = new Map<string, { repoId: string; commit: string }>();
@@ -16,6 +20,7 @@ export class ImageIndexPipeline {
     private readonly buildImage: (
       request: RepositoryImageRequest,
     ) => Promise<RepositoryImageBuildResult> = buildRepositoryImage,
+    private readonly lifecycle?: ImageLifecycle,
   ) {
     if (!/^sha256:[a-f0-9]{64}$/.test(runtimeImage)) throw new Error('Invalid runtime image ID');
   }
@@ -47,7 +52,12 @@ export class ImageIndexPipeline {
     return !!candidate && candidate.repoId === repoId && candidate.commit === commit;
   }
 
-  release(reference: string): void {
+  async release(reference: string, retainedReferences: string[] = []): Promise<void> {
+    const candidate = this.candidates.get(reference);
+    if (candidate && this.lifecycle) {
+      const imageIds = retainedReferences.map((retained) => parseImageReference(retained));
+      await this.lifecycle.reconcileRepository(candidate.repoId, [...new Set(imageIds)]);
+    }
     this.candidates.delete(reference);
   }
 

@@ -4,7 +4,7 @@ import { hashAccessKey } from '../auth.js';
 import { bearerToken, type Principal } from '../authorization.js';
 import type { AppContext } from '../http/context.js';
 import { fail, HttpError } from '../http/errors.js';
-import { admitBearerAuthentication, releaseBearerAuthentication } from '../http/guards.js';
+import { admitBearerAuthentication } from '../http/guards.js';
 import { mcpRepository } from '../http/views.js';
 import { createMcpHandler } from '../mcp.js';
 
@@ -15,32 +15,28 @@ import { createMcpHandler } from '../mcp.js';
 export function registerMcpRoute(app: FastifyInstance, ctx: AppContext): void {
   const { authorization, config } = ctx;
   const requests = new WeakMap<IncomingMessage, FastifyRequest>();
-  const admissions = new WeakMap<IncomingMessage, string>();
+  const admissions = new WeakMap<IncomingMessage, () => void>();
 
   const handler = createMcpHandler<Principal>({
     allowedHosts: config.allowedHosts,
     allowedOrigins: config.allowedOrigins,
     async authenticate(raw) {
-      const client = admissions.get(raw);
+      const release = admissions.get(raw);
+      admissions.delete(raw);
+      let key: Principal | null;
       try {
-        const key = await authorization.authenticateBearer(raw.headers.authorization ?? '');
-        if (client) {
-          admissions.delete(raw);
-          if (key) releaseBearerAuthentication(ctx, client);
-        }
-        if (!key) return null;
-        const request = requests.get(raw);
-        if (request) {
-          request.actor = { ...request.actor, subject: key.owner, key_prefix: key.prefix, authentication: 'api_key' };
-        }
-        return key;
+        key = await authorization.authenticateBearer(raw.headers.authorization ?? '');
       } catch (error) {
-        if (client) {
-          admissions.delete(raw);
-          releaseBearerAuthentication(ctx, client);
-        }
+        release?.();
         throw error;
       }
+      if (!key) return null;
+      release?.();
+      const request = requests.get(raw);
+      if (request) {
+        request.actor = { ...request.actor, subject: key.owner, key_prefix: key.prefix, authentication: 'api_key' };
+      }
+      return key;
     },
     listRepositories: async (key, signal) => (await authorization.queryList(key, signal)).map(mcpRepository),
     getRepository: async (key, id, signal) => {
@@ -69,11 +65,19 @@ export function registerMcpRoute(app: FastifyInstance, ctx: AppContext): void {
     onRequest: async (request, reply) => {
       if (config.publicMcpDisabled) fail(404, 'NOT_FOUND');
       const token = bearerToken(request.headers.authorization ?? '');
-      if (token && !ctx.limiters.mcpKey.hit(hashAccessKey(token))) fail(429, 'RATE_LIMITED');
+      if (token && !ctx.limiters.mcpKey.hit(hashAccessKey(token))) {
+        request.durableAudit = false;
+        fail(429, 'RATE_LIMITED');
+      }
       admissions.set(request.raw, admitBearerAuthentication(ctx, request));
       requests.set(request.raw, request);
       reply.hijack();
-      await handler(request.raw, reply.raw as ServerResponse);
+      try {
+        await handler(request.raw, reply.raw as ServerResponse);
+      } finally {
+        admissions.get(request.raw)?.();
+        admissions.delete(request.raw);
+      }
     },
     handler: async () => {},
   });

@@ -6,6 +6,7 @@ import type { AppContext } from '../src/http/context.js';
 import { HttpError } from '../src/http/errors.js';
 import { authenticateBearerRequest } from '../src/http/guards.js';
 import { RateLimiter } from '../src/rate-limit.js';
+import { type AuditEvent, createApp } from '../src/server.js';
 
 const validToken = `ch_${'v'.repeat(43)}`;
 const validKey: Principal = {
@@ -17,6 +18,66 @@ const validKey: Principal = {
   expires_at: null,
   revoked: 0,
 };
+
+test('releasing a bearer reservation only changes its original window once', () => {
+  const limiter = new RateLimiter(2, 60_000);
+  const client = '198.51.100.10';
+  const oldRelease = limiter.reserve(client, 0);
+  assert.ok(oldRelease);
+
+  const release = limiter.reserve(client, 60_000);
+  assert.ok(release);
+  assert.equal(limiter.hit(client, 60_000), true);
+  oldRelease();
+  assert.equal(limiter.blocked(client, 60_000), true);
+
+  release();
+  release();
+  assert.equal(limiter.hit(client, 60_000), true);
+  assert.equal(limiter.blocked(client, 60_000), true);
+});
+
+test('MCP rate limits skip the durable audit sink for requests rejected before authentication', async (t) => {
+  const audits: AuditEvent[] = [];
+  const allowedHosts: string[] = [];
+  const app = createApp(
+    {
+      dataDir: '.',
+      credentialKey: Buffer.alloc(32),
+      codeupEndpoint: 'https://devops.example',
+      organizationId: 'org',
+      allowedGitHosts: [],
+      allowedHosts,
+      writeUsers: [],
+      codegraphBin: 'codegraph',
+      authFailureRatePerMinute: 1,
+      mcpKeyRatePerMinute: 1,
+    },
+    {
+      store: { async getKey() {}, async close() {} } as never,
+      worker: { async stop() {} } as never,
+      audit: (event) => audits.push(event),
+    },
+  );
+  t.after(() => app.close());
+  const base = await app.listen({ port: 0, host: '127.0.0.1' });
+  allowedHosts.push(new URL(base).host);
+  const request = async (token: string) => {
+    const response = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    await response.text();
+    return response.status;
+  };
+  assert.equal(await request(validToken), 401);
+  assert.equal(await request(validToken), 429);
+  assert.equal(await request(`ch_${'w'.repeat(43)}`), 429);
+  assert.deepEqual(
+    audits.map((event) => event.status),
+    [401],
+  );
+});
 
 test('bearer admission bounds key lookups while preserving valid clients and source isolation', async () => {
   let keyLookups = 0;

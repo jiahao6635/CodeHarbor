@@ -218,9 +218,9 @@ test('real Git to trusted repository image and isolated readonly MCP query', {
     assert.match(result, /orchidsentinel_reference/);
     assert.doesNotMatch(result, /fictional-token-not-in-image/);
     published.set(identity.repoId, { image: built.path, ...identity });
-    pipeline.release(built.path);
+    await pipeline.release(built.path);
     published.set('fixture-beta', { image: betaBuilt.path, repoId: 'fixture-beta', commit: betaCommit });
-    pipeline.release(betaBuilt.path);
+    await pipeline.release(betaBuilt.path);
     let releaseParallel!: () => void;
     let enteredParallel!: () => void;
     const release = new Promise<void>((resolve) => {

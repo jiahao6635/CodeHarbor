@@ -1,6 +1,6 @@
 # 镜像模式部署准备
 
-此模板用于单服务器评估镜像模式。CodeHarbor 应用在 `/data` 的 tmpfs 中临时克隆和建立索引，查询容器使用只读镜像；不会把 Git 工作树或索引目录挂载为持久卷。Docker 镜像、层和构建缓存仍保存在 Docker 主机存储中，包含源码，须按源码等级保护。PostgreSQL 和 Vault 的持久化方案保持不变。
+此模板用于单服务器评估镜像模式。CodeHarbor 应用在 `/data` 的 tmpfs 中临时克隆和建立索引，查询容器使用只读镜像；不会把 Git 工作树或索引目录挂载为持久卷。受保留策略管理的 Docker 镜像和层仍保存在 Docker 主机存储中并包含源码，须按源码等级保护；固定封装流程不调用 Docker builder，因而不创建构建缓存。PostgreSQL 和 Vault 的持久化方案保持不变。
 
 并发查询版本的内部协议与旧控制器不兼容。升级时应安排维护窗口，先停止新请求并等待在途查询完成，安全停止旧平台和控制器；随后先启动新版控制器并确认就绪，再启动新版平台，验收后恢复流量。不要让新版平台与旧控制器同时处理查询。回退时同样先停流，确认全部查询容器和新版 pending 标记已按受控恢复流程处理，再切换旧版本。
 
@@ -33,6 +33,10 @@ export CODEHARBOR_REPOSITORY_RUNTIME_IMAGE="$(docker image inspect codeharbor-co
 配置以上目录、令牌文件和控制器 ID，同时准备 `production-deployment.md` 中已有的云效、PostgreSQL、Vault、TLS 和 Nginx 配置。若需本机 PostgreSQL，在基础文件和镜像文件之间加入 `deploy/compose.postgres.yaml`。
 
 `CODEHARBOR_MCP_QUERY_CONCURRENCY` 控制同时执行的查询数，默认 `10`，只接受 `1` 至 `32` 的整数。Compose 会将同一值传给平台和镜像控制器；若自行部署两个服务或追加 override，必须保持两者相同，修改值后需同步重启。默认 10 个查询容器合计最多可使用 10 核 CPU 和 5 GiB 内存，实际影响取决于工作负载和同机其他服务，需压测确认。
+
+基础 Compose 还将应用及其串行 Git/CodeGraph 索引任务限制为默认 2 个 CPU、4 GiB 内存和 256 个 PID；可通过 `CODEHARBOR_APP_CPUS`、`CODEHARBOR_APP_MEMORY_LIMIT`、`CODEHARBOR_APP_PIDS_LIMIT` 按经过容量验证的部署调整。不得移除这些 cgroup 上限，或把限额提高到会影响同机服务恢复能力的值。
+
+`CODEHARBOR_IMAGE_MAX_IMAGES` 和 `CODEHARBOR_IMAGE_STORAGE_BUDGET_BYTES` 分别限制控制器管理的镜像总数和计费存储，默认 `512` 与 64 GiB。每个仓库另外固定限制为当前、上一版本和候选版本三个镜像。控制器会在接收构建内容和调用 Docker 前完成容量检查；请把字节预算设置为小于专用 Docker 数据盘实际容量的值，并为只读运行时镜像、Docker 元数据和运维恢复预留余量。更新预算后需重启控制器；不得用增大预算代替磁盘监控和容量告警。
 
 `CODEHARBOR_DOCKER_CLI_IMAGE` 控制构建控制器镜像所用的 Docker CLI 镜像，默认 `docker:27-cli`；生产构建应指定企业审核并固定 digest 的镜像。控制器最终仍连接宿主机 Docker daemon，应确认客户端与 daemon 版本兼容。
 
