@@ -80,6 +80,7 @@ test('image mode starts on PostgreSQL, authorizes published images, and restarts
   let child: ChildProcess | undefined;
   let store: StoreBackend | undefined;
   let runtime: Awaited<ReturnType<typeof serveImageRuntime>> | undefined;
+  let buildControl: net.Server | undefined;
   let databaseCreated = false;
   let adminConnected = false;
   try {
@@ -130,6 +131,7 @@ test('image mode starts on PostgreSQL, authorizes published images, and restarts
       writeFile(dbFile, dbUrl.href, { mode: 0o600 }),
     ]);
     const querySocket = join(root, 'q.sock');
+    const buildSocket = join(root, 'b.sock');
     const authSocket = join(authDir, 'a.sock');
     let probeCount = 0;
     runtime = await serveImageRuntime({
@@ -144,6 +146,21 @@ test('image mode starts on PostgreSQL, authorizes published images, and restarts
           throw new Error('not used');
         },
       },
+    });
+    buildControl = net.createServer({ allowHalfOpen: true }, (socket) => {
+      let data = '';
+      socket.on('data', (chunk) => {
+        data += chunk.toString();
+        if (!data.endsWith('\n')) return;
+        const request = JSON.parse(data);
+        assert.equal(request.op, 'reconcile_all');
+        assert.equal(request.token, buildToken);
+        socket.end('{"ok":true}\n');
+      });
+    });
+    await new Promise<void>((resolveListen, reject) => {
+      buildControl!.once('error', reject);
+      buildControl!.listen(buildSocket, resolveListen);
     });
     const port = await reservePort();
     const base = `http://127.0.0.1:${port}`;
@@ -160,7 +177,7 @@ test('image mode starts on PostgreSQL, authorizes published images, and restarts
       CODEHARBOR_REPOSITORY_RUNTIME_IMAGE: `sha256:${'c'.repeat(64)}`,
       CODEHARBOR_IMAGE_QUERY_SOCKET: querySocket,
       CODEHARBOR_IMAGE_QUERY_TOKEN_FILE: queryFile,
-      CODEHARBOR_IMAGE_BUILD_SOCKET: join(root, 'b.sock'),
+      CODEHARBOR_IMAGE_BUILD_SOCKET: buildSocket,
       CODEHARBOR_IMAGE_BUILD_TOKEN_FILE: buildFile,
       CODEHARBOR_IMAGE_AUTH_SOCKET: authSocket,
       CODEHARBOR_IMAGE_AUTH_TOKEN_FILE: authFile,
@@ -192,6 +209,8 @@ test('image mode starts on PostgreSQL, authorizes published images, and restarts
         child?.kill('SIGKILL');
       });
     await runtime?.close();
+    if (buildControl)
+      await new Promise<void>((resolveClose) => buildControl!.close(() => resolveClose()));
     await store?.close();
     if (databaseCreated) await admin.query(`DROP DATABASE IF EXISTS "${dbName}"`);
     if (adminConnected) await admin.end();

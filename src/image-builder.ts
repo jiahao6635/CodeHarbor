@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants, createWriteStream } from 'node:fs';
-import { access, lstat, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { backup, DatabaseSync } from 'node:sqlite';
 import { pipeline } from 'node:stream/promises';
 import type { IndexCandidate } from './indexer.js';
@@ -109,6 +109,97 @@ async function dockerCommand(args: string[], home: string, signal: AbortSignal):
   });
 }
 
+type OwnedImageDetails = {
+  id: string;
+  labels: Record<string, unknown>;
+  repoTags: string[] | null;
+  size: number;
+};
+const ownedInspectFormat =
+  '{"id":{{json .Id}},"labels":{{json .Config.Labels}},"repoTags":{{json .RepoTags}},"size":{{json .Size}}}';
+
+async function inspectOwnedImage(
+  reference: string,
+  home: string,
+  signal: AbortSignal,
+  allowMissing = false,
+): Promise<OwnedImageDetails | null> {
+  const result = await dockerCommand(['image', 'inspect', '--format', ownedInspectFormat, reference], home, signal);
+  if (result.code !== 0) {
+    if (allowMissing && /No such image:/i.test(result.stderr) && !result.stdout.trim()) return null;
+    throw new RepositoryImageError('BUILD_FAILED', 'Repository image inspection failed');
+  }
+  let value: OwnedImageDetails;
+  try {
+    value = JSON.parse(result.stdout);
+  } catch {
+    throw new RepositoryImageError('BUILD_FAILED', 'Repository image inspection failed');
+  }
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    !imagePattern.test(value.id) ||
+    !value.labels ||
+    typeof value.labels !== 'object' ||
+    Array.isArray(value.labels) ||
+    !Number.isSafeInteger(value.size) ||
+    value.size < 1 ||
+    !(value.repoTags === null || (Array.isArray(value.repoTags) && value.repoTags.every((tag) => typeof tag === 'string')))
+  )
+    throw new RepositoryImageError('BUILD_FAILED', 'Repository image inspection failed');
+  return value;
+}
+
+export type OwnedRepositoryImage = {
+  imageId: string;
+  repositoryId: string;
+  commit: string;
+};
+
+/** Removes only an immutable image whose platform-authored identity and every local tag still match. */
+export async function removeOwnedRepositoryImage(
+  image: OwnedRepositoryImage,
+  home: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (
+    !imagePattern.test(image.imageId) ||
+    !idPattern.test(image.repositoryId) ||
+    !commitPattern.test(image.commit) ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1
+  )
+    throw new RepositoryImageError('BUILD_FAILED', 'Invalid repository image cleanup');
+  const deadline = AbortSignal.timeout(timeoutMs);
+  const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  const details = await inspectOwnedImage(image.imageId, home, combined, true);
+  if (!details) return;
+  const expectedTag = `codeharbor-repo:${createHash('sha256').update(image.repositoryId).digest('hex').slice(0, 20)}-`;
+  if (
+    details.id !== image.imageId ||
+    details.labels['io.codeharbor.repository-id'] !== image.repositoryId ||
+    details.labels['io.codeharbor.commit'] !== image.commit ||
+    details.labels['io.codeharbor.codegraph-version'] !== '1.6.2' ||
+    details.repoTags?.some(
+      (tag) => !tag.startsWith(expectedTag) || !/^[a-f0-9-]{36}$/.test(tag.slice(expectedTag.length)),
+    )
+  )
+    throw new RepositoryImageError('BUILD_FAILED', 'Repository image ownership changed');
+  for (const tag of details.repoTags ?? []) {
+    const removedTag = await dockerCommand(['image', 'rm', tag], home, combined);
+    if (removedTag.code !== 0 && !/No such image:/i.test(removedTag.stderr))
+      throw new RepositoryImageError('BUILD_FAILED', 'Repository image cleanup failed');
+  }
+  if (await inspectOwnedImage(image.imageId, home, combined, true)) {
+    const removedImage = await dockerCommand(['image', 'rm', image.imageId], home, combined);
+    if (removedImage.code !== 0)
+      throw new RepositoryImageError('BUILD_FAILED', 'Repository image cleanup failed');
+  }
+  if (await inspectOwnedImage(image.imageId, home, combined, true))
+    throw new RepositoryImageError('BUILD_FAILED', 'Repository image cleanup failed');
+}
+
 async function inspectImage(
   reference: string,
   home: string,
@@ -146,7 +237,7 @@ async function inspectImage(
   return value;
 }
 
-/** BuildKit requires a local tag in FROM; it is pinned and checked before and after use. */
+/** Creates one repository layer without invoking Docker's persistent build cache. */
 export async function executeFixedDockerBuild(
   context: string,
   iidFile: string,
@@ -164,79 +255,99 @@ export async function executeFixedDockerBuild(
     throw new RepositoryImageError('BUILD_FAILED', 'Invalid image build arguments');
   const deadline = AbortSignal.timeout(timeoutMs);
   const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
-  // Docker Desktop installs buildx outside the system search path; use a fresh
-  // config containing only that official plugin directory, never user credentials.
-  if (process.platform === 'darwin') {
-    const pluginDirectory = '/Applications/Docker.app/Contents/Resources/cli-plugins';
-    try {
-      await access(join(pluginDirectory, 'docker-buildx'), constants.X_OK);
-    } catch {
-      throw new RepositoryImageError('BUILD_FAILED', 'Docker buildx is unavailable');
-    }
-    const dockerConfig = join(context, '.docker');
-    await mkdir(dockerConfig, { mode: 0o700 });
-    await writeFile(join(dockerConfig, 'config.json'), JSON.stringify({ cliPluginsExtraDirs: [pluginDirectory] }), {
-      mode: 0o600,
-      flag: 'wx',
-    });
-  }
   const baseline = await inspectImage(runtimeImage, context, combined);
-  if (!baseline || baseline.id !== runtimeImage)
+  if (!baseline || baseline.id !== runtimeImage || baseline.workingDir !== '/workspace/repo')
     throw new RepositoryImageError('BUILD_FAILED', 'Runtime image mismatch');
-  const runtimeTag = `codeharbor-runtime:sha-${runtimeImage.slice(7)}`;
-  const existing = await inspectImage(runtimeTag, context, combined, true);
-  if (existing && existing.id !== runtimeImage)
-    throw new RepositoryImageError('BUILD_FAILED', 'Runtime image tag mismatch');
-  if (!existing) {
-    const tagged = await dockerCommand(['image', 'tag', runtimeImage, runtimeTag], context, combined);
-    if (tagged.code !== 0) throw new RepositoryImageError('BUILD_FAILED', 'Runtime image tag failed');
-  }
-  const before = await inspectImage(runtimeTag, context, combined);
-  if (!before || before.id !== runtimeImage)
-    throw new RepositoryImageError('BUILD_FAILED', 'Runtime image tag mismatch');
   const dockerfilePath = join(context, 'Dockerfile');
   const dockerfile = await readFile(dockerfilePath, 'utf8');
-  if (!dockerfile.startsWith(`FROM ${runtimeImage}\n`))
+  const instructions =
+    /^FROM (sha256:[a-f0-9]{64})\nCOPY --chown=1000:1000 repo \/workspace\/repo\nLABEL io\.codeharbor\.repository-id="([A-Za-z0-9_-]{1,128})"\nLABEL io\.codeharbor\.commit="([a-f0-9]{40,64})"\nLABEL io\.codeharbor\.codegraph-version="1\.6\.2"\n$/.exec(
+      dockerfile,
+    );
+  if (!instructions || instructions[1] !== runtimeImage)
     throw new RepositoryImageError('BUILD_FAILED', 'Invalid runtime image');
-  await writeFile(dockerfilePath, `FROM ${runtimeTag}\n${dockerfile.slice(`FROM ${runtimeImage}\n`.length)}`, {
-    mode: 0o600,
-  });
-  const result = await dockerCommand(
-    [
-      'build',
-      '--platform',
-      `linux/${baseline.arch}`,
-      '--network=none',
-      '--pull=false',
-      '--iidfile',
-      iidFile,
-      '--tag',
-      tag,
+  const repositoryId = instructions[2];
+  const commit = instructions[3];
+  const containerName = `codeharbor-build-${randomUUID()}`;
+  let containerId: string | undefined;
+  try {
+    const created = await dockerCommand(
+      [
+        'container',
+        'create',
+        '--name',
+        containerName,
+        '--network',
+        'none',
+        '--label',
+        'io.codeharbor.image-build-kind=repository',
+        '--label',
+        `io.codeharbor.repository-id=${repositoryId}`,
+        '--label',
+        `io.codeharbor.image-build-request=${tag.slice('codeharbor-repo:'.length)}`,
+        runtimeImage,
+      ],
       context,
-    ],
-    context,
-    combined,
-  );
-  if (result.code !== 0) throw new RepositoryImageError('BUILD_FAILED', 'Image build failed');
-  const imageId = (await readFile(iidFile, 'utf8')).trim();
-  if (!imagePattern.test(imageId))
-    throw new RepositoryImageError('BUILD_FAILED', 'Image builder returned an invalid image ID');
-  const after = await inspectImage(runtimeTag, context, combined);
-  const built = await inspectImage(imageId, context, combined);
-  if (
-    !after ||
-    after.id !== runtimeImage ||
-    !built ||
-    built.id !== imageId ||
-    built.os !== baseline.os ||
-    built.arch !== baseline.arch ||
-    built.layers.length < baseline.layers.length ||
-    baseline.layers.some((layer, index) => built.layers[index] !== layer) ||
-    ['env', 'user', 'entrypoint', 'cmd', 'workingDir'].some(
-      (key) => JSON.stringify(built[key as keyof ImageDetails]) !== JSON.stringify(baseline[key as keyof ImageDetails]),
+      combined,
+    );
+    containerId = created.stdout.trim();
+    if (created.code !== 0 || !/^[a-f0-9]{64}$/.test(containerId))
+      throw new RepositoryImageError('BUILD_FAILED', 'Repository image container creation failed');
+    const copied = await dockerCommand(
+      ['container', 'cp', `${join(context, 'repo')}${sep}.`, `${containerId}:/workspace/repo`],
+      context,
+      combined,
+    );
+    if (copied.code !== 0) throw new RepositoryImageError('BUILD_FAILED', 'Repository image copy failed');
+    const committed = await dockerCommand(
+      [
+        'container',
+        'commit',
+        '--change',
+        `LABEL io.codeharbor.repository-id="${repositoryId}"`,
+        '--change',
+        `LABEL io.codeharbor.commit="${commit}"`,
+        '--change',
+        'LABEL io.codeharbor.codegraph-version="1.6.2"',
+        containerId,
+      ],
+      context,
+      combined,
+    );
+    const imageId = committed.stdout.trim();
+    if (committed.code !== 0 || !imagePattern.test(imageId))
+      throw new RepositoryImageError('BUILD_FAILED', 'Image builder returned an invalid image ID');
+    const after = await inspectImage(runtimeImage, context, combined);
+    const built = await inspectImage(imageId, context, combined);
+    const owned = await inspectOwnedImage(imageId, context, combined);
+    if (
+      !after ||
+      after.id !== runtimeImage ||
+      !built ||
+      built.id !== imageId ||
+      !owned ||
+      owned.id !== imageId ||
+      owned.labels['io.codeharbor.repository-id'] !== repositoryId ||
+      owned.labels['io.codeharbor.commit'] !== commit ||
+      owned.labels['io.codeharbor.codegraph-version'] !== '1.6.2' ||
+      (owned.repoTags !== null && owned.repoTags.length !== 0) ||
+      built.os !== baseline.os ||
+      built.arch !== baseline.arch ||
+      built.layers.length !== baseline.layers.length + 1 ||
+      baseline.layers.some((layer, index) => built.layers[index] !== layer) ||
+      ['env', 'user', 'entrypoint', 'cmd', 'workingDir'].some(
+        (key) =>
+          JSON.stringify(built[key as keyof ImageDetails]) !== JSON.stringify(baseline[key as keyof ImageDetails]),
+      )
     )
-  ) {
-    throw new RepositoryImageError('BUILD_FAILED', 'Image provenance verification failed');
+      throw new RepositoryImageError('BUILD_FAILED', 'Image provenance verification failed');
+    await writeFile(iidFile, imageId, { mode: 0o600, flag: 'wx' });
+  } finally {
+    if (containerId) {
+      const removed = await dockerCommand(['container', 'rm', containerId], context, combined);
+      if (removed.code !== 0)
+        throw new RepositoryImageError('BUILD_FAILED', 'Repository image container cleanup failed');
+    }
   }
 }
 
@@ -348,6 +459,7 @@ async function snapshotIndex(source: string, target: string, budget: { bytes: nu
   } finally {
     database.close();
   }
+  await chmod(join(target, '.codegraph', 'codegraph.db'), 0o644);
   if (budget.bytes + (await lstat(join(target, '.codegraph', 'codegraph.db'))).size > maxSourceBytes)
     throw new RepositoryImageError('CONTEXT_TOO_LARGE', 'Repository index is too large');
   // A readonly snapshot must not depend on WAL/SHM sidecars being writable or

@@ -7,7 +7,7 @@
 - CodeHarbor 使用 Fastify、官方 MCP SDK、CodeGraph 1.6.2 和 PostgreSQL；API、MCP 和索引 Worker 在同一进程中。生产模式只接受镜像索引后端，临时工作树和索引位于限额 tmpfs，发布结果进入本机 Docker 镜像。
 - PostgreSQL 连接持有 session advisory lock，同一数据库只允许一个 CodeHarbor 实例。连接断开时拒绝后续数据库操作；使用 supervisor 监控并重启。仅支持直连或 session pooling，禁止使用事务池模式。
 - PAT 使用 AES-256-GCM 加密，主密钥通过 Vault Transit 保护；启动时 Vault 解包主密钥到应用内存。详见 [Vault Transit 指南](vault-transit.md)。
-- 本模板没有跨实例任务租约、共享索引协调或高可用；不应增加副本。生产 Compose 对串行索引 Worker 所在应用设置 CPU、内存和 PID 上限，并以限额 tmpfs 约束克隆与索引磁盘，但仍须监控 Docker 镜像和构建缓存。未验证企业云效权限之前不能认为可以用于生产多租户。
+- 本模板没有跨实例任务租约、共享索引协调或高可用；不应增加副本。生产 Compose 对串行索引 Worker 所在应用设置 CPU、内存和 PID 上限，并以限额 tmpfs 约束克隆与索引磁盘，但仍须监控 Docker 镜像和镜像层的存储用量。未验证企业云效权限之前不能认为可以用于生产多租户。
 - 已发布索引的 MCP 查询只检查 CodeHarbor Key 的明确仓库列表、有效期和撤销状态，不实时检查持有人的云效权限。云效撤权或 PAT 失效不会自动收回已签发 Key 的读取权，管理员须主动撤销或替换 Key；旧 `repos: null` Key 不可直接通过 MCP 查询。受配置允许的 write 管理员仍可管理平台并签发限定仓库范围的 Key。
 - 仓库接入和索引同步仍使用明确授权的同步账号 PAT 探测 Git HTTPS upload-pack。探测最多同时执行 2 个，运行超时 30 秒，响应最多 32 MiB、100,000 个对象；探测会在临时目录验证 Git 包并清理。空仓库、没有可探测分支、服务器不支持 shallow、数据超限或协议校验失败时无法确认克隆权限。同步凭据失效时不发布新版本，旧索引仍可由有效的限定范围 Key 查询。
 - Nginx 对外提供 TLS，不公开 `/health/` 或 `/metrics`；指标通过受控内网及独立 Bearer 访问应用端口。按企业网关、告警和日志平台调整。
