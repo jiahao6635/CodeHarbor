@@ -51,6 +51,8 @@ test('builder socket streams a sanitized context, authorizes the image and persi
     assert.ok(dockerfile.startsWith(`FROM ${runtimeImage}\n`));
     assert.ok(!dockerfile.includes('never-use-this-file'));
     assert.equal(await readFile(join(context, 'repo', 'main.ts'), 'utf8'), 'export const answer = 42;\n');
+    assert.equal((await lstat(join(context, 'repo'))).mode & 0o777, 0o755);
+    assert.equal((await lstat(join(context, 'repo', 'main.ts'))).mode & 0o777, 0o644);
     await assert.rejects(lstat(join(context, 'repo', '.git')), { code: 'ENOENT' });
     await writeFile(iidFile, imageId);
   };
@@ -72,6 +74,105 @@ test('builder socket streams a sanitized context, authorizes the image and persi
     await service.close();
     service = undefined;
     service = await serveImageBuilder({ path: f.socket, token, runtimeImage, allowlistPath: f.allowlist, execute });
+    assert.ok(await getTrustedImage(f.allowlist, imageId, builderUid));
+  } finally {
+    await service?.close();
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+test('repository reconciliation retains two live generations and retires the obsolete owned image', async () => {
+  const f = await fixture();
+  const imageIds = ['c', 'd', 'e'].map((value) => `sha256:${value.repeat(64)}`);
+  const removed: string[] = [];
+  let builds = 0;
+  const service = await serveImageBuilder({
+    path: f.socket,
+    token,
+    runtimeImage,
+    allowlistPath: f.allowlist,
+    execute: async (_context, iidFile) => {
+      await writeFile(iidFile, imageIds[builds++]);
+    },
+    removeImage: async (image) => {
+      removed.push(image.imageId);
+    },
+  });
+  try {
+    const client = new SocketImageBuildExecutor({ path: f.socket, token, runtimeImage });
+    for (const expected of imageIds)
+      assert.equal((await buildRepositoryImage(f.request, client.execute)).image, `oci://${expected}`);
+    await client.reconcileRepository('repo-1', imageIds.slice(1));
+    assert.equal(await getTrustedImage(f.allowlist, imageIds[0], builderUid), null);
+    assert.ok(await getTrustedImage(f.allowlist, imageIds[1], builderUid));
+    assert.ok(await getTrustedImage(f.allowlist, imageIds[2], builderUid));
+    assert.deepEqual(removed, [imageIds[0]]);
+  } finally {
+    await service.close();
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+test('failed Docker retirement stays untrusted and blocks further Docker work without fencing', async () => {
+  const f = await fixture();
+  const imageIds = ['c', 'd', 'e', 'f'].map((value) => `sha256:${value.repeat(64)}`);
+  let builds = 0;
+  const options = {
+    path: f.socket,
+    token,
+    runtimeImage,
+    allowlistPath: f.allowlist,
+    execute: async (_context: string, iidFile: string) => {
+      await writeFile(iidFile, imageIds[builds++]);
+    },
+    removeImage: async () => {
+      throw new Error('injected Docker cleanup failure');
+    },
+  };
+  let service: Awaited<ReturnType<typeof serveImageBuilder>> | undefined;
+  try {
+    service = await serveImageBuilder(options);
+    const client = new SocketImageBuildExecutor({ path: f.socket, token, runtimeImage });
+    for (const expected of imageIds.slice(0, 3))
+      assert.equal((await buildRepositoryImage(f.request, client.execute)).image, `oci://${expected}`);
+    await client.reconcileRepository('repo-1', imageIds.slice(1, 3));
+    assert.equal(await getTrustedImage(f.allowlist, imageIds[0], builderUid), null);
+    await assert.rejects(buildRepositoryImage(f.request, client.execute));
+    assert.equal(builds, 3);
+    await service.close();
+    service = undefined;
+    service = await serveImageBuilder(options);
+  } finally {
+    await service?.close();
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+test('capacity rejection happens before Docker work and does not leave a recovery fence', async () => {
+  const f = await fixture();
+  let calls = 0;
+  const options = {
+    path: f.socket,
+    token,
+    runtimeImage,
+    allowlistPath: f.allowlist,
+    maxTrustedImages: 1,
+    maxRepositoryImages: 1,
+    execute: async (_context: string, iidFile: string) => {
+      calls++;
+      await writeFile(iidFile, imageId);
+    },
+  };
+  let service: Awaited<ReturnType<typeof serveImageBuilder>> | undefined;
+  try {
+    service = await serveImageBuilder(options);
+    const client = new SocketImageBuildExecutor({ path: f.socket, token, runtimeImage });
+    assert.equal((await buildRepositoryImage(f.request, client.execute)).image, `oci://${imageId}`);
+    await assert.rejects(buildRepositoryImage(f.request, client.execute));
+    assert.equal(calls, 1);
+    await service.close();
+    service = undefined;
+    service = await serveImageBuilder(options);
     assert.ok(await getTrustedImage(f.allowlist, imageId, builderUid));
   } finally {
     await service?.close();

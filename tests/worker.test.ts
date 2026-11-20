@@ -218,6 +218,7 @@ test('image publication records the previously published image and commit atomic
   const next = `oci://sha256:${'b'.repeat(64)}`;
   const oldCommit = 'c'.repeat(40);
   const newCommit = 'd'.repeat(40);
+  let released: { path: string; retained: string[] } | undefined;
   await f.store.updateRepository('repo_1', { path: previous, commit: oldCommit, status: 'ready' });
   const worker = new IndexWorker({
     ...f,
@@ -227,6 +228,9 @@ test('image publication records the previously published image and commit atomic
     reconcileIntervalMs: 0,
     head: async () => newCommit,
     build: async () => ({ path: next, commit: newCommit, generation: 'v1' }),
+    releaseCandidate: (candidate, retained) => {
+      released = { path: candidate.path, retained };
+    },
   });
   try {
     const job = await worker.enqueue('repo_1', 'manual');
@@ -237,6 +241,8 @@ test('image publication records the previously published image and commit atomic
     assert.equal(record.commit, newCommit);
     assert.equal(record.previous_image, previous);
     assert.equal(record.previous_commit, oldCommit);
+    await waitFor(() => !!released);
+    assert.deepEqual(released, { path: next, retained: [next, previous] });
   } finally {
     await worker.stop();
     await f.close();
