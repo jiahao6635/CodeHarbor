@@ -34,6 +34,8 @@ declare module 'fastify' {
   interface FastifyRequest {
     /** Identity facts accumulated for the audit record of this request. */
     actor: AuditActor;
+    /** False when a pre-authentication reject must not consume durable audit capacity. */
+    durableAudit: boolean;
     principal?: Principal;
     /** Owner credential version observed at authentication; writes re-check it after the body arrives. */
     credentialVersion?: number;

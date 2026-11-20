@@ -4,6 +4,7 @@ import { hashAccessKey } from '../auth.js';
 import { bearerToken, type Principal } from '../authorization.js';
 import type { AppContext } from '../http/context.js';
 import { fail, HttpError } from '../http/errors.js';
+import { admitBearerAuthentication } from '../http/guards.js';
 import { mcpRepository } from '../http/views.js';
 import { createMcpHandler } from '../mcp.js';
 
@@ -14,16 +15,23 @@ import { createMcpHandler } from '../mcp.js';
 export function registerMcpRoute(app: FastifyInstance, ctx: AppContext): void {
   const { authorization, config } = ctx;
   const requests = new WeakMap<IncomingMessage, FastifyRequest>();
+  const admissions = new WeakMap<IncomingMessage, () => void>();
 
   const handler = createMcpHandler<Principal>({
     allowedHosts: config.allowedHosts,
     allowedOrigins: config.allowedOrigins,
     async authenticate(raw) {
-      const key = await authorization.authenticateBearer(raw.headers.authorization ?? '');
-      if (!key) {
-        if (!ctx.limiters.authFailure.hit(ctx.clientIp(raw))) fail(429, 'RATE_LIMITED');
-        return null;
+      const release = admissions.get(raw);
+      admissions.delete(raw);
+      let key: Principal | null;
+      try {
+        key = await authorization.authenticateBearer(raw.headers.authorization ?? '');
+      } catch (error) {
+        release?.();
+        throw error;
       }
+      if (!key) return null;
+      release?.();
       const request = requests.get(raw);
       if (request) {
         request.actor = { ...request.actor, subject: key.owner, key_prefix: key.prefix, authentication: 'api_key' };
@@ -57,10 +65,19 @@ export function registerMcpRoute(app: FastifyInstance, ctx: AppContext): void {
     onRequest: async (request, reply) => {
       if (config.publicMcpDisabled) fail(404, 'NOT_FOUND');
       const token = bearerToken(request.headers.authorization ?? '');
-      if (token && !ctx.limiters.mcpKey.hit(hashAccessKey(token))) fail(429, 'RATE_LIMITED');
+      if (token && !ctx.limiters.mcpKey.hit(hashAccessKey(token))) {
+        request.durableAudit = false;
+        fail(429, 'RATE_LIMITED');
+      }
+      admissions.set(request.raw, admitBearerAuthentication(ctx, request));
       requests.set(request.raw, request);
       reply.hijack();
-      await handler(request.raw, reply.raw as ServerResponse);
+      try {
+        await handler(request.raw, reply.raw as ServerResponse);
+      } finally {
+        admissions.get(request.raw)?.();
+        admissions.delete(request.raw);
+      }
     },
     handler: async () => {},
   });

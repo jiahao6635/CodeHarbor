@@ -391,12 +391,9 @@ test('self-scoped read keys follow live Codeup permissions and administrators go
       (await store.listAccess('carol')).filter((row) => row.repo_id !== 'r22'),
     );
 
-    // Documentation is not served when disabled; failed authentications are rate limited per client.
+    // Disabled documentation endpoints return 404.
     assert.equal((await call(base, 'GET', '/docs', admin.token)).status, 404);
     assert.equal((await call(base, 'GET', '/openapi.json', admin.token)).status, 404);
-    const statuses: number[] = [];
-    for (let i = 0; i < 5; i++) statuses.push((await call(base, 'GET', '/api/v1/me', createAccessKey().token)).status);
-    assert.deepEqual(statuses, [401, 401, 401, 429, 429]);
 
     // Audit events carry the subject, repository and a query hash, never the query text.
     const events = audit.filter((event) => event.tool === 'codegraph_explore');
@@ -413,6 +410,12 @@ test('self-scoped read keys follow live Codeup permissions and administrators go
     const admined = await call(base, 'GET', '/api/v1/admin/audit?limit=10', admin.token);
     assert.equal(admined.status, 200);
     assert.deepEqual(admined.body.events, []);
+
+    // Admission is checked before the key store, even when the next key is valid.
+    const statuses: number[] = [];
+    for (let i = 0; i < 5; i++) statuses.push((await call(base, 'GET', '/api/v1/me', createAccessKey().token)).status);
+    assert.deepEqual(statuses, [401, 401, 401, 429, 429]);
+    assert.equal((await call(base, 'GET', '/api/v1/me', admin.token)).status, 429);
   } finally {
     await app.close();
     await db.close();

@@ -18,17 +18,34 @@ export class RateLimiter {
       throw new Error('Invalid rate limit');
   }
 
-  /** Records one attempt; returns false when the key has exceeded its window. */
+  /** Records one attempt and returns false when the key's window is full. */
   hit(key: string, now = Date.now()): boolean {
+    return this.record(key, now) !== undefined;
+  }
+
+  /** Reserves an attempt and returns a callback that can release it once. */
+  reserve(key: string, now = Date.now()): (() => void) | undefined {
+    let slot = this.record(key, now);
+    if (!slot) return undefined;
+    return () => {
+      if (!slot || this.windows.get(key) !== slot) return;
+      slot.count--;
+      if (slot.count === 0) this.windows.delete(key);
+      slot = undefined;
+    };
+  }
+
+  private record(key: string, now: number) {
     const existing = this.windows.get(key);
     const slot = existing && existing.until > now ? existing : { count: 0, until: now + this.windowMs };
+    if (slot.count >= this.limit) return undefined;
     slot.count++;
     if (!existing || existing !== slot) {
       if (existing) this.windows.delete(key);
       if (this.windows.size >= this.maxKeys) this.evict(now);
       this.windows.set(key, slot);
     }
-    return slot.count <= this.limit;
+    return slot;
   }
 
   /** Returns true once a key has consumed its current window without recording another attempt. */
