@@ -41,12 +41,14 @@ export const pat = z
   .max(4096, '令牌过长')
   .refine((value) => !CONTROL_CHARACTERS.test(value), '令牌包含非法字符');
 
+export const UNLIMITED_EXPIRY_OPTION = { label: '无限期（无截止日期）', seconds: null } as const;
+
 export const EXPIRY_OPTIONS = [
   { label: '1 天', seconds: 86_400 },
   { label: '7 天', seconds: 7 * 86_400 },
   { label: '30 天', seconds: 30 * 86_400 },
   { label: '90 天', seconds: 90 * 86_400 },
-  { label: '无限期（无截止日期）', seconds: null },
+  UNLIMITED_EXPIRY_OPTION,
 ] as const;
 
 export const DEFAULT_EXPIRES_IN = 30 * 86_400;
