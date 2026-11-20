@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { AuditWriter } from '../src/audit-writer.js';
-import { CredentialCipher, createAccessKey } from '../src/auth.js';
+import { CredentialCipher, createAccessKey, hashAccessKey } from '../src/auth.js';
 import { CodeupError } from '../src/codeup.js';
 import { RateLimiter } from '../src/rate-limit.js';
 import { type AuditEvent, createApp } from '../src/server.js';
@@ -71,13 +71,21 @@ test('self-scoped read keys follow live Codeup permissions and administrators go
   const cipher = new CredentialCipher(key);
   const allowedHosts: string[] = [];
   const audit: AuditEvent[] = [];
-  const permitted: Record<string, Set<string>> = { 'alice-pat': new Set(['11', '22']), 'bob-pat': new Set(['11']) };
+  const permitted: Record<string, Set<string>> = {
+    'alice-pat': new Set(['11', '22']),
+    'bob-pat': new Set(['11']),
+    'bob-pat-2': new Set(['11']),
+    'bob-pat-3': new Set(['11']),
+  };
   const revoked = new Set<string>();
   let permissionChecks = 0;
+  let beforePermissionCheck: ((token: string, id: string) => Promise<void>) | undefined;
   const codeup = {
     async getUser(token: string) {
       if (token === 'alice-pat') return { id: 'alice', username: 'alice', name: 'Alice' };
-      if (token === 'bob-pat') return { id: 'bob', username: 'bob', name: 'Bob' };
+      if (token === 'bob-pat' || token === 'bob-pat-2' || token === 'bob-pat-3') {
+        return { id: 'bob', username: 'bob', name: 'Bob' };
+      }
       throw new CodeupError('invalid_credential', 401);
     },
     async listRepositories() {
@@ -85,6 +93,7 @@ test('self-scoped read keys follow live Codeup permissions and administrators go
     },
     async getRepository(token: string, id: string) {
       permissionChecks++;
+      await beforePermissionCheck?.(token, id);
       if (revoked.has(token)) throw new CodeupError('invalid_credential', 401);
       if (!permitted[token]?.has(id)) throw new CodeupError('not_found', 404);
       return {
@@ -218,14 +227,98 @@ test('self-scoped read keys follow live Codeup permissions and administrators go
     await store.upsertAccess({ user_id: 'bob', repo_id: 'r11', allowed: 1, verified_at: Date.now() - 120_000 });
     assert.equal((await call(base, 'GET', '/api/v1/repositories/r11', bobSelf.token)).status, 404);
     assert.equal((await store.getAccess('bob', 'r11'))!.allowed, 0);
-    // An invalid PAT revokes every key of that user.
-    permitted['bob-pat'].add('11');
-    revoked.add('bob-pat');
+
+    // A delayed success for an old credential cannot populate access for a newer binding.
+    permitted['bob-pat'].add('22');
+    const staleDeniedAt = Date.now() - 120_000;
+    await store.upsertAccess({ user_id: 'bob', repo_id: 'r22', allowed: 0, verified_at: staleDeniedAt });
+    let releaseAllowed!: () => void;
+    let notifyAllowedStarted!: () => void;
+    const allowedStarted = new Promise<void>((resolve) => {
+      notifyAllowedStarted = resolve;
+    });
+    const allowedReleased = new Promise<void>((resolve) => {
+      releaseAllowed = resolve;
+    });
+    beforePermissionCheck = async (token, id) => {
+      if (token === 'bob-pat' && id === '22') {
+        notifyAllowedStarted();
+        await allowedReleased;
+      }
+    };
+    const delayedAllowed = call(base, 'GET', '/api/v1/repositories/r22', bobSelf.token);
+    await allowedStarted;
+    const rebound = await call(base, 'POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'bob-pat-2' });
+    assert.equal(rebound.status, 200);
+    const newer = await call(base, 'POST', '/api/v1/auth/bootstrap/keys', rebound.body.bootstrap_token, {
+      scope: 'read',
+    });
+    assert.equal(newer.status, 201);
+    releaseAllowed();
+    assert.equal((await delayedAllowed).status, 404);
+    beforePermissionCheck = undefined;
+    assert.deepEqual(await store.getAccess('bob', 'r22'), {
+      user_id: 'bob',
+      repo_id: 'r22',
+      allowed: 0,
+      verified_at: staleDeniedAt,
+    });
+    assert.equal((await call(base, 'GET', '/api/v1/repositories/r22', newer.body.token)).status, 404);
+
+    // A delayed rejection for an old credential cannot revoke newer keys or matching sync state.
+    await store.upsertAccess({ user_id: 'bob', repo_id: 'r11', allowed: 1, verified_at: Date.now() - 120_000 });
+    let releaseInvalid!: () => void;
+    let notifyInvalidStarted!: () => void;
+    const invalidStarted = new Promise<void>((resolve) => {
+      notifyInvalidStarted = resolve;
+    });
+    const invalidReleased = new Promise<void>((resolve) => {
+      releaseInvalid = resolve;
+    });
+    beforePermissionCheck = async (token, id) => {
+      if (token === 'bob-pat-2' && id === '11') {
+        notifyInvalidStarted();
+        await invalidReleased;
+      }
+    };
+    const delayedInvalid = call(base, 'GET', '/api/v1/repositories/r11', newer.body.token);
+    await invalidStarted;
+    const reboundAgain = await call(base, 'POST', '/api/v1/auth/yunxiao/bind', undefined, { pat: 'bob-pat-3' });
+    assert.equal(reboundAgain.status, 200);
+    const newest = await call(base, 'POST', '/api/v1/auth/bootstrap/keys', reboundAgain.body.bootstrap_token, {
+      scope: 'read',
+    });
+    assert.equal(newest.status, 201);
+    const newestVersion = (await store.getUser('bob'))!.credential_version;
+    await store.updateRepository('r22', {
+      sync_owner: 'bob',
+      sync_credential_version: newestVersion,
+      status: 'ready',
+      error: null,
+    });
+    revoked.add('bob-pat-2');
+    releaseInvalid();
+    assert.equal((await delayedInvalid).status, 404);
+    beforePermissionCheck = undefined;
+    assert.equal((await store.getKey(hashAccessKey(newest.body.token)))?.revoked, 0);
+    assert.equal((await call(base, 'GET', '/api/v1/me', newest.body.token)).status, 200);
+    assert.equal((await store.getRepository('r22'))!.status, 'ready');
+    revoked.delete('bob-pat-2');
+
+    // An invalid current PAT still revokes every key and matching synchronized repository of that user.
+    revoked.add('bob-pat-3');
     await store.upsertAccess({ user_id: 'bob', repo_id: 'r11', allowed: 1, verified_at: Date.now() - 120_000 });
     assert.equal((await call(base, 'GET', '/api/v1/repositories/r11', bobSelf.token)).status, 404);
     assert.equal((await store.getKey(bobSelf.hash))!.revoked, 1);
     assert.equal((await store.getKey(bobScoped.hash))!.revoked, 1);
+    assert.equal((await store.getRepository('r22'))!.status, 'credential_required');
     assert.equal((await call(base, 'GET', '/api/v1/repositories/r22', bobScoped.token)).status, 401);
+    await store.updateRepository('r22', {
+      sync_owner: 'alice',
+      sync_credential_version: 1,
+      status: 'ready',
+      error: null,
+    });
 
     // Background maintenance seeds and refreshes permission rows for users holding self-scoped keys.
     revoked.clear();
