@@ -374,7 +374,9 @@ test('rate limiter enforces fixed windows with bounded memory', () => {
   assert.ok(limiter.hit('a', 0));
   assert.ok(limiter.hit('a', 10));
   assert.ok(!limiter.hit('a', 20));
+  assert.equal(limiter.blocked('a', 20), true);
   assert.ok(limiter.hit('a', 1001), 'a new window starts after expiry');
+  assert.equal(limiter.blocked('a', 1001), false);
   assert.ok(limiter.hit('b', 1001));
   assert.equal(limiter.size, 2);
   assert.ok(limiter.hit('c', 1002), 'the oldest key is evicted when the table is full');

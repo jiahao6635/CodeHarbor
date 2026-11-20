@@ -15,12 +15,31 @@ async function main(): Promise<void> {
       ?.split(',')
       .map((item) => item.trim())
       .filter(Boolean) ?? [];
+  const integer = (name: string, fallback: number) => {
+    const value = process.env[name];
+    if (value === undefined || value === '') return fallback;
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 100_000) throw new Error(`Invalid ${name}`);
+    return parsed;
+  };
+  const flag = (name: string, fallback: boolean) => {
+    const value = process.env[name];
+    if (value === undefined || value === '') return fallback;
+    if (value !== 'true' && value !== 'false') throw new Error(`Invalid ${name}`);
+    return value === 'true';
+  };
   const allowedHosts = list(process.env.CODEHARBOR_ALLOWED_HOSTS);
   if (!allowedHosts.length) allowedHosts.push(`127.0.0.1:${port}`, `localhost:${port}`);
   const app = createMcpService({
     backend: new SocketMcpBackend(path, token),
     allowedHosts,
     allowedOrigins: list(process.env.CODEHARBOR_ALLOWED_ORIGINS),
+    trustProxy: flag('CODEHARBOR_TRUST_PROXY', false),
+    limits: {
+      keyRequestsPerMinute: integer('CODEHARBOR_MCP_KEY_RATE_PER_MIN', 120),
+      authFailuresPerMinute: integer('CODEHARBOR_AUTH_FAILURE_RATE_PER_MIN', 30),
+      readinessCacheMs: integer('CODEHARBOR_MCP_READY_CACHE_MS', 5_000),
+    },
   });
   await app.listen({ port, host });
   let stopping = false;

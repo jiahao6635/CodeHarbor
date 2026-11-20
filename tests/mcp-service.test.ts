@@ -84,6 +84,7 @@ test('isolated MCP service forwards the caller through Unix RPC and exposes no p
     backend: new SocketMcpBackend(socketPath, serviceToken),
     allowedHosts,
     log: (event) => accessLog.push(event),
+    limits: { keyConcurrentQueries: 1, readinessCacheMs: 1 },
   });
   await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
@@ -91,6 +92,7 @@ test('isolated MCP service forwards the caller through Unix RPC and exposes no p
   allowedHosts.push(`127.0.0.1:${address.port}`);
   const base = `http://127.0.0.1:${address.port}`;
   const client = new Client({ name: 'isolated-test', version: '1' });
+  const competingClient = new Client({ name: 'isolated-competing-test', version: '1' });
   try {
     assert.equal((await fetch(`${base}/health/live`)).status, 200);
     assert.equal((await fetch(`${base}/health/ready`)).status, 200);
@@ -112,6 +114,9 @@ test('isolated MCP service forwards the caller through Unix RPC and exposes no p
     await client.connect(
       new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { authorization } } }),
     );
+    await competingClient.connect(
+      new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { authorization } } }),
+    );
     const tools = await client.listTools();
     assert.deepEqual(
       tools.tools.map((tool) => tool.name),
@@ -130,6 +135,15 @@ test('isolated MCP service forwards the caller through Unix RPC and exposes no p
     });
     const pending = client.callTool({ name: 'codegraph_explore', arguments: { repo_id: 'repo1', query: 'wait' } });
     await started;
+    const competing = await competingClient.callTool({
+      name: 'codegraph_explore',
+      arguments: { repo_id: 'repo1', query: 'competing' },
+    });
+    assert.equal(competing.isError, true);
+    assert.equal(
+      requests.some((request) => request.op === 'explore' && request.query === 'competing'),
+      false,
+    );
     permitted = false;
     release!();
     const revoked = await pending;
@@ -145,10 +159,169 @@ test('isolated MCP service forwards the caller through Unix RPC and exposes no p
     for (const value of [authorization, serviceToken, 'source-result', 'secret=hidden'])
       assert.ok(!text.includes(value));
   } finally {
+    await competingClient.close().catch(() => {});
     await client.close().catch(() => {});
     await app.close();
     await new Promise<void>((resolve, reject) => rpc.close((error) => (error ? reject(error) : resolve())));
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('isolated MCP service blocks a client after its authentication failure budget', async () => {
+  const allowedHosts = ['placeholder'];
+  let authenticationCalls = 0;
+  const app = createMcpService({
+    backend: {
+      async authenticate() {
+        authenticationCalls++;
+        return false;
+      },
+    } as never,
+    allowedHosts,
+    limits: { authFailuresPerMinute: 1 },
+    log() {},
+    trustProxy: true,
+  });
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  const address = app.server.address();
+  assert.ok(address && typeof address !== 'string');
+  allowedHosts.push(`127.0.0.1:${address.port}`);
+  const base = `http://127.0.0.1:${address.port}`;
+  const rejectedAuthorization = `Bearer ch_${'b'.repeat(43)}`;
+  try {
+    assert.equal(
+      (
+        await fetch(`${base}/mcp`, {
+          method: 'POST',
+          headers: { authorization: rejectedAuthorization, 'x-real-ip': '192.0.2.10' },
+        })
+      ).status,
+      401,
+    );
+    assert.equal(authenticationCalls, 1);
+    assert.equal(
+      (
+        await fetch(`${base}/mcp`, {
+          method: 'POST',
+          headers: { authorization: rejectedAuthorization, 'x-real-ip': '192.0.2.10' },
+        })
+      ).status,
+      429,
+    );
+    assert.equal(authenticationCalls, 1, 'blocked clients must not consume another backend authentication');
+    assert.equal(
+      (
+        await fetch(`${base}/mcp`, {
+          method: 'POST',
+          headers: { authorization: rejectedAuthorization, 'x-real-ip': '192.0.2.11' },
+        })
+      ).status,
+      401,
+    );
+    assert.equal(authenticationCalls, 2, 'the controlled proxy identity must keep separate clients independent');
+  } finally {
+    await app.close();
+  }
+});
+
+test('isolated MCP service enforces per-key and pre-auth client request budgets', async () => {
+  const allowedHosts = ['placeholder'];
+  let authenticationCalls = 0;
+  const app = createMcpService({
+    backend: {
+      async authenticate() {
+        authenticationCalls++;
+        return true;
+      },
+    } as never,
+    allowedHosts,
+    limits: { clientRequestsPerMinute: 2, keyRequestsPerMinute: 1 },
+    log() {},
+  });
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  const address = app.server.address();
+  assert.ok(address && typeof address !== 'string');
+  allowedHosts.push(`127.0.0.1:${address.port}`);
+  const base = `http://127.0.0.1:${address.port}`;
+  const otherAuthorization = `Bearer ch_${'c'.repeat(43)}`;
+  try {
+    assert.equal((await fetch(`${base}/mcp`, { headers: { authorization } })).status, 405);
+    assert.equal(authenticationCalls, 1);
+    assert.equal((await fetch(`${base}/mcp`, { headers: { authorization } })).status, 429);
+    assert.equal(authenticationCalls, 1, 'per-key rejection must happen before backend authentication');
+    assert.equal(
+      (
+        await fetch(`${base}/mcp`, {
+          headers: { authorization: otherAuthorization, 'x-real-ip': '192.0.2.20' },
+        })
+      ).status,
+      429,
+    );
+    assert.equal(authenticationCalls, 1, 'per-client rejection must happen before backend authentication');
+  } finally {
+    await app.close();
+  }
+});
+
+test('isolated MCP service coalesces readiness probes and caps all outstanding backend requests', async () => {
+  const allowedHosts = ['placeholder'];
+  let authenticationCalls = 0;
+  let probeCalls = 0;
+  let releaseProbe: (() => void) | undefined;
+  let probeStarted: (() => void) | undefined;
+  const app = createMcpService({
+    backend: {
+      async authenticate() {
+        authenticationCalls++;
+        return true;
+      },
+      async probe() {
+        probeCalls++;
+        probeStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseProbe = resolve;
+        });
+      },
+    } as never,
+    allowedHosts,
+    limits: { globalOutstandingRequests: 2, readinessRequestsPerMinute: 3, readinessCacheMs: 60_000 },
+    log() {},
+  });
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  const address = app.server.address();
+  assert.ok(address && typeof address !== 'string');
+  allowedHosts.push(`127.0.0.1:${address.port}`);
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const started = new Promise<void>((resolve) => {
+      probeStarted = resolve;
+    });
+    const firstReadiness = fetch(`${base}/health/ready`);
+    await started;
+    const secondReadinessAccepted = new Promise<void>((resolve) => {
+      app.server.once('request', () => resolve());
+    });
+    const secondReadiness = fetch(`${base}/health/ready`);
+    await secondReadinessAccepted;
+    assert.equal((await fetch(`${base}/mcp`, { headers: { authorization } })).status, 429);
+    assert.equal(authenticationCalls, 0, 'the global cap must reject before backend authentication');
+    releaseProbe!();
+    assert.deepEqual(
+      await Promise.all([firstReadiness, secondReadiness]).then((responses) =>
+        responses.map((response) => response.status),
+      ),
+      [200, 200],
+    );
+    assert.equal(probeCalls, 1, 'concurrent readiness requests must share one backend probe');
+    assert.equal((await fetch(`${base}/health/ready`)).status, 200);
+    assert.equal(probeCalls, 1, 'cached readiness must not start another backend probe');
+    assert.equal((await fetch(`${base}/health/ready`)).status, 429);
+    assert.equal(probeCalls, 1, 'rate-limited readiness must not start another backend probe');
+    assert.equal((await fetch(`${base}/mcp`, { headers: { authorization } })).status, 405);
+    assert.equal(authenticationCalls, 1, 'ordinary authenticated traffic resumes after capacity is released');
+  } finally {
+    releaseProbe?.();
+    await app.close();
   }
 });
 
@@ -192,7 +365,7 @@ test('unexpected MCP response failures close the request and leave the listener 
     backend: {
       async authenticate() {
         // Authentication is reached only after the service Host check, so this
-        // exception is injected within the asynchronous MCP handler itself.
+        // exception is injected within the asynchronous MCP admission path.
         handlerEntered = true;
         assert.ok(injectedResponse);
         injectedResponse.writeHead = (() => {

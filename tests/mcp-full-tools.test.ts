@@ -23,7 +23,7 @@ import { internalRepository, mcpRepository } from '../src/http/views.js';
 import { createInternalMcpHandler, type InternalMcpBackend } from '../src/internal-mcp.js';
 import { createInternalMcpBackend } from '../src/internal-mcp-backend.js';
 import { createMcpHandler } from '../src/mcp.js';
-import { createMcpService, SocketMcpBackend } from '../src/mcp-service.js';
+import { createMcpService, type McpServiceLimits, SocketMcpBackend } from '../src/mcp-service.js';
 import type { AccessRecord, KeyRecord, RepositoryRecord, StoreBackend } from '../src/store.js';
 
 const TOOL_NAMES = [
@@ -143,7 +143,11 @@ async function sendSocket(path: string, body: unknown): Promise<unknown> {
   });
 }
 
-async function fixture(t: { after(fn: () => Promise<void>): void }, surface: Surface = 'split') {
+async function fixture(
+  t: { after(fn: () => Promise<void>): void },
+  surface: Surface = 'split',
+  limits?: Partial<McpServiceLimits>,
+) {
   // Short, owner-only directory keeps Unix socket paths below Darwin's limit.
   const root = await mkdtemp(join(tmpdir(), 'ch-full-'));
   await chmod(root, 0o700);
@@ -354,7 +358,7 @@ async function fixture(t: { after(fn: () => Promise<void>): void }, surface: Sur
   const allowedHosts = ['127.0.0.1'];
   let host: string;
   if (surface === 'split') {
-    service = createMcpService({ backend: socketBackend, allowedHosts, log() {} });
+    service = createMcpService({ backend: socketBackend, allowedHosts, limits, log() {} });
     await service.listen({ port: 0, host: '127.0.0.1' });
     const address = service.server.address();
     assert.ok(address && typeof address !== 'string');
@@ -635,7 +639,7 @@ for (const surface of ['split', 'public'] as const) {
   test(`${surface}: invalid tools, injected fields, paths and numeric/types fail before the query backend`, {
     timeout: 30_000,
   }, async (t) => {
-    const f = await fixture(t, surface);
+    const f = await fixture(t, surface, { keyRequestsPerMinute: 1000 });
     for (const { label, name, arguments: args } of invalidRequests()) {
       await t.test(label, async () => {
         const before = f.snapshot();

@@ -1,9 +1,11 @@
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import net from 'node:net';
 import { isAbsolute } from 'node:path';
+import { hashAccessKey } from './auth.js';
 import { type CodeGraphToolCall, validCodeGraphToolCall } from './codegraph-tools.js';
 import { createLogger } from './logger.js';
 import { createMcpHandler, type McpRepository } from './mcp.js';
+import { RateLimiter } from './rate-limit.js';
 
 export interface McpServiceBackend {
   callTool?(
@@ -173,30 +175,148 @@ export type McpHttpAccessEvent = {
 };
 const defaultLog = createLogger({ name: 'codeharbor-mcp' });
 
+export type McpServiceLimits = {
+  clientRequestsPerMinute: number;
+  authFailuresPerMinute: number;
+  keyRequestsPerMinute: number;
+  keyConcurrentQueries: number;
+  globalOutstandingRequests: number;
+  readinessRequestsPerMinute: number;
+  readinessCacheMs: number;
+};
+
+const DEFAULT_LIMITS: McpServiceLimits = {
+  // The public proxy can multiplex many clients over one source address. Key
+  // and failure budgets provide the tighter controls after this coarse guard.
+  clientRequestsPerMinute: 10_000,
+  authFailuresPerMinute: 30,
+  keyRequestsPerMinute: 120,
+  keyConcurrentQueries: 2,
+  globalOutstandingRequests: 32,
+  readinessRequestsPerMinute: 30,
+  readinessCacheMs: 5_000,
+};
+
+function serviceLimits(overrides?: Partial<McpServiceLimits>): McpServiceLimits {
+  const limits = { ...DEFAULT_LIMITS, ...overrides };
+  if (Object.values(limits).some((value) => !Number.isSafeInteger(value) || value < 1)) {
+    throw new Error('Invalid MCP service limits');
+  }
+  return limits;
+}
+
+function clientAddress(req: IncomingMessage, trustProxy: boolean): string {
+  const forwarded = req.headers['x-real-ip'];
+  if (trustProxy && typeof forwarded === 'string' && net.isIP(forwarded)) return forwarded;
+  return req.socket.remoteAddress ?? 'unknown';
+}
+
+function bearerAuthorization(value: string | undefined): { authorization: string; token: string } | null {
+  if (!value) return null;
+  const match = /^Bearer (ch_[A-Za-z0-9_-]{43})$/.exec(value);
+  return match ? { authorization: value, token: match[1] } : null;
+}
+
+function mcpError(res: ServerResponse, status: number, message: string): void {
+  if (res.destroyed || res.writableEnded) return;
+  if (status === 401) res.setHeader('www-authenticate', 'Bearer');
+  if (status === 429) res.setHeader('retry-after', '60');
+  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+  res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message }, id: null }));
+}
+
 export function createMcpService(options: {
   backend: McpServiceBackend;
   allowedHosts: string[];
   allowedOrigins?: string[];
   log?: (event: McpHttpAccessEvent) => void;
+  limits?: Partial<McpServiceLimits>;
+  /** Trust X-Real-IP only when every reachable listener overwrites it at a controlled proxy. */
+  trustProxy?: boolean;
 }): {
   server: Server;
   listen(options: { port: number; host: string }): Promise<void>;
   close(): Promise<void>;
 } {
   if (!options.allowedHosts.length) throw new Error('MCP allowed hosts are required');
+  const limits = serviceLimits(options.limits);
+  const clientRequests = new RateLimiter(limits.clientRequestsPerMinute, 60_000);
+  const authFailures = new RateLimiter(limits.authFailuresPerMinute, 60_000);
+  const keyRequests = new RateLimiter(limits.keyRequestsPerMinute, 60_000);
+  const readinessRequests = new RateLimiter(limits.readinessRequestsPerMinute, 60_000);
+  const admitted = new WeakMap<IncomingMessage, string>();
+  const activeQueries = new Map<string, number>();
+  let outstandingRequests = 0;
+  let readinessCache: { status: 200 | 503; until: number } | undefined;
+  let readinessProbe: Promise<200 | 503> | undefined;
+
+  const acquireRequest = () => {
+    if (outstandingRequests >= limits.globalOutstandingRequests) return false;
+    outstandingRequests++;
+    return true;
+  };
+  const releaseRequest = () => {
+    outstandingRequests--;
+  };
+  const withQueryLimit = async <T>(authorization: string, query: () => Promise<T>): Promise<T> => {
+    const parsed = bearerAuthorization(authorization);
+    if (!parsed) throw new Error('Authentication required');
+    const key = hashAccessKey(parsed.token);
+    const active = activeQueries.get(key) ?? 0;
+    if (active >= limits.keyConcurrentQueries) throw new Error('MCP key query limit exceeded');
+    activeQueries.set(key, active + 1);
+    try {
+      return await query();
+    } finally {
+      const remaining = (activeQueries.get(key) ?? 1) - 1;
+      if (remaining > 0) activeQueries.set(key, remaining);
+      else activeQueries.delete(key);
+    }
+  };
+  const readinessStatus = (): Promise<200 | 503> => {
+    const now = Date.now();
+    if (readinessCache && readinessCache.until > now) return Promise.resolve(readinessCache.status);
+    if (readinessProbe) return readinessProbe;
+    readinessProbe = Promise.resolve()
+      .then(() => options.backend.probe(AbortSignal.timeout(5_000)))
+      .then(
+        () => 200 as const,
+        () => 503 as const,
+      )
+      .then((status) => {
+        readinessCache = { status, until: Date.now() + limits.readinessCacheMs };
+        return status;
+      })
+      .finally(() => {
+        readinessProbe = undefined;
+      });
+    return readinessProbe;
+  };
   const remoteCallTool = options.backend.callTool?.bind(options.backend);
   const handler = createMcpHandler<string>({
     allowedHosts: options.allowedHosts,
     allowedOrigins: options.allowedOrigins,
     async authenticate(req) {
-      const authorization = req.headers.authorization;
-      if (!authorization || !/^Bearer ch_[A-Za-z0-9_-]{43}$/.test(authorization)) return null;
-      return (await options.backend.authenticate(authorization)) ? authorization : null;
+      const parsed = bearerAuthorization(req.headers.authorization);
+      if (!parsed) return null;
+      if (admitted.get(req) === parsed.authorization) {
+        admitted.delete(req);
+        return parsed.authorization;
+      }
+      const authenticated = await options.backend.authenticate(parsed.authorization);
+      if (!authenticated) authFailures.hit(clientAddress(req, options.trustProxy ?? false));
+      return authenticated ? parsed.authorization : null;
     },
     listRepositories: (auth, signal) => options.backend.list(auth, signal),
     getRepository: (auth, id, signal) => options.backend.get(auth, id, signal),
-    remoteExplore: (auth, id, query, signal) => options.backend.explore(auth, id, query, signal),
-    ...(remoteCallTool ? { remoteCallTool } : {}),
+    remoteExplore: (auth, id, query, signal) =>
+      withQueryLimit(auth, () => options.backend.explore(auth, id, query, signal)),
+    ...(remoteCallTool
+      ? {
+          remoteCallTool: (auth: string, id: string, call: CodeGraphToolCall, signal: AbortSignal) =>
+            withQueryLimit(auth, () => remoteCallTool(auth, id, call, signal)),
+        }
+      : {}),
   });
   const server = createServer((req, res) => {
     const started = performance.now();
@@ -243,7 +363,46 @@ export function createMcpService(options: {
     }
     if (pathname === '/mcp' || pathname === '/health/live' || pathname === '/health/ready') route = pathname;
     if (pathname === '/mcp') {
-      void handler(req, res).catch(() => {
+      void (async () => {
+        const client = clientAddress(req, options.trustProxy ?? false);
+        if (!clientRequests.hit(client) || authFailures.blocked(client)) {
+          mcpError(res, 429, 'Rate limited');
+          return;
+        }
+        const parsed = bearerAuthorization(req.headers.authorization);
+        if (!parsed) {
+          authFailures.hit(client);
+          mcpError(res, 401, 'Authentication required');
+          return;
+        }
+        if (!keyRequests.hit(hashAccessKey(parsed.token))) {
+          mcpError(res, 429, 'Rate limited');
+          return;
+        }
+        if (!acquireRequest()) {
+          mcpError(res, 429, 'Service busy');
+          return;
+        }
+        try {
+          let authenticated: boolean;
+          try {
+            authenticated = await options.backend.authenticate(parsed.authorization);
+          } catch {
+            mcpError(res, 503, 'Authentication unavailable');
+            return;
+          }
+          if (!authenticated) {
+            authFailures.hit(client);
+            mcpError(res, 401, 'Authentication required');
+            return;
+          }
+          admitted.set(req, parsed.authorization);
+          await handler(req, res);
+        } finally {
+          admitted.delete(req);
+          releaseRequest();
+        }
+      })().catch(() => {
         // A disconnected client or an unexpected protocol failure must not
         // become an unhandled rejection that terminates the listener.
         if (res.destroyed || res.writableEnded) return;
@@ -264,16 +423,19 @@ export function createMcpService(options: {
       return;
     }
     if (req.method === 'GET' && pathname === '/health/ready') {
-      void options.backend
-        .probe(AbortSignal.timeout(5_000))
-        .then(() => {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end('{"status":"ok"}');
+      const client = clientAddress(req, options.trustProxy ?? false);
+      if (!readinessRequests.hit(client) || !acquireRequest()) {
+        res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' });
+        res.end('{"status":"rate_limited"}');
+        return;
+      }
+      void readinessStatus()
+        .then((status) => {
+          res.writeHead(status, { 'content-type': 'application/json' });
+          res.end(status === 200 ? '{"status":"ok"}' : '{"status":"unavailable"}');
         })
-        .catch(() => {
-          res.writeHead(503, { 'content-type': 'application/json' });
-          res.end('{"status":"unavailable"}');
-        });
+        .catch(() => res.destroy())
+        .finally(releaseRequest);
       return;
     }
     res.writeHead(404);

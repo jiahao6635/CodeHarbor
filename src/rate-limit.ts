@@ -31,6 +31,12 @@ export class RateLimiter {
     return slot.count <= this.limit;
   }
 
+  /** Returns true once a key has consumed its current window without recording another attempt. */
+  blocked(key: string, now = Date.now()): boolean {
+    const slot = this.windows.get(key);
+    return !!slot && slot.until > now && slot.count >= this.limit;
+  }
+
   private evict(now: number): void {
     for (const [key, slot] of this.windows) if (slot.until <= now) this.windows.delete(key);
     if (this.windows.size >= this.maxKeys) {
