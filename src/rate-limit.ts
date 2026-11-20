@@ -18,17 +18,29 @@ export class RateLimiter {
       throw new Error('Invalid rate limit');
   }
 
-  /** Records one attempt; returns false when the key has exceeded its window. */
+  /** Reserves one attempt; returns false when the key's window is already full. */
   hit(key: string, now = Date.now()): boolean {
     const existing = this.windows.get(key);
     const slot = existing && existing.until > now ? existing : { count: 0, until: now + this.windowMs };
+    if (slot.count >= this.limit) return false;
     slot.count++;
     if (!existing || existing !== slot) {
       if (existing) this.windows.delete(key);
       if (this.windows.size >= this.maxKeys) this.evict(now);
       this.windows.set(key, slot);
     }
-    return slot.count <= this.limit;
+    return true;
+  }
+
+  /** Releases a successful or abandoned reservation without forgiving recorded failures. */
+  release(key: string, now = Date.now()): void {
+    const slot = this.windows.get(key);
+    if (!slot) return;
+    if (slot.until <= now || slot.count <= 1) {
+      this.windows.delete(key);
+      return;
+    }
+    slot.count--;
   }
 
   private evict(now: number): void {

@@ -1,16 +1,43 @@
+import type { IncomingMessage } from 'node:http';
 import type { FastifyRequest, onRequestAsyncHookHandler } from 'fastify';
 import type { Principal } from '../authorization.js';
 import type { AppContext } from './context.js';
 import { fail } from './errors.js';
 
+type BearerRequest = Pick<IncomingMessage, 'headers' | 'socket'> & { durableAudit?: boolean };
+
+/** Reserves per-client authentication capacity before any bearer value can reach the key store. */
+export function admitBearerAuthentication(ctx: AppContext, request: BearerRequest): string {
+  const client = ctx.clientIp(request);
+  if (!ctx.limiters.authFailure.hit(client)) {
+    request.durableAudit = false;
+    fail(429, 'RATE_LIMITED');
+  }
+  return client;
+}
+
+/** Successful authentication and backend errors do not consume the client's failure budget. */
+export function releaseBearerAuthentication(ctx: AppContext, client: string): void {
+  ctx.limiters.authFailure.release(client);
+}
+
+export async function authenticateBearerRequest(ctx: AppContext, request: BearerRequest): Promise<Principal | null> {
+  const client = admitBearerAuthentication(ctx, request);
+  try {
+    const key = await ctx.authorization.authenticateBearer(request.headers.authorization ?? '');
+    if (key) releaseBearerAuthentication(ctx, client);
+    return key;
+  } catch (error) {
+    releaseBearerAuthentication(ctx, client);
+    throw error;
+  }
+}
+
 /** Resolves the bearer key before the body is read so slow uploads cannot hold an unauthenticated connection. */
 export function authenticateHook(ctx: AppContext): onRequestAsyncHookHandler {
   return async (request) => {
-    const key = await ctx.authorization.authenticateBearer(request.headers.authorization ?? '');
-    if (!key) {
-      if (!ctx.limiters.authFailure.hit(ctx.clientIp(request))) fail(429, 'RATE_LIMITED');
-      fail(401, 'UNAUTHENTICATED');
-    }
+    const key = await authenticateBearerRequest(ctx, request);
+    if (!key) fail(401, 'UNAUTHENTICATED');
     const user = await ctx.store.getUser(key.owner);
     if (!user) fail(401, 'UNAUTHENTICATED');
     request.principal = key;

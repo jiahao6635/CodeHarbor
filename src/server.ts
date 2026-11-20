@@ -141,8 +141,9 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
     requestIdHeader: false,
   });
 
-  function emitAudit(event: AuditEvent) {
+  function emitAudit(event: AuditEvent, durable = true) {
     fastify.log.info(event, 'audit');
+    if (!durable) return;
     try {
       deps.audit?.(event);
     } catch {
@@ -152,11 +153,13 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
 
   // Reference-typed decorations are initialised per request in onRequest, never shared.
   fastify.decorateRequest('actor');
+  fastify.decorateRequest('durableAudit');
   fastify.decorateRequest('principal');
   fastify.decorateRequest('credentialVersion');
 
   fastify.addHook('onRequest', async (request, reply) => {
     request.actor = {};
+    request.durableAudit = true;
     const started = process.hrtime.bigint();
     const route = routeLabel(request.routeOptions.url);
     // Raw headers survive reply.hijack(), which the MCP route relies on.
@@ -182,7 +185,10 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
         'http_request',
       );
       if (AUDITED_ROUTE.test(route)) {
-        emitAudit({ request_id: request.id, method: request.method, route, status, ...request.actor });
+        emitAudit(
+          { request_id: request.id, method: request.method, route, status, ...request.actor },
+          request.durableAudit,
+        );
       }
     });
     const { host, origin } = request.headers;
