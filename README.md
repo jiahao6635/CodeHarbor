@@ -9,9 +9,9 @@ CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库
 - Codeup Push Webhook、手动同步和 15 分钟对账；保留上次成功索引，报告 commit 和新鲜度。
 - 单个 `/mcp` 地址，提供 `list_repositories`、`get_repository_status` 和全部 7 个代码工具：`codegraph_search`、`codegraph_callers`、`codegraph_callees`、`codegraph_impact`、`codegraph_node`、`codegraph_explore`、`codegraph_files`；全部代码工具必须传入 `repo_id`，按 Key 的仓库范围鉴权。
 - `write` Key 仅允许平台管理及触发索引，不能写云效代码。
-- 可选择仓库镜像后端：每个仓库的源码快照和索引打包为本机 Docker 镜像，查询容器使用经过适配的只读 CodeGraph；配置和迁移边界见 [镜像后端指南](docs/image-backend.md)。
+- 生产模式使用仓库镜像后端：每个仓库的源码快照和索引打包为本机 Docker 镜像，查询容器使用经过适配的只读 CodeGraph；文件系统后端仅保留给开发和测试，配置与迁移边界见 [镜像后端指南](docs/image-backend.md)。
 
-**使用边界**：此版本在生产模式使用 PostgreSQL 和 Vault Transit；仍是单进程 Worker，不支持多副本或跨进程租约与 fencing。它尚未通过真实云效账号和企业权限策略联调；部署前需验证云效身份、克隆/下载管控、继承权限和浏览者实际代码访问权。未经这些验证不要用于生产多租户环境。Index Worker 和共享 CodeGraph 进程还需要部署级文件系统及网络隔离；源码和索引须按源码等级保护。发布后保留当前及上一个受管理的索引版本；未知或无所有权标记的旧目录不会自动删除。
+**使用边界**：此版本在生产模式使用 PostgreSQL、Vault Transit 和镜像索引后端；仍是单进程 Worker，不支持多副本或跨进程租约与 fencing。它尚未通过真实云效账号和企业权限策略联调；部署前需验证云效身份、克隆/下载管控、继承权限和浏览者实际代码访问权。未经这些验证不要用于生产多租户环境。生产模板将索引工作区放在限额 tmpfs，并限制应用 CPU、内存和 PID；源码镜像、构建缓存和索引仍须按源码等级保护并监控容量。
 
 查询已发布索引时，平台检查 Key 的有效期、撤销状态及明确的仓库 ID 列表，不重新检查持有人的云效权限；仓库更新后 Key 的范围保持不变。**云效撤权或 PAT 失效不会自动撤销 CodeHarbor Key 的读取权限**，应由管理员及时撤销或替换 Key。仓库首次接入及自动同步仍使用凭证持有人明确授权的 PAT 验证 Git 克隆权限；同步失败保留上一次成功的索引并报告状态，详见 [生产部署指南](docs/production-deployment.md)。
 
@@ -43,6 +43,7 @@ export DATABASE_URL='postgres://codeharbor_test:codeharbor_test@127.0.0.1:54329/
 | `CODEHARBOR_MASTER_KEY` | 本地开发模式使用的 Base64 编码 32 字节密钥；与数据目录分开保存；生产不使用此模式 |
 | `DATABASE_URL` 或 `CODEHARBOR_DATABASE_URL_FILE` | 必填，PostgreSQL 连接串或受保护的连接串文件，二者只能设置一个；生产必须启用 `sslmode=verify-full` |
 | `CODEHARBOR_KEY_PROVIDER` | 生产设为 `vault-transit`；Vault 配置见 [Vault Transit 文档](docs/vault-transit.md) |
+| `CODEHARBOR_INDEX_BACKEND` | 生产必须为 `image`；默认的 `filesystem` 仅用于开发和测试 |
 | `CODEHARBOR_METRICS_TOKEN_FILE` | 可选，独立监控 Bearer 密钥文件；未配置时 `/metrics` 不开放 |
 | `CODEHARBOR_MCP_QUERY_CONCURRENCY` | 镜像模式并发查询上限，默认 `10`，可设 `1`～`32`；平台与镜像控制器必须一致 |
 | `YUNXIAO_ENDPOINT` | 必填，可信云效 API HTTPS 源，例如 `https://example.yunxiao.example` |
@@ -64,9 +65,9 @@ export DATABASE_URL='postgres://codeharbor_test:codeharbor_test@127.0.0.1:54329/
 | `CODEHARBOR_ALLOWED_ORIGINS` | 允许的浏览器 Origin；默认不允许携带 Origin 的请求 |
 | `CODEGRAPH_BIN` | 可选，覆盖 CodeGraph 可执行文件路径 |
 
-运行 `npm start`。`NODE_ENV=production` 会强制要求 PostgreSQL 验证服务端证书和 Vault Transit，不能退回本地密钥。服务使用一条专用会话持有实例互斥锁（`pg_advisory_lock`）并执行迁移，业务查询和事务走独立连接池（默认 10 个连接）；因此数据库连接应直连或使用 session pooling，不可使用事务池。锁会话断开后所有读写拒绝执行，需由 supervisor 重启。业务进程与 Worker 同实例运行，仍不能横向扩容。
+运行 `npm start`。`NODE_ENV=production` 会强制要求 PostgreSQL 验证服务端证书、Vault Transit 和镜像索引后端，不能退回本地密钥或文件系统索引。服务使用一条专用会话持有实例互斥锁（`pg_advisory_lock`）并执行迁移，业务查询和事务走独立连接池（默认 10 个连接）；因此数据库连接应直连或使用 session pooling，不可使用事务池。锁会话断开后所有读写拒绝执行，需由 supervisor 重启。业务进程与 Worker 同实例运行，仍不能横向扩容。
 
-本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者检查数据库，工作树模式下检查上游 MCP 工具 schema，镜像模式下检查镜像调度控制器。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 与索引队列指标，不包含源码、仓库或用户标签；仅限内网采集。指标含义和查询示例见[队列监控](docs/queue-metrics.md)。结构化 HTTP 和审计事件输出到 stdout，同时批量写入数据库 `audit_events` 表（代码查询只记录 SHA-256 摘要，不记录内容），管理员可通过 `GET /api/v1/admin/audit` 查询；生产环境仍须配置访问受控的日志采集、留存和告警。`/metrics` 额外暴露 `codeharbor_runtime_fenced{component}`（镜像运行时/图客户端进入 fail-closed 状态时为 1，需人工介入）和 `codeharbor_audit_dropped_total`，应接入告警。
+本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者检查数据库，开发文件系统模式下检查上游 MCP 工具 schema，生产镜像模式下检查镜像调度控制器。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 与索引队列指标，不包含源码、仓库或用户标签；仅限内网采集。指标含义和查询示例见[队列监控](docs/queue-metrics.md)。结构化 HTTP 和审计事件输出到 stdout，同时批量写入数据库 `audit_events` 表（代码查询只记录 SHA-256 摘要，不记录内容），管理员可通过 `GET /api/v1/admin/audit` 查询；生产环境仍须配置访问受控的日志采集、留存和告警。`/metrics` 额外暴露 `codeharbor_runtime_fenced{component}`（镜像运行时/图客户端进入 fail-closed 状态时为 1，需人工介入）和 `codeharbor_audit_dropped_total`，应接入告警。
 
 ## 管理控制台
 
@@ -167,4 +168,4 @@ npm run test:db:down
 docker build -t codeharbor:dev .
 ```
 
-容器以非 root 用户运行，数据保存在 `/data`。生产部署可选择外部 PostgreSQL，或叠加 [本地 PostgreSQL Compose 配置](deploy/compose.postgres.yaml) 在 Docker 中运行数据库；两种方式均要求经验证的 PostgreSQL TLS、Vault Transit 和 HTTPS 反向代理。配置及启动步骤见 [部署指南](docs/production-deployment.md)。模板不会创建企业凭证或自动部署服务；生产使用前仍须验证实际云效权限、备份恢复和运行隔离。
+容器以非 root 用户运行。生产部署必须叠加 [镜像 Compose 配置](deploy/compose.image.yaml)，并可选择外部 PostgreSQL 或再叠加 [本地 PostgreSQL Compose 配置](deploy/compose.postgres.yaml)；两种数据库方式均要求经验证的 PostgreSQL TLS、Vault Transit 和 HTTPS 反向代理。配置及启动步骤见 [部署指南](docs/production-deployment.md)。模板不会创建企业凭证或自动部署服务；生产使用前仍须验证实际云效权限、备份恢复和运行隔离。

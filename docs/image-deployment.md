@@ -34,6 +34,8 @@ export CODEHARBOR_REPOSITORY_RUNTIME_IMAGE="$(docker image inspect codeharbor-co
 
 `CODEHARBOR_MCP_QUERY_CONCURRENCY` 控制同时执行的查询数，默认 `10`，只接受 `1` 至 `32` 的整数。Compose 会将同一值传给平台和镜像控制器；若自行部署两个服务或追加 override，必须保持两者相同，修改值后需同步重启。默认 10 个查询容器合计最多可使用 10 核 CPU 和 5 GiB 内存，实际影响取决于工作负载和同机其他服务，需压测确认。
 
+基础 Compose 还将应用及其串行 Git/CodeGraph 索引任务限制为默认 2 个 CPU、4 GiB 内存和 256 个 PID；可通过 `CODEHARBOR_APP_CPUS`、`CODEHARBOR_APP_MEMORY_LIMIT`、`CODEHARBOR_APP_PIDS_LIMIT` 按经过容量验证的部署调整。不得移除这些 cgroup 上限，或把限额提高到会影响同机服务恢复能力的值。
+
 `CODEHARBOR_DOCKER_CLI_IMAGE` 控制构建控制器镜像所用的 Docker CLI 镜像，默认 `docker:27-cli`；生产构建应指定企业审核并固定 digest 的镜像。控制器最终仍连接宿主机 Docker daemon，应确认客户端与 daemon 版本兼容。
 
 `compose.image.yaml` 使用 `!override` 替换应用的全部 `volumes`，以确保旧仓库卷不再挂载；这也会移除前面其他 Compose 文件加上的 CA 证书或其他业务挂载。部署前必须用最终 Compose 配置逐项核对原有非仓库挂载，在镜像配置之后通过受控的附加 override 显式恢复仍需的证书等挂载；不要把旧 Git 工作树卷重新挂入。Compose `secrets` 与 PostgreSQL 配置不会因这个 `volumes` 覆盖而自动移除，但仍需逐项核查源文件和访问权限。

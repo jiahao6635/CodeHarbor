@@ -57,6 +57,9 @@ for (const localPostgres of [false, true]) {
     assert.equal(app.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');
     assert.equal(controller.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');
     assert.equal(app.environment.TMPDIR, '/data');
+    assert.ok(Number(app.cpus) > 0);
+    assert.ok(app.mem_limit);
+    assert.ok(Number(app.pids_limit) > 0);
     assert.equal(
       app.volumes.some((volume) => ['/data', '/var/run/docker.sock'].includes(volume.target)),
       false,

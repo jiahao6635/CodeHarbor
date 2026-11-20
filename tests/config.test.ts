@@ -12,7 +12,11 @@ test('index backend accepts only known values', () => {
 });
 
 test('production requires PostgreSQL with verified TLS and Vault', () => {
-  const env = { NODE_ENV: 'production', CODEHARBOR_KEY_PROVIDER: 'vault-transit' };
+  const env = {
+    NODE_ENV: 'production',
+    CODEHARBOR_KEY_PROVIDER: 'vault-transit',
+    CODEHARBOR_INDEX_BACKEND: 'image',
+  };
   const good = 'postgresql://user:password@db.example/codeharbor?sslmode=verify-full';
   assert.doesNotThrow(() => validateProduction(env, good));
   for (const url of [
@@ -25,6 +29,10 @@ test('production requires PostgreSQL with verified TLS and Vault', () => {
     assert.throws(() => validateDatabaseTls(env, url));
   }
   assert.throws(() => validateProduction({ ...env, CODEHARBOR_KEY_PROVIDER: 'local' }, good));
+  assert.throws(() => validateProduction({ ...env, CODEHARBOR_INDEX_BACKEND: 'filesystem' }, good), /image index/);
+  assert.throws(() => validateProduction({ NODE_ENV: 'production', CODEHARBOR_KEY_PROVIDER: 'vault-transit' }, good), {
+    message: 'Production requires the bounded image index backend',
+  });
   assert.throws(() => validateDatabaseTls({ ...env, NODE_TLS_REJECT_UNAUTHORIZED: '0' }, good));
   assert.doesNotThrow(() => validateProduction({ NODE_ENV: 'test' }, 'postgresql://host/db'));
 });
