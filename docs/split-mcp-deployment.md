@@ -4,7 +4,7 @@
 
 当前部署的 `codegraph.sigmob.com` 仅内网可达，MCP 的推荐地址为 `https://codegraph.sigmob.com/mcp`，与控制台同域、经 Nginx TLS。**只有在该域名仅对可信网络开放时才能使用此配置**；若域名可从公网访问，须先在 Nginx 的 `/mcp` 上限制来源 IP，或恢复为 `return 404` 只保留内网端口。
 
-内网端口 `http://10.29.23.237:18080/mcp` 继续保留，供尚未迁移的客户端使用。**该端口上 Bearer Key、查询和返回的源码内容在网络传输中均为明文**，必须确保该网络和所有中间设备可信，限制访问来源；客户端迁移完成后可关闭该端口。网络和安全组规则由运维管理，此模板不会修改阿里云安全组。
+内网端口 `http://10.29.23.237:18080/mcp` 继续保留，供尚未迁移的客户端使用；该端口由 Nginx 执行来源限流后转发，MCP 容器本身不再向宿主机发布端口。**该端口上 Bearer Key、查询和返回的源码内容在网络传输中均为明文**，必须确保该网络和所有中间设备可信，限制访问来源；客户端迁移完成后可关闭该端口。网络和安全组规则由运维管理，此模板不会修改阿里云安全组。
 
 ## 前提
 
@@ -29,6 +29,8 @@ export CODEHARBOR_UI_MCP_URL=https://codegraph.sigmob.com/mcp
 ```
 
 `CODEHARBOR_MCP_ALLOWED_HOSTS` 与客户端请求的 HTTP `Host` 严格匹配，默认端口以外的地址要包含端口；如果还需要经过可信代理或健康检查访问，应明确加入相应 Host，多个值以逗号分隔。非浏览器 MCP 客户端一般不发送 `Origin`；浏览器客户端仅在确有需要时设置 `CODEHARBOR_MCP_ALLOWED_ORIGINS`，填入允许的完整 Origin。
+
+独立 MCP 服务会在自身入口执行容量保护，直连内网端口不会绕过这些控制。Nginx 会覆盖转发的客户端地址头，服务仅在这个内部拓扑中信任该值。每个 Key 的请求配额和每个客户端地址的认证失败配额分别沿用 `CODEHARBOR_MCP_KEY_RATE_PER_MIN`（默认 `120`）与 `CODEHARBOR_AUTH_FAILURE_RATE_PER_MIN`（默认 `30`）；单个 Key 同时最多执行 2 个查询，服务同时最多处理 32 个后端请求。`/health/ready` 每个来源每分钟最多请求 30 次，并按 `CODEHARBOR_MCP_READY_CACHE_MS`（默认 `5000` 毫秒）缓存探测结果，使并发或高频检查不会重复占用数据库和 CodeGraph 探测容量；`/health/live` 仍只检查进程存活且不调用后端。
 
 镜像查询并发通过 `CODEHARBOR_MCP_QUERY_CONCURRENCY` 控制，默认 `10`、可配置 `1`～`32` 的整数。平台和镜像控制器必须使用同一个值；`compose.image.yaml` 会将该变量同时传给两者，独立 MCP 网关无需单独配置。上线时同时更新平台和控制器，并按实际负载验证 CPU、内存和等待时间。
 

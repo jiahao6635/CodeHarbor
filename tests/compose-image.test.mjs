@@ -110,4 +110,15 @@ test('image Compose passes one configurable query limit to platform and controll
   assert.equal(services.codeharbor.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '7');
   assert.equal(services['image-controller'].environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '7');
   assert.equal(services.mcp.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, undefined);
+  assert.equal(services.mcp.environment.CODEHARBOR_TRUST_PROXY, 'true');
+  assert.equal(services.mcp.environment.CODEHARBOR_MCP_KEY_RATE_PER_MIN, '120');
+  assert.equal(services.mcp.environment.CODEHARBOR_AUTH_FAILURE_RATE_PER_MIN, '30');
+  assert.equal(services.mcp.environment.CODEHARBOR_MCP_READY_CACHE_MS, '5000');
+  assert.equal(services.mcp.ports, undefined, 'the MCP container must not publish a host port');
+  assert.ok(
+    services.nginx.ports.some(
+      (port) => port.target === 8081 && String(port.published) === '18080' && port.host_ip === '10.0.0.2',
+    ),
+    'the legacy private port must terminate at the controlled Nginx listener',
+  );
 });

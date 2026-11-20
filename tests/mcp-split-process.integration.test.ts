@@ -176,6 +176,7 @@ test('split MCP process shares platform authorization and publication locking', 
         CODEHARBOR_ALLOWED_HOSTS: `127.0.0.1:${port}`,
         CODEHARBOR_INTERNAL_MCP_SOCKET: path,
         CODEHARBOR_INTERNAL_MCP_TOKEN_FILE: tokenFile,
+        CODEHARBOR_MCP_READY_CACHE_MS: '1',
       },
     });
     await ready(child, base);
