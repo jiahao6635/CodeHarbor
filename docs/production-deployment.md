@@ -4,10 +4,10 @@
 
 ## 架构与限制
 
-- CodeHarbor 使用 Fastify、官方 MCP SDK、CodeGraph 1.6.2 和 PostgreSQL；API、MCP 和索引 Worker 在同一进程中。每个仓库的 CodeGraph SQLite 索引与工作树存放在持久化磁盘。
+- CodeHarbor 使用 Fastify、官方 MCP SDK、CodeGraph 1.6.2 和 PostgreSQL；API、MCP 和索引 Worker 在同一进程中。生产模式只接受镜像索引后端，临时工作树和索引位于限额 tmpfs，发布结果进入本机 Docker 镜像。
 - PostgreSQL 连接持有 session advisory lock，同一数据库只允许一个 CodeHarbor 实例。连接断开时拒绝后续数据库操作；使用 supervisor 监控并重启。仅支持直连或 session pooling，禁止使用事务池模式。
 - PAT 使用 AES-256-GCM 加密，主密钥通过 Vault Transit 保护；启动时 Vault 解包主密钥到应用内存。详见 [Vault Transit 指南](vault-transit.md)。
-- 本模板没有跨实例任务租约、fencing、共享索引协调或高可用；不应增加副本。索引 Worker 与 API 共用容器，容器边界无法提供仓库间强隔离。未验证企业云效权限之前不能认为可以用于生产多租户。
+- 本模板没有跨实例任务租约、共享索引协调或高可用；不应增加副本。生产 Compose 对串行索引 Worker 所在应用设置 CPU、内存和 PID 上限，并以限额 tmpfs 约束克隆与索引磁盘，但仍须监控 Docker 镜像和镜像层的存储用量。未验证企业云效权限之前不能认为可以用于生产多租户。
 - 已发布索引的 MCP 查询只检查 CodeHarbor Key 的明确仓库列表、有效期和撤销状态，不实时检查持有人的云效权限。云效撤权或 PAT 失效不会自动收回已签发 Key 的读取权，管理员须主动撤销或替换 Key；旧 `repos: null` Key 不可直接通过 MCP 查询。受配置允许的 write 管理员仍可管理平台并签发限定仓库范围的 Key。
 - 仓库接入和索引同步仍使用明确授权的同步账号 PAT 探测 Git HTTPS upload-pack。探测最多同时执行 2 个，运行超时 30 秒，响应最多 32 MiB、100,000 个对象；探测会在临时目录验证 Git 包并清理。空仓库、没有可探测分支、服务器不支持 shallow、数据超限或协议校验失败时无法确认克隆权限。同步凭据失效时不发布新版本，旧索引仍可由有效的限定范围 Key 查询。
 - Nginx 对外提供 TLS，不公开 `/health/` 或 `/metrics`；指标通过受控内网及独立 Bearer 访问应用端口。按企业网关、告警和日志平台调整。
@@ -17,7 +17,7 @@
 1. PostgreSQL 17 可以使用远端现有实例，也可以按下文启动本机 Docker 实例。应用账户须能建表和使用 advisory lock。两种方式均须配置服务端证书和可信 CA，连接串必须为 `postgresql://...?...sslmode=verify-full`；生产环境拒绝额外连接参数（可选 `application_name` 除外），不得关闭 TLS 校验。数据库必须持久化、备份并限制访问。
 2. 可用 HTTPS Vault、Transit AES 密钥、只具备 decrypt 权限的短期 token 文件，以及已包装的主密钥文件。全新数据使用 `--new`，迁移必须用 `--wrap-existing` 包装**原主密钥**，否则历史 PAT 无法解密。
 3. 云效 API endpoint、组织 ID、可信 Git HTTPS 主机名、服务域名和允许创建 write Key 的用户 ID。配置 DNS、防火墙和出网，使 CodeHarbor 可访问云效与 Vault；Webhook 的反向代理必须可由云效访问。
-4. 持久化数据卷（以运行用户 UID 1000 可读写），Git 凭证助手所在的 `/tmp` 和数据卷必须允许执行文件。实际 Docker Compose 本地 secrets 可能保留宿主文件的 UID/权限，需确保应用 UID 可读，避免将密钥对无关用户开放。Vault token 文件更新及密钥轮换后需按运行策略重启并验证。
+4. 按 [镜像模式部署准备](image-deployment.md) 创建控制器目录、三个独立令牌和只读运行时镜像。Git 凭证助手所在的限额 tmpfs 必须允许执行文件。实际 Docker Compose 本地 secrets 可能保留宿主文件的 UID/权限，需确保应用 UID 可读，避免将密钥对无关用户开放。
 5. TLS 证书与私钥、独立的监控 token（至少 32 个可打印 ASCII 且无空格）、受信的固定 Nginx 镜像引用。实际生产镜像建议按组织策略固定摘要并扫描。
 
 ## 环境配置
@@ -42,21 +42,21 @@
 将变量中的路径设置为宿主机上的实际文件，确认应用用户能读取。可先使用以下命令检查模板，不必启动服务：
 
 ```sh
-docker compose -f deploy/compose.yaml config --quiet
+docker compose -f deploy/compose.yaml -f deploy/compose.image.yaml config --quiet
 ```
 
 确认数据、证书、网络与备份配置之后，按企业部署流程构建并启动：
 
 ```sh
-docker compose -f deploy/compose.yaml build
-docker compose -f deploy/compose.yaml up -d
+docker compose -f deploy/compose.yaml -f deploy/compose.image.yaml build
+docker compose -f deploy/compose.yaml -f deploy/compose.image.yaml up -d
 ```
 
 这些命令不会初始化 Vault 密钥、生成数据库凭证或自动配置云效 Webhook。代理后的 PAT 绑定限流目前按连接来源 IP 计数；如果所有连接从同一反向代理进入，它们可能共享限额。不要盲目信任 `X-Forwarded-For`，应在可信网关配置限流，或实现并测试可信代理策略。
 
 ### 方式二：使用 Docker 本地 PostgreSQL
 
-保留前述 Vault、云效、Nginx 及应用必需的配置，再叠加 `deploy/compose.postgres.yaml`。该服务默认创建管理员 `codeharbor_admin`、非超级用户的应用账户 `codeharbor` 和对应数据库；应用账户可以在自身数据库中建表，不能创建数据库或角色。数据保存在 Docker 命名卷，仅允许 Compose 内网访问，默认不向宿主机开放数据库端口。数据库 URL 应使用应用账户、`postgres` 主机名和 `sslmode=verify-full`，数据库证书的 SAN 必须包含 `DNS:postgres`。
+保留前述 Vault、云效、Nginx 及镜像配置，在基础文件和 `deploy/compose.image.yaml` 之间叠加 `deploy/compose.postgres.yaml`。该服务默认创建管理员 `codeharbor_admin`、非超级用户的应用账户 `codeharbor` 和对应数据库；应用账户可以在自身数据库中建表，不能创建数据库或角色。数据保存在 Docker 命名卷，仅允许 Compose 内网访问，默认不向宿主机开放数据库端口。数据库 URL 应使用应用账户、`postgres` 主机名和 `sslmode=verify-full`，数据库证书的 SAN 必须包含 `DNS:postgres`。
 
 准备以下受保护的宿主文件，并导出其路径：
 
@@ -114,8 +114,8 @@ docker compose -f deploy/compose.postgres.yaml up -d postgres
 准备好所有基础环境配置后，启动完整服务：
 
 ```sh
-docker compose -f deploy/compose.yaml -f deploy/compose.postgres.yaml config --quiet
-docker compose -f deploy/compose.yaml -f deploy/compose.postgres.yaml up -d --build
+docker compose -f deploy/compose.yaml -f deploy/compose.postgres.yaml -f deploy/compose.image.yaml config --quiet
+docker compose -f deploy/compose.yaml -f deploy/compose.postgres.yaml -f deploy/compose.image.yaml up -d --build
 ```
 
 保留并备份数据库卷、证书及密钥；不要使用会删除卷的命令代替常规停机。Docker Compose 的 `restart` 不能仅凭健康检查失败自动重启容器，数据库不可用时应结合外部监控和服务恢复策略。切换远端与本地数据库只改变连接目标，不会自动复制数据；已有数据须通过一致性备份/恢复或迁移完成转移，并验证身份、仓库及索引状态。
