@@ -140,7 +140,10 @@ test('isolated MCP service forwards the caller through Unix RPC and exposes no p
       arguments: { repo_id: 'repo1', query: 'competing' },
     });
     assert.equal(competing.isError, true);
-    assert.equal(requests.some((request) => request.op === 'explore' && request.query === 'competing'), false);
+    assert.equal(
+      requests.some((request) => request.op === 'explore' && request.query === 'competing'),
+      false,
+    );
     permitted = false;
     release!();
     const revoked = await pending;
