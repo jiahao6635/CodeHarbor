@@ -1,5 +1,6 @@
 import { Key as KeyIcon, Plus, Trash } from '@phosphor-icons/react';
 import { useId, useState } from 'react';
+import { Link } from 'react-router';
 import { toast } from 'sonner';
 import { useCreateKey, useKeys, useRepositories, useRevokeKey } from '@/api/hooks';
 import type { CreatedKey, KeyInfo, Scope } from '@/api/types';
@@ -27,7 +28,13 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatAbsolute, formatExpiry } from '@/lib/format';
 import { toastError } from '@/lib/toast';
-import { childExpiryOptions, parseExpiry, resolveChildExpiry, UNLIMITED_EXPIRY_HELP } from '@/lib/validation';
+import {
+  childExpiryOptions,
+  parseExpiry,
+  resolveChildExpiry,
+  UNLIMITED_EXPIRY_HELP,
+  UNLIMITED_EXPIRY_OPTION,
+} from '@/lib/validation';
 
 export function KeyScopeCell({ info }: { info: Pick<KeyInfo, 'scope' | 'repos'> }) {
   if (info.repos === null) {
@@ -63,6 +70,18 @@ function CreateKeyDialog({
   const expiryOptions = childExpiryOptions(parentExpiry);
   // Default to the longest finite option; null is only used when explicitly selected.
   const expiresIn = resolveChildExpiry(expiryOptions, chosenExpiry);
+  const expiryHelp =
+    typeof parentExpiry === 'number' ? (
+      <>
+        当前 Key 有到期日。要创建无限期的下级 Key，请先
+        <Link to="/onboarding" className="text-accent underline underline-offset-4">
+          用云效 PAT 申请无限期 write Key
+        </Link>
+        。
+      </>
+    ) : expiresIn === null ? (
+      UNLIMITED_EXPIRY_HELP
+    ) : undefined;
 
   const submit = () => {
     setError(null);
@@ -150,18 +169,28 @@ function CreateKeyDialog({
             )}
           </fieldset>
         ) : null}
-        <Field id={expiryId} label="有效期" helper={expiresIn === null ? UNLIMITED_EXPIRY_HELP : undefined}>
+        <Field id={expiryId} label="有效期" helper={expiryHelp}>
           <NativeSelect
             id={expiryId}
             value={expiresIn === undefined ? '' : String(expiresIn)}
             onChange={(event) => setChosenExpiry(parseExpiry(event.target.value))}
-            aria-describedby={describedBy(expiryId, { helper: expiresIn === null })}
+            aria-describedby={describedBy(expiryId, { helper: Boolean(expiryHelp) })}
           >
+            {expiryOptions.length === 0 ? (
+              <option value="" disabled>
+                无可用有效期
+              </option>
+            ) : null}
             {expiryOptions.map((option) => (
               <option key={String(option.seconds)} value={String(option.seconds)}>
                 {option.label}
               </option>
             ))}
+            {parentExpiry !== null ? (
+              <option value={String(UNLIMITED_EXPIRY_OPTION.seconds)} disabled>
+                {UNLIMITED_EXPIRY_OPTION.label}
+              </option>
+            ) : null}
           </NativeSelect>
         </Field>
         <DialogFooter>

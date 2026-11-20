@@ -1,4 +1,4 @@
-import type { ComponentProps } from 'react';
+import type { ComponentProps, ReactNode } from 'react';
 import { cn } from '@/lib/cn';
 
 export function Label({ className, ...props }: ComponentProps<'label'>) {
@@ -16,7 +16,7 @@ export function Field({
 }: {
   id: string;
   label: string;
-  helper?: string;
+  helper?: ReactNode;
   error?: string;
   children: React.ReactNode;
   className?: string;
