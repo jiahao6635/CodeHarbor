@@ -93,13 +93,20 @@ export class Authorization {
     return this.isSelfScoped(key) && this.accessFresh(access, Date.now());
   }
 
-  /** A Codeup PAT that no longer authenticates invalidates every key and synced repository of its owner. */
-  async invalidateUserCredential(userId: string): Promise<void> {
+  /** A Codeup PAT that still belongs to the current version invalidates its owner's keys and synced repositories. */
+  async invalidateUserCredential(userId: string, credentialVersion: number): Promise<void> {
     await this.mutate(() =>
       this.store.transaction(async (tx) => {
+        const currentUser = await tx.getUser(userId);
+        if (!currentUser || currentUser.credential_version !== credentialVersion) return;
         await tx.revokeUserKeys(userId);
         for (const repo of await tx.listRepositories()) {
-          if (repo.sync_owner === userId && repo.status !== 'disabled' && repo.status !== 'branch_deleted') {
+          if (
+            repo.sync_owner === userId &&
+            repo.sync_credential_version === credentialVersion &&
+            repo.status !== 'disabled' &&
+            repo.status !== 'branch_deleted'
+          ) {
             await tx.updateRepository(repo.id, { status: 'credential_required', error: 'SYNC_AUTHORIZATION_REQUIRED' });
           }
         }
@@ -125,14 +132,20 @@ export class Authorization {
     } catch (error) {
       if (!(error instanceof CodeupError)) throw error;
       if (error.kind === 'invalid_credential') {
-        await this.invalidateUserCredential(user.id);
+        await this.invalidateUserCredential(user.id, user.credential_version);
         return undefined;
       }
       if (error.kind !== 'forbidden' && error.kind !== 'not_found') throw error;
     }
     const row: AccessRecord = { user_id: user.id, repo_id: repo.id, allowed, verified_at: Date.now() };
-    await this.store.upsertAccess(row);
-    return row;
+    return await this.mutate(() =>
+      this.store.transaction(async (tx) => {
+        const currentUser = await tx.getUser(user.id);
+        if (!currentUser || currentUser.credential_version !== user.credential_version) return undefined;
+        await tx.upsertAccess(row);
+        return row;
+      }),
+    );
   }
 
   /**
