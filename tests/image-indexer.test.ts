@@ -35,6 +35,7 @@ const graph: GraphClient = {
 
 test('image indexing publishes only an image reference and removes the temporary checkout', async () => {
   let temp = '';
+  let reconciled: { repositoryId: string; imageIds: string[] } | undefined;
   const pipeline = new ImageIndexPipeline(
     digest,
     graph,
@@ -51,11 +52,22 @@ test('image indexing publishes only an image reference and removes the temporary
       assert.equal(input.candidate.commit, commit);
       return { image, commit, repositoryId: request.repositoryId, codegraphVersion: '1.6.2' };
     },
+    {
+      async reconcileRepository(repositoryId, imageIds) {
+        reconciled = { repositoryId, imageIds };
+      },
+    },
   );
   assert.deepEqual(await pipeline.build(request), { path: image, commit, generation: 'generation-1' });
   await assert.rejects(access(temp));
   assert.equal(await pipeline.healthy(request, image, commit), true);
   assert.equal(await pipeline.healthy(request, '/old/worktree', commit), false);
+  const previous = `oci://sha256:${'f'.repeat(64)}`;
+  await pipeline.release(image, [image, previous]);
+  assert.deepEqual(reconciled, {
+    repositoryId: request.repositoryId,
+    imageIds: [digest, previous.slice('oci://'.length)],
+  });
 });
 
 test('image indexing removes its temporary checkout when image creation fails', async () => {

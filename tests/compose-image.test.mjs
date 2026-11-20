@@ -56,6 +56,8 @@ for (const localPostgres of [false, true]) {
     assert.equal(app.environment.CODEHARBOR_INDEX_BACKEND, 'image');
     assert.equal(app.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');
     assert.equal(controller.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');
+    assert.equal(controller.environment.CODEHARBOR_IMAGE_MAX_IMAGES, '512');
+    assert.equal(controller.environment.CODEHARBOR_IMAGE_STORAGE_BUDGET_BYTES, '68719476736');
     assert.equal(app.environment.TMPDIR, '/data');
     assert.equal(
       app.volumes.some((volume) => ['/data', '/var/run/docker.sock'].includes(volume.target)),

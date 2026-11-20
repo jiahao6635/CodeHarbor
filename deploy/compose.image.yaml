@@ -56,6 +56,8 @@ services:
       CODEHARBOR_IMAGE_ALLOWLIST: /var/lib/codeharbor-image-controller/images.sqlite
       CODEHARBOR_IMAGE_FENCE_DIR: /var/lib/codeharbor-image-controller
       CODEHARBOR_IMAGE_BUILD_WORK_DIR: /tmp
+      CODEHARBOR_IMAGE_MAX_IMAGES: ${CODEHARBOR_IMAGE_MAX_IMAGES:-512}
+      CODEHARBOR_IMAGE_STORAGE_BUDGET_BYTES: ${CODEHARBOR_IMAGE_STORAGE_BUDGET_BYTES:-68719476736}
       CODEHARBOR_IMAGE_QUERY_TOKEN_FILE: /run/secrets/image_query_token
       CODEHARBOR_IMAGE_BUILD_TOKEN_FILE: /run/secrets/image_build_token
       CODEHARBOR_IMAGE_AUTH_TOKEN_FILE: /run/secrets/image_auth_token

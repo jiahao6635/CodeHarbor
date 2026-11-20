@@ -7,15 +7,23 @@ import { DatabaseSync } from 'node:sqlite';
 import { Transform } from 'node:stream';
 import { finished, pipeline } from 'node:stream/promises';
 import * as tar from 'tar-stream';
-import { executeFixedDockerBuild, type ImageBuildExecutor } from './image-builder.js';
+import {
+  executeFixedDockerBuild,
+  type ImageBuildExecutor,
+  type OwnedRepositoryImage,
+  removeOwnedRepositoryImage,
+} from './image-builder.js';
 
 const idPattern = /^sha256:[a-f0-9]{64}$/;
 const repoPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const commitPattern = /^[a-f0-9]{40,64}$/;
-const maxHeader = 8192;
+const maxHeader = 4 * 1024 * 1024;
 const maxFiles = 50_000;
 const defaultMaxBytes = 512 * 1024 * 1024;
-const maxTrusted = 10_000;
+const storageMetadataBytes = maxFiles * 4096 + 1024 * 1024;
+const defaultMaxTrusted = 512;
+const defaultMaxRepositoryImages = 3;
+const defaultMaxStorageBytes = 64 * 1024 * 1024 * 1024;
 
 export interface TrustedRepositoryImage {
   imageId: string;
@@ -23,12 +31,26 @@ export interface TrustedRepositoryImage {
   commit: string;
   runtimeImage: string;
 }
+type StoredRepositoryImage = TrustedRepositoryImage & {
+  storageBytes: number;
+  active: boolean;
+};
+type ImageCapacityLimits = {
+  maxTrusted: number;
+  maxRepositoryImages: number;
+  maxStorageBytes: number;
+};
 export interface ImageBuilderSocketOptions {
   path: string;
   token: string;
   runtimeImage: `sha256:${string}`;
   timeoutMs?: number;
 }
+
+export type RetainedImageReferences = {
+  repositoryId: string;
+  imageIds: string[];
+};
 
 function validateOptions(options: ImageBuilderSocketOptions): void {
   if (
@@ -98,7 +120,9 @@ export async function getTrustedImage(
   const db = new DatabaseSync(path, { readOnly: true });
   try {
     const row = db
-      .prepare('SELECT image_id, repository_id, commit_id, runtime_image FROM images WHERE image_id = ?')
+      .prepare(
+        'SELECT image_id, repository_id, commit_id, runtime_image FROM images WHERE image_id = ? AND active = 1',
+      )
       .get(imageId);
     if (
       !row ||
@@ -126,7 +150,7 @@ export async function getTrustedImage(
   }
 }
 
-async function initializeAllowlist(path: string): Promise<void> {
+async function initializeAllowlist(path: string, legacyStorageBytes: number): Promise<void> {
   if (!isAbsolute(path) || path.includes('\0')) throw new Error('Invalid allowlist path');
   const uid = process.getuid?.();
   if (uid === undefined) throw new Error('Image builder requires a Unix user');
@@ -143,7 +167,15 @@ async function initializeAllowlist(path: string): Promise<void> {
   const db = new DatabaseSync(path);
   try {
     db.exec(
-      'PRAGMA journal_mode=DELETE; CREATE TABLE IF NOT EXISTS images (image_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL, commit_id TEXT NOT NULL, runtime_image TEXT NOT NULL); CREATE TABLE IF NOT EXISTS builder_state (id INTEGER PRIMARY KEY CHECK(id=1), uncertain INTEGER NOT NULL CHECK(uncertain IN (0,1))); INSERT OR IGNORE INTO builder_state(id, uncertain) VALUES (1, 0)',
+      `PRAGMA journal_mode=DELETE; CREATE TABLE IF NOT EXISTS images (image_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL, commit_id TEXT NOT NULL, runtime_image TEXT NOT NULL, storage_bytes INTEGER NOT NULL DEFAULT ${legacyStorageBytes}, active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))); CREATE TABLE IF NOT EXISTS builder_state (id INTEGER PRIMARY KEY CHECK(id=1), uncertain INTEGER NOT NULL CHECK(uncertain IN (0,1))); INSERT OR IGNORE INTO builder_state(id, uncertain) VALUES (1, 0)`,
+    );
+    const columns = db.prepare('PRAGMA table_info(images)').all();
+    if (!columns.some((column) => column.name === 'storage_bytes'))
+      db.exec(`ALTER TABLE images ADD COLUMN storage_bytes INTEGER NOT NULL DEFAULT ${legacyStorageBytes}`);
+    if (!columns.some((column) => column.name === 'active'))
+      db.exec('ALTER TABLE images ADD COLUMN active INTEGER NOT NULL DEFAULT 1');
+    db.exec(
+      'CREATE INDEX IF NOT EXISTS images_repository_active ON images(repository_id, active); CREATE INDEX IF NOT EXISTS images_active ON images(active)',
     );
     if (db.prepare('SELECT uncertain FROM builder_state WHERE id=1').get()?.uncertain !== 0)
       throw new Error('Image builder requires operator recovery');
@@ -152,27 +184,81 @@ async function initializeAllowlist(path: string): Promise<void> {
   }
   await chmod(path, 0o640);
 }
-async function trustImage(path: string, record: TrustedRepositoryImage): Promise<void> {
+
+function numeric(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+async function ensureBuildCapacity(
+  path: string,
+  repositoryId: string,
+  reservationBytes: number,
+  limits: ImageCapacityLimits,
+): Promise<void> {
+  await protectedDatabase(path, process.getuid?.());
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    const totals = db.prepare('SELECT count(*) AS n, COALESCE(sum(storage_bytes), 0) AS bytes FROM images').get();
+    const repository = db.prepare('SELECT count(*) AS n FROM images WHERE repository_id = ?').get(repositoryId);
+    const count = numeric(totals?.n);
+    const bytes = numeric(totals?.bytes);
+    const repositoryCount = numeric(repository?.n);
+    if (
+      count === null ||
+      bytes === null ||
+      repositoryCount === null ||
+      count >= limits.maxTrusted ||
+      repositoryCount >= limits.maxRepositoryImages ||
+      bytes > limits.maxStorageBytes - reservationBytes
+    )
+      throw new Error('Image capacity is unavailable');
+  } finally {
+    db.close();
+  }
+}
+
+async function trustImage(
+  path: string,
+  record: TrustedRepositoryImage,
+  storageBytes: number,
+  limits: ImageCapacityLimits,
+): Promise<void> {
   await protectedDatabase(path, process.getuid?.());
   const db = new DatabaseSync(path);
   try {
     db.exec('BEGIN IMMEDIATE');
     try {
-      const count = db.prepare('SELECT count(*) AS n FROM images').get()?.n;
+      const totals = db.prepare('SELECT count(*) AS n, COALESCE(sum(storage_bytes), 0) AS bytes FROM images').get();
+      const repositoryCount = db
+        .prepare('SELECT count(*) AS n FROM images WHERE repository_id = ?')
+        .get(record.repositoryId)?.n;
       const old = db
-        .prepare('SELECT repository_id, commit_id, runtime_image FROM images WHERE image_id = ?')
+        .prepare('SELECT repository_id, commit_id, runtime_image, active FROM images WHERE image_id = ?')
         .get(record.imageId);
       if (
         old &&
         (old.repository_id !== record.repositoryId ||
           old.commit_id !== record.commit ||
-          old.runtime_image !== record.runtimeImage)
+          old.runtime_image !== record.runtimeImage ||
+          old.active !== 1)
       )
         throw new Error('Conflicting image identity');
-      if (!old && (typeof count !== 'number' || count >= maxTrusted)) throw new Error('Image allowlist is full');
+      const count = numeric(totals?.n);
+      const bytes = numeric(totals?.bytes);
+      const perRepository = numeric(repositoryCount);
+      if (
+        !old &&
+        (count === null ||
+          bytes === null ||
+          perRepository === null ||
+          count >= limits.maxTrusted ||
+          perRepository >= limits.maxRepositoryImages ||
+          bytes > limits.maxStorageBytes - storageBytes)
+      )
+        throw new Error('Image capacity is unavailable');
       db.prepare(
-        'INSERT OR IGNORE INTO images(image_id, repository_id, commit_id, runtime_image) VALUES (?, ?, ?, ?)',
-      ).run(record.imageId, record.repositoryId, record.commit, record.runtimeImage);
+        'INSERT OR IGNORE INTO images(image_id, repository_id, commit_id, runtime_image, storage_bytes, active) VALUES (?, ?, ?, ?, ?, 1)',
+      ).run(record.imageId, record.repositoryId, record.commit, record.runtimeImage, storageBytes);
       db.exec('UPDATE builder_state SET uncertain=0 WHERE id=1');
       db.exec('COMMIT');
     } catch (error) {
@@ -181,6 +267,118 @@ async function trustImage(path: string, record: TrustedRepositoryImage): Promise
     }
   } finally {
     db.close();
+  }
+}
+
+function storedImage(row: Record<string, unknown>): StoredRepositoryImage {
+  if (
+    typeof row.image_id !== 'string' ||
+    !idPattern.test(row.image_id) ||
+    typeof row.repository_id !== 'string' ||
+    !repoPattern.test(row.repository_id) ||
+    typeof row.commit_id !== 'string' ||
+    !commitPattern.test(row.commit_id) ||
+    typeof row.runtime_image !== 'string' ||
+    !idPattern.test(row.runtime_image) ||
+    numeric(row.storage_bytes) === null ||
+    (row.active !== 0 && row.active !== 1)
+  )
+    throw new Error('Invalid image allowlist state');
+  return {
+    imageId: row.image_id,
+    repositoryId: row.repository_id,
+    commit: row.commit_id,
+    runtimeImage: row.runtime_image,
+    storageBytes: row.storage_bytes as number,
+    active: row.active === 1,
+  };
+}
+
+function verifyRetainedImages(
+  db: DatabaseSync,
+  repositoryId: string,
+  imageIds: readonly string[],
+): void {
+  for (const imageId of imageIds) {
+    const row = db
+      .prepare('SELECT repository_id, active FROM images WHERE image_id = ?')
+      .get(imageId) as Record<string, unknown> | undefined;
+    if (!row || row.repository_id !== repositoryId || row.active !== 1)
+      throw new Error('Retained image is not trusted');
+  }
+}
+
+async function reconcileRepositoryImages(path: string, repositoryId: string, imageIds: string[]): Promise<void> {
+  await protectedDatabase(path, process.getuid?.());
+  const db = new DatabaseSync(path);
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      verifyRetainedImages(db, repositoryId, imageIds);
+      db.prepare('UPDATE images SET active=0 WHERE repository_id = ?').run(repositoryId);
+      const retain = db.prepare('UPDATE images SET active=1 WHERE image_id = ? AND repository_id = ?');
+      for (const imageId of imageIds) retain.run(imageId, repositoryId);
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  } finally {
+    db.close();
+  }
+}
+
+async function reconcileAllImages(
+  path: string,
+  repositories: Array<{ repositoryId: string; imageIds: string[] }>,
+): Promise<void> {
+  await protectedDatabase(path, process.getuid?.());
+  const db = new DatabaseSync(path);
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const repository of repositories)
+        verifyRetainedImages(db, repository.repositoryId, repository.imageIds);
+      db.exec('UPDATE images SET active=0');
+      const retain = db.prepare('UPDATE images SET active=1 WHERE image_id = ? AND repository_id = ?');
+      for (const repository of repositories)
+        for (const imageId of repository.imageIds) retain.run(imageId, repository.repositoryId);
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  } finally {
+    db.close();
+  }
+}
+
+async function cleanupRetiredImages(
+  path: string,
+  removeImage: (image: OwnedRepositoryImage) => Promise<void>,
+): Promise<void> {
+  await protectedDatabase(path, process.getuid?.());
+  const read = new DatabaseSync(path, { readOnly: true });
+  let retired: StoredRepositoryImage[];
+  try {
+    retired = read
+      .prepare(
+        'SELECT image_id, repository_id, commit_id, runtime_image, storage_bytes, active FROM images WHERE active=0 ORDER BY repository_id, image_id',
+      )
+      .all()
+      .map((row) => storedImage(row));
+  } finally {
+    read.close();
+  }
+  for (const image of retired) {
+    await removeImage(image);
+    await protectedDatabase(path, process.getuid?.());
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare('DELETE FROM images WHERE image_id = ? AND active=0').run(image.imageId);
+    } finally {
+      db.close();
+    }
   }
 }
 
@@ -268,6 +466,54 @@ export class SocketImageBuildExecutor {
   constructor(private readonly options: ImageBuilderSocketOptions) {
     validateOptions(options);
   }
+
+  private async control(input: Record<string, unknown>): Promise<void> {
+    const socket = net.createConnection({ path: this.options.path, allowHalfOpen: true });
+    const timer = setTimeout(() => socket.destroy(), this.options.timeoutMs ?? 30_000);
+    timer.unref();
+    try {
+      await new Promise<void>((ok, fail) => {
+        socket.once('connect', ok);
+        socket.once('error', fail);
+      });
+      const response = readLine(socket);
+      socket.end(`${JSON.stringify({ ...input, token: this.options.token })}\n`);
+      if ((await response) !== '{"ok":true}') throw new Error('Image builder rejected reconciliation');
+    } finally {
+      clearTimeout(timer);
+      socket.destroy();
+    }
+  }
+
+  async reconcileRepository(repositoryId: string, imageIds: string[]): Promise<void> {
+    if (
+      !repoPattern.test(repositoryId) ||
+      imageIds.length > 2 ||
+      new Set(imageIds).size !== imageIds.length ||
+      imageIds.some((imageId) => !idPattern.test(imageId))
+    )
+      throw new Error('Invalid repository image reconciliation');
+    await this.control({ op: 'reconcile_repository', repositoryId, imageIds });
+  }
+
+  async reconcileAll(repositories: RetainedImageReferences[]): Promise<void> {
+    const ids = repositories.flatMap((repository) => repository.imageIds);
+    if (
+      repositories.length > 10_000 ||
+      ids.length > 10_000 ||
+      new Set(repositories.map((repository) => repository.repositoryId)).size !== repositories.length ||
+      new Set(ids).size !== ids.length ||
+      repositories.some(
+        (repository) =>
+          !repoPattern.test(repository.repositoryId) ||
+          repository.imageIds.length > 2 ||
+          repository.imageIds.some((imageId) => !idPattern.test(imageId)),
+      )
+    )
+      throw new Error('Invalid global image reconciliation');
+    await this.control({ op: 'reconcile_all', repositories });
+  }
+
   readonly execute: ImageBuildExecutor = async (context, iidFile, tag, timeoutMs) => {
     const dockerfile = await readFile(join(context, 'Dockerfile'), 'utf8');
     const match =
@@ -356,21 +602,50 @@ export async function serveImageBuilder(
     workDir?: string;
     maxConnections?: number;
     handshakeTimeoutMs?: number;
+    maxTrustedImages?: number;
+    maxRepositoryImages?: number;
+    maxStorageBytes?: number;
     /** Test-only hooks; production uses the fixed executor and cleanup. */
     execute?: ImageBuildExecutor;
     cleanup?: (path: string) => Promise<void>;
+    removeImage?: (image: OwnedRepositoryImage) => Promise<void>;
   },
 ): Promise<{ close(): Promise<void> }> {
   validateOptions(options);
   const maxBytes = options.maxBytes ?? defaultMaxBytes;
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 2 * 1024 * 1024 * 1024)
     throw new Error('Invalid image build size limit');
+  const imageReservationBytes = maxBytes + storageMetadataBytes;
+  const buildReservationBytes = imageReservationBytes * 2;
+  const limits: ImageCapacityLimits = {
+    maxTrusted: options.maxTrustedImages ?? defaultMaxTrusted,
+    maxRepositoryImages: options.maxRepositoryImages ?? defaultMaxRepositoryImages,
+    maxStorageBytes: options.maxStorageBytes ?? defaultMaxStorageBytes,
+  };
+  if (
+    !Number.isSafeInteger(limits.maxTrusted) ||
+    limits.maxTrusted < 1 ||
+    limits.maxTrusted > 10_000 ||
+    !Number.isSafeInteger(limits.maxRepositoryImages) ||
+    limits.maxRepositoryImages < 1 ||
+    limits.maxRepositoryImages > 3 ||
+    limits.maxRepositoryImages > limits.maxTrusted ||
+    !Number.isSafeInteger(limits.maxStorageBytes) ||
+    limits.maxStorageBytes < buildReservationBytes
+  )
+    throw new Error('Invalid image storage limits');
   const uid = process.getuid?.();
   if (uid === undefined) throw new Error('Image builder requires a Unix user');
   await protectedDirectory(dirname(options.path), uid);
-  await initializeAllowlist(options.allowlistPath);
+  await initializeAllowlist(options.allowlistPath, imageReservationBytes);
   const workDir = options.workDir ?? dirname(options.allowlistPath);
   await protectedDirectory(workDir, uid);
+  const removeImage =
+    options.removeImage ??
+    ((image: OwnedRepositoryImage) =>
+      removeOwnedRepositoryImage(image, workDir, options.timeoutMs ?? 10 * 60_000));
+  // Retirement is durable before Docker cleanup, so interrupted cleanup can be retried safely.
+  await cleanupRetiredImages(options.allowlistPath, removeImage).catch(() => {});
   const maxConnections = options.maxConnections ?? 4;
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? 5000;
   if (
@@ -397,6 +672,7 @@ export async function serveImageBuilder(
     let fence = false;
     let startedBuild = false;
     let responseId: string | undefined;
+    let controlResponse = false;
     let extract: tar.Extract | undefined;
     const abort = new AbortController();
     const handshake = setTimeout(() => socket.destroy(), handshakeTimeoutMs);
@@ -424,15 +700,8 @@ export async function serveImageBuilder(
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
         const input = parsed as Record<string, unknown>;
         if (
-          Object.keys(input).sort().join(',') !== 'commit,op,repositoryId,runtimeImage,token' ||
-          input.op !== 'build' ||
           typeof input.token !== 'string' ||
           !equalToken(input.token, options.token) ||
-          input.runtimeImage !== options.runtimeImage ||
-          typeof input.repositoryId !== 'string' ||
-          !repoPattern.test(input.repositoryId) ||
-          typeof input.commit !== 'string' ||
-          !commitPattern.test(input.commit) ||
           busy ||
           poisoned
         )
@@ -440,10 +709,83 @@ export async function serveImageBuilder(
         clearTimeout(handshake);
         busy = true;
         claimed = true;
+        if (input.op === 'reconcile_repository') {
+          if (
+            Object.keys(input).sort().join(',') !== 'imageIds,op,repositoryId,token' ||
+            typeof input.repositoryId !== 'string' ||
+            !repoPattern.test(input.repositoryId) ||
+            !Array.isArray(input.imageIds) ||
+            input.imageIds.length > 2 ||
+            new Set(input.imageIds).size !== input.imageIds.length ||
+            input.imageIds.some((imageId) => typeof imageId !== 'string' || !idPattern.test(imageId))
+          )
+            throw new Error();
+          await reconcileRepositoryImages(options.allowlistPath, input.repositoryId, input.imageIds as string[]);
+          // A failed Docker removal remains durably inactive and counts against
+          // admission until a later maintenance/build request can retry it.
+          await cleanupRetiredImages(options.allowlistPath, removeImage).catch(() => {});
+          controlResponse = true;
+          return;
+        }
+        if (input.op === 'reconcile_all') {
+          if (
+            Object.keys(input).sort().join(',') !== 'op,repositories,token' ||
+            !Array.isArray(input.repositories) ||
+            input.repositories.length > 10_000
+          )
+            throw new Error();
+          const repositories: RetainedImageReferences[] = [];
+          for (const item of input.repositories) {
+            if (
+              !item ||
+              typeof item !== 'object' ||
+              Array.isArray(item) ||
+              Object.keys(item).sort().join(',') !== 'imageIds,repositoryId'
+            )
+              throw new Error();
+            const repository = item as Record<string, unknown>;
+            if (
+              typeof repository.repositoryId !== 'string' ||
+              !repoPattern.test(repository.repositoryId) ||
+              !Array.isArray(repository.imageIds) ||
+              repository.imageIds.length > 2 ||
+              new Set(repository.imageIds).size !== repository.imageIds.length ||
+              repository.imageIds.some((imageId) => typeof imageId !== 'string' || !idPattern.test(imageId))
+            )
+              throw new Error();
+            repositories.push({
+              repositoryId: repository.repositoryId,
+              imageIds: repository.imageIds as string[],
+            });
+          }
+          const retained = repositories.flatMap((repository) => repository.imageIds);
+          if (
+            retained.length > 10_000 ||
+            new Set(repositories.map((repository) => repository.repositoryId)).size !== repositories.length ||
+            new Set(retained).size !== retained.length
+          )
+            throw new Error();
+          await reconcileAllImages(options.allowlistPath, repositories);
+          await cleanupRetiredImages(options.allowlistPath, removeImage).catch(() => {});
+          controlResponse = true;
+          return;
+        }
+        if (
+          Object.keys(input).sort().join(',') !== 'commit,op,repositoryId,runtimeImage,token' ||
+          input.op !== 'build' ||
+          input.runtimeImage !== options.runtimeImage ||
+          typeof input.repositoryId !== 'string' ||
+          !repoPattern.test(input.repositoryId) ||
+          typeof input.commit !== 'string' ||
+          !commitPattern.test(input.commit)
+        )
+          throw new Error();
+        await cleanupRetiredImages(options.allowlistPath, removeImage);
+        await ensureBuildCapacity(options.allowlistPath, input.repositoryId, buildReservationBytes, limits);
         await setRecoveryRequired(options.allowlistPath);
         fence = true;
         context = await mkdtemp(join(workDir, 'codeharbor-builder-context-'));
-        await mkdir(join(context, 'repo'), { mode: 0o700 });
+        await mkdir(join(context, 'repo'), { mode: 0o755 });
         extract = tar.extract();
         let bytes = 0;
         let files = 0;
@@ -481,8 +823,8 @@ export async function serveImageBuilder(
               if (header.size !== 2) throw new Error();
               sawGitignore = true;
             }
-            await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
-            await pipeline(stream, createWriteStream(destination, { mode: 0o600, flags: 'wx' }));
+            await mkdir(dirname(destination), { recursive: true, mode: 0o755 });
+            await pipeline(stream, createWriteStream(destination, { mode: 0o644, flags: 'wx' }));
             next();
           })().catch(() => {
             stream.destroy();
@@ -556,12 +898,17 @@ export async function serveImageBuilder(
         if (!idPattern.test(imageId)) throw new Error();
         await (options.cleanup ?? ((p) => rm(p, { recursive: true, force: true })))(context);
         context = undefined;
-        await trustImage(options.allowlistPath, {
-          imageId,
-          repositoryId: input.repositoryId,
-          commit: input.commit,
-          runtimeImage: options.runtimeImage,
-        });
+        await trustImage(
+          options.allowlistPath,
+          {
+            imageId,
+            repositoryId: input.repositoryId,
+            commit: input.commit,
+            runtimeImage: options.runtimeImage,
+          },
+          bytes + files * 4096 + 1024 * 1024,
+          limits,
+        );
         fence = false;
         responseId = imageId;
       } catch {
@@ -587,7 +934,11 @@ export async function serveImageBuilder(
         if (claimed) busy = false;
         if (!socket.destroyed)
           socket.end(
-            responseId && !poisoned ? `${JSON.stringify({ ok: true, imageId: responseId })}\n` : '{"ok":false}\n',
+            responseId && !poisoned
+              ? `${JSON.stringify({ ok: true, imageId: responseId })}\n`
+              : controlResponse && !poisoned
+                ? '{"ok":true}\n'
+                : '{"ok":false}\n',
           );
       }
     })();
