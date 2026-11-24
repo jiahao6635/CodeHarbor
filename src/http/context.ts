@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import type { CredentialCipher } from '../auth.js';
 import type { Authorization, Principal } from '../authorization.js';
+import type { BrowserSession, BrowserSessionService, FeishuConfig } from '../browser-auth.js';
 import type { GraphClient } from '../codegraph.js';
 import type { CodeupClient } from '../codeup.js';
 import type { IndexRequest } from '../indexer.js';
@@ -15,7 +16,7 @@ export type AuditEvent = {
   method: string;
   route: string;
   status: number;
-  authentication?: 'api_key' | 'yunxiao_pat' | 'bootstrap' | 'webhook';
+  authentication?: 'api_key' | 'feishu_session' | 'yunxiao_pat' | 'bootstrap' | 'webhook';
   subject?: string;
   key_prefix?: string;
   repo_id?: string;
@@ -37,6 +38,7 @@ declare module 'fastify' {
     /** False when a pre-authentication reject must not consume durable audit capacity. */
     durableAudit: boolean;
     principal?: Principal;
+    browserSession?: BrowserSession;
     /** Owner credential version observed at authentication; writes re-check it after the body arrives. */
     credentialVersion?: number;
   }
@@ -52,6 +54,7 @@ export interface AppConfig {
   allowedGitHosts: string[];
   allowedHosts: string[];
   allowedOrigins?: string[];
+  feishu?: FeishuConfig;
   writeUsers: string[];
   codegraphBin: string;
   reconcileMs?: number;
@@ -77,8 +80,6 @@ export interface AppConfig {
   auditRetentionDays?: number;
 }
 
-export type BootstrapSession = { userId: string; expires: number };
-
 /** Everything route modules need; built once by createApp. */
 export interface AppContext {
   config: AppConfig;
@@ -89,9 +90,8 @@ export interface AppContext {
   worker: Pick<IndexWorker, 'enqueue' | 'kick'>;
   authorization: Authorization;
   metrics: HttpMetrics;
-  limiters: { bind: RateLimiter; authFailure: RateLimiter; mcpKey: RateLimiter };
-  /** Short-lived bootstrap tokens issued after a PAT binding, keyed by token hash. */
-  sessions: Map<string, BootstrapSession>;
+  limiters: { bind: RateLimiter; oauth: RateLimiter; authFailure: RateLimiter; mcpKey: RateLimiter };
+  sessionService?: BrowserSessionService;
   probe: (request: IndexRequest, signal?: AbortSignal) => Promise<boolean>;
   clientIp(request: Pick<IncomingMessage, 'headers' | 'socket'>): string;
   fenced(): Record<string, boolean>;

@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
-import Fastify, { type FastifyBaseLogger, LogController } from 'fastify';
+import Fastify, { type FastifyBaseLogger, type FastifyInstance, LogController } from 'fastify';
 import { CredentialCipher } from './auth.js';
 import { Authorization } from './authorization.js';
+import { BrowserSessionService } from './browser-auth.js';
 import { checkCloneAccess } from './clone-access.js';
 import { CodeGraphClient, type GraphClient } from './codegraph.js';
 import { CodeupClient } from './codeup.js';
@@ -19,6 +20,7 @@ import { openApiDocument } from './openapi.js';
 import { RateLimiter } from './rate-limit.js';
 import { registerAdminRoutes } from './routes/admin.js';
 import { registerAuthRoutes } from './routes/auth.js';
+import { registerCodeupBranchRoutes } from './routes/codeup-branches.js';
 import { registerConsoleRoutes, UI_ASSET_ROUTE, UI_CSP, UI_ROUTE } from './routes/console.js';
 import { registerHookRoutes } from './routes/hooks.js';
 import { registerKeyRoutes } from './routes/keys.js';
@@ -33,6 +35,9 @@ export type { AppConfig, AuditEvent } from './http/context.js';
 export type AppDependencies = {
   store: StoreBackend;
   codeup?: CodeupClient;
+  feishuFetch?: typeof fetch;
+  /** Legacy behavior for existing regression fixtures. The server entrypoint never sets it. */
+  legacyAuthForTests?: (app: FastifyInstance, ctx: AppContext) => void;
   graph?: GraphClient;
   worker?: IndexWorker;
   imagePipeline?: ImageIndexPipeline;
@@ -74,6 +79,10 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
     codeup,
     cipher,
     writeUsers: config.writeUsers,
+    enforceFeishu: !deps.legacyAuthForTests,
+    dataDir: config.dataDir,
+    allowedGitHosts: config.allowedGitHosts,
+    probe: deps.probe ?? checkCloneAccess,
     accessTtlMs,
     auditRetentionDays: config.auditRetentionDays ?? 180,
   });
@@ -113,10 +122,13 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
     metrics: new HttpMetrics(),
     limiters: {
       bind: new RateLimiter(10, 60_000),
+      oauth: new RateLimiter(60, 60_000),
       authFailure: new RateLimiter(config.authFailureRatePerMinute ?? 30, 60_000),
       mcpKey: new RateLimiter(config.mcpKeyRatePerMinute ?? 120, 60_000),
     },
-    sessions: new Map(),
+    sessionService: config.feishu
+      ? new BrowserSessionService(config.feishu, store, authorization.mutate, deps.feishuFetch)
+      : undefined,
     probe: deps.probe ?? checkCloneAccess,
     clientIp(request: Pick<IncomingMessage, 'headers' | 'socket'>) {
       if (config.trustProxy) {
@@ -156,6 +168,7 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
   fastify.decorateRequest('actor');
   fastify.decorateRequest('durableAudit');
   fastify.decorateRequest('principal');
+  fastify.decorateRequest('browserSession');
   fastify.decorateRequest('credentialVersion');
 
   fastify.addHook('onRequest', async (request, reply) => {
@@ -199,7 +212,7 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
     // A page served from an allowed host (the bundled console) is same-origin by construction; browsers
     // still send Origin on non-GET requests, so it must pass without being listed separately.
     const sameOrigin = origin === `https://${host}` || origin === `http://${host}`;
-    if (origin && !sameOrigin && !config.allowedOrigins?.includes(origin)) {
+    if (origin && !sameOrigin && origin !== config.feishu?.origin && !config.allowedOrigins?.includes(origin)) {
       return reply.code(403).send({ error: 'FORBIDDEN' });
     }
   });
@@ -233,7 +246,13 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
 
   registerSystemRoutes(fastify, ctx);
   registerMcpRoute(fastify, ctx);
-  registerAuthRoutes(fastify, ctx);
+  if (deps.legacyAuthForTests) {
+    if (config.feishu) throw new Error('Legacy test authentication cannot be combined with Feishu login');
+    deps.legacyAuthForTests(fastify, ctx);
+  } else {
+    registerAuthRoutes(fastify, ctx);
+    registerCodeupBranchRoutes(fastify, ctx);
+  }
   registerHookRoutes(fastify, ctx);
   registerRepositoryRoutes(fastify, ctx);
   registerKeyRoutes(fastify, ctx);

@@ -3,7 +3,7 @@ import { describeError, describeRepositoryError } from './errors';
 
 describe('describeError', () => {
   it('maps known server codes to Chinese explanations', () => {
-    expect(describeError('UNAUTHENTICATED')).toMatch(/Key/);
+    expect(describeError('UNAUTHENTICATED')).toMatch(/飞书/);
     expect(describeError('RATE_LIMITED')).toMatch(/频繁/);
   });
   it('keeps unknown codes visible for log correlation', () => {

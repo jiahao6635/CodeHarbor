@@ -1,13 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   branchName,
-  childExpiryOptions,
   codeupRepositoryId,
   DEFAULT_EXPIRES_IN,
   EXPIRY_OPTIONS,
   MAX_EXPIRES_IN,
   parseExpiry,
-  resolveChildExpiry,
 } from './validation';
 
 describe('branchName mirrors the server rules', () => {
@@ -33,7 +31,6 @@ describe('codeupRepositoryId', () => {
 
 describe('expiry options', () => {
   const day = 86_400;
-  const now = 1_800_000_000_000;
 
   it('offers unlimited validity and keeps finite options within the server maximum', () => {
     expect(EXPIRY_OPTIONS.filter((option) => option.seconds === null)).toEqual([
@@ -46,42 +43,19 @@ describe('expiry options', () => {
     }
   });
 
-  it('keeps onboarding at 30 days and child keys at the longest finite default', () => {
+  it('defaults to 30 days', () => {
     expect(DEFAULT_EXPIRES_IN).toBe(30 * day);
     expect(EXPIRY_OPTIONS.some((option) => option.seconds === DEFAULT_EXPIRES_IN)).toBe(true);
-    expect(resolveChildExpiry(childExpiryOptions(null, now), undefined)).toBe(90 * day);
   });
 
   it('round-trips select values without turning unlimited into zero or the default', () => {
-    const options = childExpiryOptions(null, now);
-    for (const option of options) {
+    for (const option of EXPIRY_OPTIONS) {
       const selected = parseExpiry(String(option.seconds));
       expect(selected).toBe(option.seconds);
-      expect(resolveChildExpiry(options, selected)).toBe(option.seconds);
     }
   });
 
   it.each(['0', '', 'undefined', '-1', 'Infinity'])('rejects invalid select value %j', (value) => {
     expect(() => parseExpiry(value)).toThrow('Invalid key expiry');
   });
-
-  it('filters unlimited and overlong choices for a finite parent, including the exact boundary', () => {
-    const options = childExpiryOptions(now + 30 * day * 1000, now);
-    expect(options.map((option) => option.seconds)).toEqual([day, 7 * day, 30 * day]);
-    expect(resolveChildExpiry(options, undefined)).toBe(30 * day);
-    expect(resolveChildExpiry(options, null)).toBe(30 * day);
-    expect(resolveChildExpiry(options, 90 * day)).toBe(30 * day);
-    expect(resolveChildExpiry(options, day)).toBe(day);
-    expect(childExpiryOptions(now + 30 * day * 1000, now + 1).map((option) => option.seconds)).toEqual([day, 7 * day]);
-  });
-
-  it.each([undefined, now - 1, now, now + day * 1000 - 1])(
-    'has no valid expiry for an unknown, expired or too-short parent (%s)',
-    (parent) => {
-      const options = childExpiryOptions(parent, now);
-      expect(options).toEqual([]);
-      expect(resolveChildExpiry(options, undefined)).toBeUndefined();
-      expect(resolveChildExpiry(options, null)).toBeUndefined();
-    },
-  );
 });

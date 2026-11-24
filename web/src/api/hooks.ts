@@ -1,18 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiFetch } from './client';
 import type {
+  AccountRole,
+  AccountStatus,
   AdminKeyInfo,
   AdminRepository,
   AuditEvent,
-  BootstrapKey,
-  BootstrapSession,
   CodeupRepository,
   ConsoleConfig,
   CreatedKey,
   CreatedRepository,
   Job,
   KeyInfo,
-  Me,
   Repository,
   Scope,
   UserSummary,
@@ -48,10 +47,6 @@ const pollWhile =
     return data !== undefined && active(data) ? intervalMs : false;
   };
 
-export function useMe(enabled = true) {
-  return useQuery({ queryKey: queryKeys.me, queryFn: () => apiFetch<Me>('/api/v1/me'), enabled, staleTime: 60_000 });
-}
-
 export function useConsoleConfig() {
   return useQuery({
     queryKey: queryKeys.console,
@@ -61,10 +56,15 @@ export function useConsoleConfig() {
   });
 }
 
-export function useRepositories() {
+export function useRepositories(forKey = false) {
   return useQuery({
-    queryKey: queryKeys.repositories,
-    queryFn: async () => (await apiFetch<{ repositories: Repository[] }>('/api/v1/repositories')).repositories,
+    queryKey: forKey ? [...queryKeys.repositories, 'for-key'] : queryKeys.repositories,
+    queryFn: async () =>
+      (
+        await apiFetch<{ repositories: Repository[] }>(
+          forKey ? '/api/v1/repositories?for_key=1' : '/api/v1/repositories',
+        )
+      ).repositories,
     refetchInterval: pollWhile<Repository[]>((repos) => repos.some(isRepositoryActive), 10_000),
   });
 }
@@ -77,11 +77,23 @@ export function useRepository(id: string) {
   });
 }
 
-export function useRepositoryJobs(id: string) {
+export function useRepositoryJobs(id: string, options?: { watchIdle?: boolean; repositoryActive?: boolean }) {
   return useQuery({
     queryKey: queryKeys.repositoryJobs(id),
     queryFn: async () => (await apiFetch<{ jobs: Job[] }>(`/api/v1/repositories/${encodeURIComponent(id)}/jobs`)).jobs,
-    refetchInterval: pollWhile<Job[]>((jobs) => jobs.some(isJobActive), 5_000),
+    refetchInterval: ({ state: { data } }) => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return false;
+      if (options?.repositoryActive || data?.some(isJobActive)) return 5_000;
+      return options?.watchIdle && data !== undefined ? 30_000 : false;
+    },
+  });
+}
+
+export function useJob(id: string) {
+  return useQuery({
+    queryKey: queryKeys.job(id),
+    queryFn: () => apiFetch<Job>(`/api/v1/jobs/${encodeURIComponent(id)}`),
+    refetchInterval: pollWhile<Job>(isJobActive, 5_000),
   });
 }
 
@@ -207,6 +219,7 @@ export function useRepositoryLifecycle() {
       ),
     onSuccess: (_result, { id }) => {
       void client.invalidateQueries({ queryKey: queryKeys.repository(id) });
+      void client.invalidateQueries({ queryKey: queryKeys.repositoryJobs(id) });
       void client.invalidateQueries({ queryKey: queryKeys.repositories });
       void client.invalidateQueries({ queryKey: queryKeys.adminRepositories });
     },
@@ -225,7 +238,7 @@ export function useDeleteRepository() {
   });
 }
 
-export function createKey(input: { scope: Scope; repos: string[] | null; expires_in: number | null }) {
+export function createKey(input: { scope: Scope; repos: string[]; expires_in: number | null }) {
   return apiFetch<CreatedKey>('/api/v1/api-keys', { method: 'POST', body: input });
 }
 
@@ -266,21 +279,24 @@ export function useAdminRevokeUserKeys() {
   });
 }
 
-// ---- Onboarding (no session) ------------------------------------------------------------------
-
-export function bindYunxiao(pat: string, signal?: AbortSignal) {
-  return apiFetch<BootstrapSession>('/api/v1/auth/yunxiao/bind', {
-    method: 'POST',
-    body: { pat },
-    token: null,
-    signal,
+export function useUpdateAccount() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, patch }: { id: string; patch: { role?: AccountRole; status?: AccountStatus } }) =>
+      apiFetch(`/api/v1/admin/users/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.adminUsers });
+      void client.invalidateQueries({ queryKey: queryKeys.me });
+      void client.invalidateQueries({ queryKey: ['admin', 'keys'] });
+    },
   });
 }
 
-export function createBootstrapKey(bootstrapToken: string, input: { scope: Scope; expires_in: number | null }) {
-  return apiFetch<BootstrapKey>('/api/v1/auth/bootstrap/keys', { method: 'POST', body: input, token: bootstrapToken });
-}
-
-export function fetchMeWith(token: string) {
-  return apiFetch<Me>('/api/v1/me', { token, keepSession: true });
+export function useApproveLegacyKey() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (prefix: string) =>
+      apiFetch(`/api/v1/admin/api-keys/${encodeURIComponent(prefix)}/approve`, { method: 'POST' }),
+    onSuccess: () => void client.invalidateQueries({ queryKey: ['admin', 'keys'] }),
+  });
 }

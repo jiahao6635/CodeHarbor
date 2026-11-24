@@ -40,9 +40,11 @@ export function registerHookRoutes(app: FastifyInstance, ctx: AppContext): void 
       return authorization.mutate(async () => {
         const current = await store.getRepository(repo.id);
         if (!current || !constantTimeEqual(hashAccessKey(token), current.hook_hash)) fail(404, 'NOT_FOUND');
-        if (outcome === 'enqueue') await worker.enqueue(repo.id, 'webhook');
-        if (outcome === 'branch_deleted') {
-          await store.updateRepository(repo.id, { status: 'branch_deleted', error: 'BRANCH_DELETED' });
+        if (current.status !== 'disabled') {
+          if (outcome === 'enqueue') await worker.enqueue(repo.id, 'webhook');
+          if (outcome === 'branch_deleted') {
+            await store.updateRepository(repo.id, { status: 'branch_deleted', error: 'BRANCH_DELETED' });
+          }
         }
         return reply.code(202).send({ accepted: true });
       });

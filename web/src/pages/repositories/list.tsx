@@ -59,7 +59,7 @@ export function SyncButton({ repo, size = 'sm' }: { repo: Repository; size?: 'sm
 }
 
 export default function RepositoriesPage() {
-  const { canWrite, isAdmin } = useAbility();
+  const { hasPat, isAdmin } = useAbility();
   const query = useRepositories();
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<StatusFilter>('all');
@@ -79,10 +79,10 @@ export default function RepositoriesPage() {
     <>
       <PageHeader
         title="仓库"
-        description="当前 Key 可访问的已接入仓库及其索引状态。"
+        description="你可访问的已接入仓库及其索引状态。"
         actions={
           <Button asChild>
-            <Link to="/repositories/new">
+            <Link to={hasPat ? '/repositories/new' : '/onboarding'}>
               <Plus aria-hidden="true" />
               接入仓库
             </Link>
@@ -141,7 +141,7 @@ export default function RepositoriesPage() {
       ) : repos.length === 0 ? (
         <EmptyState
           icon={GitBranch}
-          title={isAdmin ? '还没有接入任何仓库' : '当前 Key 没有可访问的仓库'}
+          title={isAdmin ? '还没有接入任何仓库' : '你暂无可访问的仓库'}
           action={
             <Button asChild>
               <Link to="/repositories/new">接入第一个仓库</Link>
@@ -193,7 +193,7 @@ export default function RepositoriesPage() {
                     <TableCell className="text-muted-foreground">
                       <RelativeTime value={repo.indexed_at} />
                     </TableCell>
-                    <TableCell className="text-right">{canWrite ? <SyncButton repo={repo} /> : null}</TableCell>
+                    <TableCell className="text-right">{repo.can_manage ? <SyncButton repo={repo} /> : null}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -225,7 +225,7 @@ export default function RepositoriesPage() {
                     </>
                   ) : null}
                 </dl>
-                {canWrite ? (
+                {repo.can_manage ? (
                   <div className="mt-3 flex justify-end">
                     <SyncButton repo={repo} />
                   </div>

@@ -10,7 +10,7 @@ import { CredentialCipher, createAccessKey } from '../src/auth.js';
 import { CodeupError } from '../src/codeup.js';
 import { createInternalMcpHandler } from '../src/internal-mcp.js';
 import { createMcpService, SocketMcpBackend } from '../src/mcp-service.js';
-import { createApp } from '../src/server.js';
+import { createLegacyTestApp as createApp } from './helpers/legacy-auth.js';
 import { openTestStore } from './helpers/postgres.js';
 
 test('MCP queries use explicit Key scope while cloud credentials are unavailable', { timeout: 30_000 }, async () => {

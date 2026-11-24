@@ -1,67 +1,43 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { childExpiryOptions, DEFAULT_EXPIRES_IN, parseExpiry, resolveChildExpiry } from '@/lib/validation';
-import { configureApi } from './client';
-import { createBootstrapKey, createKey } from './hooks';
-import type { BootstrapKey, CreatedKey } from './types';
+import { DEFAULT_EXPIRES_IN } from '@/lib/validation';
+import { apiFetch, configureApi } from './client';
+import { createKey } from './hooks';
 
-afterEach(() => {
-  vi.unstubAllGlobals();
-  configureApi({ token: () => null, onUnauthenticated: () => {} });
-});
+afterEach(() => vi.unstubAllGlobals());
 
-describe('key creation requests', () => {
-  it.each([null, DEFAULT_EXPIRES_IN])('sends bootstrap expires_in=%s explicitly', async (expiry) => {
-    const result: BootstrapKey = { token: 'created-key', prefix: 'ch_test', scope: 'read', expires_in: expiry };
+describe('console requests', () => {
+  it.each([null, DEFAULT_EXPIRES_IN])('creates a scoped key with the browser session and expiry %s', async (expiry) => {
+    const result = { token: 'example', scope: 'read', repos: ['repo-1'], expires_at: expiry };
     const fetch = vi.fn().mockResolvedValue(Response.json(result));
     vi.stubGlobal('fetch', fetch);
 
-    const created = await createBootstrapKey('bootstrap-token', {
-      scope: 'read',
-      expires_in: parseExpiry(String(expiry)),
-    });
-
-    expect(created.expires_in).toBe(expiry);
-    expect(fetch).toHaveBeenCalledWith(
-      '/api/v1/auth/bootstrap/keys',
-      expect.objectContaining({
-        method: 'POST',
-        headers: expect.objectContaining({ authorization: 'Bearer bootstrap-token' }),
-        body: JSON.stringify({ scope: 'read', expires_in: expiry }),
-      }),
-    );
-  });
-
-  it.each([
-    { chosen: null, expected: null },
-    { chosen: undefined, expected: 90 * 86_400 },
-    { chosen: 7 * 86_400, expected: 7 * 86_400 },
-  ])('sends child selection $chosen as expires_in=$expected', async ({ chosen, expected }) => {
-    const result: CreatedKey = {
-      token: 'created-key',
-      prefix: 'ch_child',
-      scope: 'read',
-      repos: ['repo-1'],
-      expires_at: expected === null ? null : Date.now() + expected * 1000,
-    };
-    const fetch = vi.fn().mockResolvedValue(Response.json(result));
-    vi.stubGlobal('fetch', fetch);
-    configureApi({ token: () => 'parent-token', onUnauthenticated: () => {} });
-    const expiresIn = resolveChildExpiry(
-      childExpiryOptions(null),
-      chosen === undefined ? undefined : parseExpiry(String(chosen)),
-    );
-    if (expiresIn === undefined) throw new Error('Expected an available expiry');
-
-    const created = await createKey({ scope: 'read', repos: ['repo-1'], expires_in: expiresIn });
-
-    expect(created.expires_at).toBe(result.expires_at);
+    expect(await createKey({ scope: 'read', repos: ['repo-1'], expires_in: expiry })).toEqual(result);
     expect(fetch).toHaveBeenCalledWith(
       '/api/v1/api-keys',
       expect.objectContaining({
         method: 'POST',
-        headers: expect.objectContaining({ authorization: 'Bearer parent-token' }),
-        body: JSON.stringify({ scope: 'read', repos: ['repo-1'], expires_in: expected }),
+        credentials: 'same-origin',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ scope: 'read', repos: ['repo-1'], expires_in: expiry }),
       }),
     );
+  });
+
+  it('only ends the Feishu session on a session authentication failure', async () => {
+    const expired = vi.fn();
+    const cleanup = configureApi(expired);
+    try {
+      const fetch = vi
+        .fn()
+        .mockResolvedValueOnce(Response.json({ error: 'INVALID_CREDENTIAL' }, { status: 401 }))
+        .mockResolvedValueOnce(Response.json({ error: 'UNAUTHENTICATED' }, { status: 401 }));
+      vi.stubGlobal('fetch', fetch);
+      await expect(apiFetch('/api/v1/auth/yunxiao/bind')).rejects.toMatchObject({ code: 'INVALID_CREDENTIAL' });
+      expect(expired).not.toHaveBeenCalled();
+      await expect(apiFetch('/api/v1/repositories')).rejects.toMatchObject({ code: 'UNAUTHENTICATED' });
+      expect(expired).toHaveBeenCalledTimes(1);
+    } finally {
+      cleanup();
+    }
   });
 });

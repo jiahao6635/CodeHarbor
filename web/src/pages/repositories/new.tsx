@@ -1,5 +1,6 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { CaretRight, MagnifyingGlass } from '@phosphor-icons/react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useId, useMemo, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { Link, useNavigate } from 'react-router';
@@ -9,7 +10,9 @@ import { ApiError } from '@/api/client';
 import { useCodeupRepositories, useCreateRepository } from '@/api/hooks';
 import type { CodeupRepository, CreatedRepository } from '@/api/types';
 import { useAbility } from '@/auth/session';
+import { CodeupBranchPicker } from '@/components/codeup-branch-picker';
 import { ErrorNotice } from '@/components/error-notice';
+import { IndexBuildProgress } from '@/components/index-build-progress';
 import { PageHeader } from '@/components/page-header';
 import { RepositoryCreatePermission } from '@/components/repository-create-permission';
 import { SecretReveal } from '@/components/secret-reveal';
@@ -65,14 +68,7 @@ function CodeupPicker({ selectedId, onSelect }: { selectedId: string; onSelect: 
       {query.isPending ? (
         <Skeleton className="h-48 w-full" />
       ) : query.isError ? (
-        <ErrorNotice
-          error={query.error}
-          title={
-            query.error instanceof ApiError && query.error.status === 403
-              ? '当前 Key 限定了仓库范围，无法浏览云效仓库'
-              : '云效仓库列表加载失败'
-          }
-        />
+        <ErrorNotice error={query.error} title="云效仓库列表加载失败" />
       ) : (
         <>
           <ul
@@ -133,7 +129,7 @@ function CodeupPicker({ selectedId, onSelect }: { selectedId: string; onSelect: 
 }
 
 export default function RepositoryNewPage() {
-  const { isAdmin } = useAbility();
+  const { hasPat } = useAbility();
 
   return (
     <>
@@ -148,7 +144,7 @@ export default function RepositoryNewPage() {
         title="接入云效仓库"
         description="平台将用你当前绑定的 PAT 克隆并构建索引，之后按 Webhook、手动同步和定期对账更新。"
       />
-      {isAdmin ? (
+      {hasPat ? (
         <RepositoryCreateForm />
       ) : (
         <>
@@ -163,20 +159,22 @@ export default function RepositoryNewPage() {
 }
 
 function RepositoryCreateForm() {
-  const { isUnrestricted } = useAbility();
   const navigate = useNavigate();
+  const client = useQueryClient();
   const create = useCreateRepository();
   const [created, setCreated] = useState<CreatedRepository | null>(null);
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const [serverError, setServerError] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<{ repoId: string; branch: string } | null>(null);
   const form = useForm<FormValues>({
     resolver: zodResolver(schema),
-    defaultValues: { codeup_repository_id: '', branch: 'main', authorize: undefined as unknown as true },
+    defaultValues: { codeup_repository_id: '', branch: '', authorize: undefined as unknown as true },
   });
   const authorizeId = useId();
 
   const onSubmit = form.handleSubmit((values) => {
     setServerError(null);
+    setConflict(null);
     create.mutate(
       { codeup_repository_id: values.codeup_repository_id, branch: values.branch },
       {
@@ -189,6 +187,19 @@ function RepositoryCreateForm() {
           navigate(`/repositories/${result.repository.repo_id}`);
         },
         onError: (error) => {
+          if (error instanceof ApiError && error.code === 'REPOSITORY_BRANCH_CONFLICT') {
+            const repository = (error.data as { repository?: { repo_id?: string; branch?: string } })?.repository;
+            if (repository?.repo_id && repository.branch) {
+              setConflict({ repoId: repository.repo_id, branch: repository.branch });
+              return;
+            }
+          }
+          if (error instanceof ApiError && error.code === 'BRANCH_NOT_FOUND') {
+            form.setValue('branch', '');
+            void client.invalidateQueries({ queryKey: ['codeup-branches', values.codeup_repository_id] });
+            form.setError('branch', { message: '该分支已不可用。请重新加载并选择分支。' });
+            return;
+          }
           if (error instanceof ApiError && error.status === 404) {
             setServerError('云效仓库不存在、你没有访问权限，或平台无法用你的 PAT 克隆该仓库。');
             return;
@@ -201,22 +212,30 @@ function RepositoryCreateForm() {
 
   const errors = form.formState.errors;
   const idValue = form.watch('codeup_repository_id');
+  const selectedBranch = form.watch('branch');
+  const validId = codeupRepositoryId.safeParse(idValue);
+
+  const resetBranch = () => {
+    form.setValue('branch', '');
+    form.clearErrors('branch');
+    setServerError(null);
+    setConflict(null);
+  };
 
   return (
     <>
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_380px]">
         <Card className="flex flex-col gap-4">
-          <Tabs defaultValue={isUnrestricted ? 'pick' : 'manual'}>
+          <Tabs defaultValue="pick">
             <TabsList>
-              <TabsTrigger value="pick" disabled={!isUnrestricted}>
-                从云效列表选择
-              </TabsTrigger>
+              <TabsTrigger value="pick">从云效列表选择</TabsTrigger>
               <TabsTrigger value="manual">输入仓库 ID</TabsTrigger>
             </TabsList>
             <TabsContent value="pick">
               <CodeupPicker
                 selectedId={idValue}
                 onSelect={(repo) => {
+                  if (repo.id !== idValue) resetBranch();
                   form.setValue('codeup_repository_id', repo.id, { shouldValidate: true });
                   setSelectedName(repo.name);
                 }}
@@ -233,6 +252,11 @@ function RepositoryCreateForm() {
         <form onSubmit={onSubmit} noValidate className="flex flex-col gap-4">
           <Card className="flex flex-col gap-4">
             {serverError ? <Alert tone="error">{serverError}</Alert> : null}
+            {conflict ? (
+              <Alert tone="warning">
+                此仓库已跟踪 {conflict.branch}。 <Link to={`/repositories/${conflict.repoId}`}>查看已有索引</Link>
+              </Alert>
+            ) : null}
             <Field
               id="codeup_repository_id"
               label="云效仓库 ID"
@@ -249,24 +273,21 @@ function RepositoryCreateForm() {
                   helper: !!selectedName,
                   error: !!errors.codeup_repository_id,
                 })}
-                {...form.register('codeup_repository_id', { onChange: () => setSelectedName(null) })}
+                {...form.register('codeup_repository_id', {
+                  onChange: () => {
+                    setSelectedName(null);
+                    resetBranch();
+                  },
+                })}
               />
             </Field>
-            <Field
-              id="branch"
-              label="分支"
-              helper="默认 main；索引始终跟踪该分支的最新提交。"
+            <CodeupBranchPicker
+              key={validId.success ? validId.data : ''}
+              repoId={validId.success ? validId.data : ''}
+              value={selectedBranch}
+              onSelect={(name) => form.setValue('branch', name, { shouldValidate: true })}
               error={errors.branch?.message}
-            >
-              <Input
-                id="branch"
-                autoComplete="off"
-                className="font-mono"
-                aria-invalid={errors.branch ? true : undefined}
-                aria-describedby={describedBy('branch', { helper: true, error: !!errors.branch })}
-                {...form.register('branch')}
-              />
-            </Field>
+            />
             <div className="flex flex-col gap-1.5">
               <div className="flex items-start gap-2">
                 <Checkbox
@@ -289,7 +310,7 @@ function RepositoryCreateForm() {
                 </p>
               ) : null}
             </div>
-            <Button type="submit" loading={create.isPending}>
+            <Button type="submit" loading={create.isPending} disabled={!selectedBranch || !validId.success}>
               接入并开始构建
             </Button>
           </Card>
@@ -322,7 +343,9 @@ function RepositoryCreateForm() {
           if (target) navigate(`/repositories/${target}`);
         }}
         confirmLabel="我已妥善保存，查看仓库"
-      />
+      >
+        {created ? <IndexBuildProgress jobId={created.job_id} /> : null}
+      </SecretReveal>
     </>
   );
 }

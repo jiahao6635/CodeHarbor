@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
-import { buildIndexCandidate, isPublishedIndexHealthy } from '../src/indexer.js';
+import { buildIndexCandidate, type IndexRequest, isPublishedIndexHealthy } from '../src/indexer.js';
 
 test('builds a queryable index for a real Git commit with the installed CodeGraph', async () => {
   const root = await mkdtemp(join(tmpdir(), 'codeharbor-codegraph-'));
@@ -37,7 +37,8 @@ process.exit(result.status === null ? 1 : result.status);
     );
     await chmod(mockGit, 0o700);
     process.env.PATH = `${mockBin}:${previousPath}`;
-    const request = {
+    const phases: string[] = [];
+    const request: IndexRequest = {
       dataDir: join(root, 'data'),
       repositoryId: 'r1',
       branch: 'main',
@@ -47,8 +48,12 @@ process.exit(result.status === null ? 1 : result.status);
       token: 'test-token',
       codegraphBin: codegraph,
       timeoutMs: 60_000,
+      async onProgress(phase) {
+        phases.push(phase);
+      },
     };
     const candidate = await buildIndexCandidate(request);
+    assert.deepEqual(phases, ['cloning', 'indexing']);
     assert.equal(candidate.commit, commit);
     const result = execFileSync(codegraph, ['query', 'createOrder', '--json'], {
       cwd: candidate.path,

@@ -1,6 +1,6 @@
 # CodeHarbor 单实例部署指南
 
-本文描述部署模板和上线前验证；尚未对公司的云效、PostgreSQL、Vault、网络和权限策略完成联调。不要将模板当作已上线或多实例方案。
+本文描述部署模板和上线前验证；上线前需要验证真实飞书、云效、PostgreSQL、Vault、网络和权限策略。不要将模板当作已上线或多实例方案。
 
 ## 架构与限制
 
@@ -8,7 +8,7 @@
 - PostgreSQL 连接持有 session advisory lock，同一数据库只允许一个 CodeHarbor 实例。连接断开时拒绝后续数据库操作；使用 supervisor 监控并重启。仅支持直连或 session pooling，禁止使用事务池模式。
 - PAT 使用 AES-256-GCM 加密，主密钥通过 Vault Transit 保护；启动时 Vault 解包主密钥到应用内存。详见 [Vault Transit 指南](vault-transit.md)。
 - 本模板没有跨实例任务租约、共享索引协调或高可用；不应增加副本。生产 Compose 对串行索引 Worker 所在应用设置 CPU、内存和 PID 上限，并以限额 tmpfs 约束克隆与索引磁盘，但仍须监控 Docker 镜像和镜像层的存储用量。未验证企业云效权限之前不能认为可以用于生产多租户。
-- 已发布索引的 MCP 查询只检查 CodeHarbor Key 的明确仓库列表、有效期和撤销状态，不实时检查持有人的云效权限。云效撤权或 PAT 失效不会自动收回已签发 Key 的读取权，管理员须主动撤销或替换 Key；旧 `repos: null` Key 不可直接通过 MCP 查询。受配置允许的 write 管理员仍可管理平台并签发限定仓库范围的 Key。
+- 飞书会话控制平台管理。只有超级管理员看到全部已接入仓库和平台审计。普通用户按当前 PAT 的云效访问角色查看仓库。API Key 限定仓库、有效期和权限。MCP 查询源码还验证持有人具备跟踪分支的 Git HTTPS 克隆权限，缓存最多 5 分钟。无法确认权限时拒绝对应查询，账号停用或 Key 撤销立即生效。
 - 仓库接入和索引同步仍使用明确授权的同步账号 PAT 探测 Git HTTPS upload-pack。探测最多同时执行 2 个，运行超时 30 秒，响应最多 32 MiB、100,000 个对象；探测会在临时目录验证 Git 包并清理。空仓库、没有可探测分支、服务器不支持 shallow、数据超限或协议校验失败时无法确认克隆权限。同步凭据失效时不发布新版本，旧索引仍可由有效的限定范围 Key 查询。
 - Nginx 对外提供 TLS，不公开 `/health/` 或 `/metrics`；指标通过受控内网及独立 Bearer 访问应用端口。按企业网关、告警和日志平台调整。
 
@@ -16,7 +16,7 @@
 
 1. PostgreSQL 17 可以使用远端现有实例，也可以按下文启动本机 Docker 实例。应用账户须能建表和使用 advisory lock。两种方式均须配置服务端证书和可信 CA，连接串必须为 `postgresql://...?...sslmode=verify-full`；生产环境拒绝额外连接参数（可选 `application_name` 除外），不得关闭 TLS 校验。数据库必须持久化、备份并限制访问。
 2. 可用 HTTPS Vault、Transit AES 密钥、只具备 decrypt 权限的短期 token 文件，以及已包装的主密钥文件。全新数据使用 `--new`，迁移必须用 `--wrap-existing` 包装**原主密钥**，否则历史 PAT 无法解密。
-3. 云效 API endpoint、组织 ID、可信 Git HTTPS 主机名、服务域名和允许创建 write Key 的用户 ID。配置 DNS、防火墙和出网，使 CodeHarbor 可访问云效与 Vault；Webhook 的反向代理必须可由云效访问。
+3. 云效 API endpoint、组织 ID、可信 Git HTTPS 主机名、服务域名和企业飞书自建应用。配置 DNS、防火墙和出网，使 CodeHarbor 可访问飞书授权及 API、云效、Vault 和数据库。Webhook 的反向代理必须可由云效访问。
 4. 按 [镜像模式部署准备](image-deployment.md) 创建控制器目录、三个独立令牌和只读运行时镜像。Git 凭证助手所在的限额 tmpfs 必须允许执行文件。实际 Docker Compose 本地 secrets 可能保留宿主文件的 UID/权限，需确保应用 UID 可读，避免将密钥对无关用户开放。
 5. TLS 证书与私钥、独立的监控 token（至少 32 个可打印 ASCII 且无空格）、受信的固定 Nginx 镜像引用。实际生产镜像建议按组织策略固定摘要并扫描。
 
@@ -25,15 +25,24 @@
 在部署系统配置非敏感参数，密码、token 和已包装密钥通过受保护文件或企业秘密注入提供，**不要把文件内容写入仓库、镜像、shell 历史或日志**。
 
 - `YUNXIAO_ENDPOINT`、`YUNXIAO_ORGANIZATION_ID`、`CODEHARBOR_GIT_HOSTS`：实际云效信息。
-- `CODEHARBOR_ALLOWED_HOSTS`：代理对上游传递的主机名；若需要内部健康检查也加入 `127.0.0.1:8080`。浏览器调用时另设 `CODEHARBOR_ALLOWED_ORIGINS`（模板按需扩展）。
-- `CODEHARBOR_WRITE_USERS`：经企业批准、可签发 write Key 的云效用户 ID；留空不允许 write Key。这些用户的无范围 write Key 即平台管理员 Key。
+- `CODEHARBOR_ALLOWED_HOSTS` 包含代理传给上游的主机名。若需要内部健康检查，同时加入 `127.0.0.1:8080`。
+- `CODEHARBOR_PUBLIC_ORIGIN` 设为用户访问的规范 HTTPS Origin。飞书回调使用该 Origin，Cookie 会话的写操作也要求精确匹配。
+- `CODEHARBOR_FEISHU_APP_ID` 和 `CODEHARBOR_FEISHU_TENANT_KEY` 分别配置企业自建应用和允许登录的租户。
+- `CODEHARBOR_FEISHU_APP_SECRET_FILE` 指向仅供应用读取的 App Secret 文件。
+- `CODEHARBOR_FEISHU_SUPER_ADMIN_OPEN_ID` 设为初始超级管理员在该应用中的 Open ID。指定账号首次登录且平台还没有启用的超级管理员时初始化角色，后续通过管理台调整。
 - `CODEHARBOR_TRUST_PROXY`：模板固定为 `true`，Nginx 传递 `X-Forwarded-For`，应用按真实客户端地址做认证失败限流；Nginx 层另有 `/mcp` 20r/s、`/api/v1/auth/` 1r/s 的每地址限流。
 - `CODEHARBOR_DOCS_ENABLED`：默认 `false`；Nginx 模板同时对 `/docs`、`/openapi.json` 返回 404。
-- `CODEHARBOR_ACCESS_TTL_MS`、`CODEHARBOR_AUDIT_RETENTION_DAYS`：无范围 read Key 的云效权限缓存有效期（默认 6 小时）与持久化审计保留天数（默认 180）。
+- `CODEHARBOR_ACCESS_TTL_MS` 控制云效权限缓存，实际最长 5 分钟。持久化审计由 `CODEHARBOR_AUDIT_RETENTION_DAYS` 控制，默认保留 180 天。
 - `CODEHARBOR_DATABASE_URL_FILE`：保存 PostgreSQL URL 的文件路径；也支持 `DATABASE_URL`，但不要同时配置。生产 URL 必须只使用单个 `sslmode=verify-full` 和可选 `application_name` 参数。
 - `CODEHARBOR_VAULT_ADDR`、`CODEHARBOR_VAULT_TRANSIT_KEY`、`CODEHARBOR_VAULT_TOKEN_FILE`、`CODEHARBOR_VAULT_WRAPPED_KEY_FILE`：参见 [Vault Transit 指南](vault-transit.md)。
 - `CODEHARBOR_METRICS_TOKEN_FILE`、`CODEHARBOR_TLS_CERT`、`CODEHARBOR_TLS_KEY`：分别指向监控 token、TLS 证书和私钥文件。
 - `CODEHARBOR_NGINX_IMAGE`：经过批准的 Nginx 镜像完整引用；`CODEHARBOR_LISTEN_ADDR` 默认 `127.0.0.1`，只有配好企业访问策略后才应调整。
+
+### 飞书应用准备
+
+1. 在目标租户内创建并发布飞书企业自建应用，配置实际使用成员的可用范围。
+2. 将 `${CODEHARBOR_PUBLIC_ORIGIN}/api/v1/auth/feishu/callback` 的实际完整 URL 登记为重定向 URL，将 App Secret 经受保护文件交给 CodeHarbor。服务端登录只读取用户身份。 [飞书登录文档](https://open.feishu.cn/document/server-docs/api-call-guide/calling-process/get-access-token)
+3. 确定初始超级管理员在同一应用中的 Open ID。先用该员工账号完成首次登录，然后让另一普通成员验证仓库访问范围。使用自管代理时，确保 OAuth 回调的查询参数不会进入访问日志、错误日志和链路追踪。项目 Nginx 模板已关闭认证路径的代理日志。
 
 ### 方式一：使用远端 PostgreSQL
 
@@ -53,6 +62,13 @@ docker compose -f deploy/compose.yaml -f deploy/compose.image.yaml up -d
 ```
 
 这些命令不会初始化 Vault 密钥、生成数据库凭证或自动配置云效 Webhook。代理后的 PAT 绑定限流目前按连接来源 IP 计数；如果所有连接从同一反向代理进入，它们可能共享限额。不要盲目信任 `X-Forwarded-For`，应在可信网关配置限流，或实现并测试可信代理策略。
+
+#### 将现有数据库切换到云 PostgreSQL
+
+1. 先在目标云服务上验证 PostgreSQL 17 兼容性、应用账户的 schema DDL 权限、`pg_advisory_lock`、受信 TLS、网络延迟和备份能力。连接使用直连或 session pooling。
+2. 在维护窗口停止接受写流量，关闭旧实例及 Worker。使用 `pg_dump` 的自定义格式取得一致备份，并将其安全保存。将备份恢复到空的云数据库，使用目标应用账户拥有表和迁移所需权限。演练时可用 PostgreSQL service 配置和受保护的密码文件，避免将带密码 URL 写入命令行。
+3. 确认目标库中的 `schema_migrations`、仓库、任务和 Key 数据后，更新 `CODEHARBOR_DATABASE_URL_FILE`。保留 Vault 包装的原主密钥、Webhook 配置和现有索引镜像。启动服务应用迁移，验证 readiness、完成管理员和普通成员登录、绑定 PAT、真实云效分支与权限、MCP 查询和一次测试同步。确认后恢复流量。
+4. 保留一致备份和旧实例的停机状态，观察数据库连接、鉴权拒绝率和任务队列。需要回滚时先暂停写流量，评估迁移后的新增数据并处理与旧库的差异。旧版本使用迁移前兼容的快照启动。
 
 ### 方式二：使用 Docker 本地 PostgreSQL
 
@@ -122,7 +138,7 @@ docker compose -f deploy/compose.yaml -f deploy/compose.postgres.yaml -f deploy/
 
 ## 数据库 schema 迁移
 
-schema 由仓库内 `migrations/NNNN_name.sql` 管理，服务启动时在持有实例锁的会话中按序执行未应用的版本，并记入 `schema_migrations(version, name, applied_at)`；每个版本在独立事务中执行，失败整体回滚且服务拒绝启动。数据库中的版本高于当前构建、或同一版本名称不一致时也会拒绝启动，避免误用旧镜像连接新库。升级流程：先备份数据库，再部署新版本让其自动迁移；回滚到旧版本前必须恢复备份，迁移本身不提供 down 脚本。当前处于开发阶段，所有表合并为 `0001_init.sql`；早于迁移机制的旧库不受支持，需要重建。
+schema 由仓库内 `migrations/NNNN_name.sql` 管理，服务启动时在持有实例锁的会话中按序执行未应用的版本，并记入 `schema_migrations(version, name, applied_at)`；每个版本在独立事务中执行，失败整体回滚且服务拒绝启动。数据库中的版本高于当前构建、或同一版本名称不一致时也会拒绝启动，避免误用旧镜像连接新库。升级流程：先备份数据库，再部署新版本让其自动迁移；回滚到旧版本前必须恢复备份，迁移本身不提供 down 脚本。本次增量迁移保留已建仓库、历史任务、加密 PAT 和 Key 哈希，并添加飞书账号、会话和任务阶段。升级前制定旧 Key 切换窗口。升级后旧 Key 需由持有人先绑定原云效账号，再由超级管理员复核并批准已明确限定仓库且仍有效的 Key。无范围 Key 需要重新创建。
 
 ## 监控与恢复
 

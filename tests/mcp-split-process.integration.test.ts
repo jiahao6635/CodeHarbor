@@ -13,7 +13,8 @@ import { CredentialCipher, createAccessKey } from '../src/auth.js';
 import { CODEGRAPH_TOOL_NAMES } from '../src/codegraph-tools.js';
 import { ImageCodeGraphClient } from '../src/image-codegraph.js';
 import { createInternalMcpHandler } from '../src/internal-mcp.js';
-import { type AuditEvent, createApp } from '../src/server.js';
+import type { AuditEvent } from '../src/server.js';
+import { createLegacyTestApp as createApp } from './helpers/legacy-auth.js';
 import { openTestStore } from './helpers/postgres.js';
 
 async function reservePort(): Promise<number> {

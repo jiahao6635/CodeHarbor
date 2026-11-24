@@ -30,6 +30,7 @@ export class ImageIndexPipeline {
     let result: IndexCandidate;
     try {
       const candidate = await this.buildIndex({ ...request, dataDir: root });
+      await request.onProgress?.('packaging');
       const image = await this.buildImage({
         dataDir: root,
         repositoryId: request.repositoryId,

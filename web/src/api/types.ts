@@ -1,6 +1,8 @@
 // Response shapes follow src/openapi.ts on the server. Keep both in sync.
 
 export type Scope = 'read' | 'write';
+export type AccountRole = 'member' | 'super_admin';
+export type AccountStatus = 'active' | 'disabled';
 
 export type RepositoryStatus =
   | 'pending'
@@ -16,12 +18,8 @@ export type RepositoryStatus =
 export interface Me {
   id: string;
   username: string;
-  key_scope: Scope;
-  key_prefix: string;
-  key_repos: string[] | null;
-  key_expires_at: number | null;
-  can_write: boolean;
-  is_admin: boolean;
+  role: AccountRole;
+  has_pat: boolean;
 }
 
 export interface ConsoleConfig {
@@ -40,6 +38,8 @@ export interface Repository {
   stale: boolean;
   error: string | null;
   webhook_path: string;
+  can_manage?: boolean;
+  can_authorize_sync?: boolean;
 }
 
 export interface AdminRepository extends Repository {
@@ -62,11 +62,13 @@ export interface CodeupRepository {
 }
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed';
+export type JobPhase = 'queued' | 'validating' | 'cloning' | 'indexing' | 'packaging' | 'publishing' | 'complete';
 
 export interface Job {
   id: string;
   repo_id: string;
   status: JobStatus;
+  phase: JobPhase | null;
   reason: string;
   created_at: number;
   queued_at: number | null;
@@ -81,10 +83,12 @@ export interface KeyInfo {
   repos: string[] | null;
   expires_at: number | null;
   revoked: boolean;
+  legacy_pending?: boolean;
 }
 
 export interface AdminKeyInfo extends KeyInfo {
   owner: string;
+  legacy_approvable?: boolean;
 }
 
 export interface CreatedKey {
@@ -95,23 +99,13 @@ export interface CreatedKey {
   expires_at: number | null;
 }
 
-export interface BootstrapSession {
-  bootstrap_token: string;
-  expires_in: number;
-  user: { id: string; name: string };
-}
-
-export interface BootstrapKey {
-  token: string;
-  prefix: string;
-  scope: Scope;
-  expires_in: number | null;
-}
-
 export interface UserSummary {
   id: string;
   username: string;
-  credential_version: number;
+  codeup_user_id: string | null;
+  role: AccountRole;
+  status: AccountStatus;
+  has_pat: boolean;
 }
 
 export interface AuditEvent {

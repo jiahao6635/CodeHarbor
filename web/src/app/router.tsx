@@ -43,7 +43,6 @@ const router = createBrowserRouter(
             </RedirectIfSession>,
           ),
         },
-        { path: '/onboarding', element: page(<OnboardingPage />) },
         {
           element: <RequireSession />,
           children: [
@@ -54,6 +53,7 @@ const router = createBrowserRouter(
                 { path: 'repositories', element: page(<RepositoriesPage />) },
                 { path: 'repositories/new', element: page(<RepositoryNewPage />) },
                 { path: 'repositories/:id', element: page(<RepositoryDetailPage />) },
+                { path: 'onboarding', element: page(<OnboardingPage />) },
                 { path: 'keys', element: page(<KeysPage />) },
                 { path: 'mcp', element: page(<McpPage />) },
                 {

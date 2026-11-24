@@ -3,37 +3,31 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code: string,
     readonly requestId: string | null,
+    readonly data?: unknown,
   ) {
     super(code);
     this.name = 'ApiError';
   }
 }
 
-export type TokenSource = () => string | null;
-
-let tokenSource: TokenSource = () => null;
 let onUnauthenticated: (() => void) | null = null;
 
-/** The session layer supplies the bearer token and reacts to 401 responses. */
-export function configureApi(options: { token: TokenSource; onUnauthenticated: () => void }): void {
-  tokenSource = options.token;
-  onUnauthenticated = options.onUnauthenticated;
+export function configureApi(onExpired: () => void): () => void {
+  onUnauthenticated = onExpired;
+  return () => {
+    if (onUnauthenticated === onExpired) onUnauthenticated = null;
+  };
 }
 
 interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
-  /** Overrides the session token, used by the onboarding wizard for bootstrap tokens. */
-  token?: string | null;
   signal?: AbortSignal;
-  /** Do not end the session on 401, used while validating a freshly entered key. */
   keepSession?: boolean;
 }
 
 export async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const token = options.token === undefined ? tokenSource() : options.token;
   const headers: Record<string, string> = { accept: 'application/json' };
-  if (token) headers.authorization = `Bearer ${token}`;
   if (options.body !== undefined) headers['content-type'] = 'application/json';
   let response: Response;
   try {
@@ -42,7 +36,7 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
       signal: options.signal,
-      credentials: 'omit',
+      credentials: 'same-origin',
       cache: 'no-store',
     });
   } catch (error) {
@@ -55,12 +49,14 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
     return (await response.json()) as T;
   }
   let code = 'INTERNAL_ERROR';
+  let data: unknown;
   try {
     const payload = (await response.json()) as { error?: unknown };
     if (typeof payload.error === 'string') code = payload.error;
+    data = payload;
   } catch {
     // Non-JSON error bodies keep the generic code.
   }
-  if (response.status === 401 && !options.keepSession && options.token === undefined) onUnauthenticated?.();
-  throw new ApiError(response.status, code, requestId);
+  if (response.status === 401 && code === 'UNAUTHENTICATED' && !options.keepSession) onUnauthenticated?.();
+  throw new ApiError(response.status, code, requestId, data);
 }

@@ -2,8 +2,8 @@ import { UsersThree } from '@phosphor-icons/react';
 import { useState } from 'react';
 import { Link } from 'react-router';
 import { toast } from 'sonner';
-import { useAdminRevokeUserKeys, useAdminUsers } from '@/api/hooks';
-import type { UserSummary } from '@/api/types';
+import { useAdminRevokeUserKeys, useAdminUsers, useUpdateAccount } from '@/api/hooks';
+import type { AccountRole, AccountStatus, UserSummary } from '@/api/types';
 import { useAbility } from '@/auth/session';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { EmptyState } from '@/components/empty-state';
@@ -15,86 +15,146 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toastError } from '@/lib/toast';
 
+type AccountAction =
+  | { kind: 'role'; role: AccountRole; title: string }
+  | { kind: 'status'; status: AccountStatus; title: string }
+  | { kind: 'keys'; title: string };
+
 export default function AdminUsersPage() {
   const { me } = useAbility();
   const users = useAdminUsers();
   const revoke = useAdminRevokeUserKeys();
-  const [target, setTarget] = useState<UserSummary | null>(null);
+  const update = useUpdateAccount();
+  const [target, setTarget] = useState<{ user: UserSummary; action: AccountAction } | null>(null);
+
+  const suspending = target?.action.kind === 'status' && target.action.status === 'disabled';
+
+  const submit = () => {
+    if (!target) return;
+    const { user, action } = target;
+    const handlers = {
+      onSuccess: () => {
+        toast.success('已更新', { description: user.username });
+        setTarget(null);
+      },
+      onError: (error: Error) => toastError(error, '更新失败'),
+    };
+    if (action.kind === 'keys') revoke.mutate(user.id, handlers);
+    else
+      update.mutate(
+        { id: user.id, patch: action.kind === 'role' ? { role: action.role } : { status: action.status } },
+        handlers,
+      );
+  };
 
   return (
     <>
-      <PageHeader title="用户" description="已绑定云效 PAT 的用户。credential_version 随每次重新绑定递增。" />
+      <PageHeader title="用户" description="管理飞书账号角色、使用状态和已签发的 API Key。" />
       {users.isPending ? (
         <Skeleton className="h-40 w-full" />
       ) : users.isError ? (
         <ErrorNotice error={users.error} />
       ) : users.data.length === 0 ? (
-        <EmptyState icon={UsersThree} title="还没有用户绑定" />
+        <EmptyState icon={UsersThree} title="暂无用户" />
       ) : (
         <Table>
           <TableHeader>
             <TableRow className="hover:bg-transparent">
-              <TableHead>用户 ID</TableHead>
-              <TableHead>用户名</TableHead>
-              <TableHead>凭证版本</TableHead>
+              <TableHead>飞书用户</TableHead>
+              <TableHead>角色</TableHead>
+              <TableHead>状态</TableHead>
+              <TableHead>云效账号</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {users.data.map((user) => (
-              <TableRow key={user.id}>
-                <TableCell className="font-mono text-xs">
-                  {user.id}
-                  {user.id === me?.id ? (
-                    <Badge tone="progress" className="ml-2">
-                      本人
-                    </Badge>
-                  ) : null}
-                </TableCell>
-                <TableCell>{user.username}</TableCell>
-                <TableCell className="tabular">{user.credential_version}</TableCell>
-                <TableCell className="text-right">
-                  <div className="flex justify-end gap-1">
-                    <Button asChild variant="ghost" size="sm">
-                      <Link to={`/admin/keys?owner=${encodeURIComponent(user.id)}`}>查看 Key</Link>
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="text-status-error hover:text-status-error"
-                      onClick={() => setTarget(user)}
-                    >
-                      撤销全部 Key
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            ))}
+            {users.data.map((user) => {
+              const promote = user.role === 'member';
+              const enable = user.status === 'disabled';
+              return (
+                <TableRow key={user.id}>
+                  <TableCell>
+                    {user.username}
+                    {user.id === me?.id ? (
+                      <Badge tone="progress" className="ml-2">
+                        本人
+                      </Badge>
+                    ) : null}
+                  </TableCell>
+                  <TableCell>{promote ? '成员' : '超级管理员'}</TableCell>
+                  <TableCell>
+                    <Badge tone={enable ? 'error' : 'ready'}>{enable ? '已停用' : '启用'}</Badge>
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{user.codeup_user_id ?? '未绑定'}</TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex flex-wrap justify-end gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setTarget({
+                            user,
+                            action: {
+                              kind: 'role',
+                              role: promote ? 'super_admin' : 'member',
+                              title: promote ? '设为超级管理员' : '改为普通成员',
+                            },
+                          })
+                        }
+                      >
+                        {promote ? '设为超级管理员' : '改为普通成员'}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setTarget({
+                            user,
+                            action: {
+                              kind: 'status',
+                              status: enable ? 'active' : 'disabled',
+                              title: enable ? '启用账号' : '停用账号',
+                            },
+                          })
+                        }
+                      >
+                        {enable ? '启用' : '停用'}
+                      </Button>
+                      {user.codeup_user_id ? (
+                        <>
+                          <Button asChild variant="ghost" size="sm">
+                            <Link to={`/admin/keys?owner=${encodeURIComponent(user.codeup_user_id)}`}>查看 Key</Link>
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setTarget({ user, action: { kind: 'keys', title: '撤销全部 Key' } })}
+                          >
+                            撤销全部 Key
+                          </Button>
+                        </>
+                      ) : null}
+                    </div>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       )}
       <ConfirmDialog
         open={target !== null}
         onOpenChange={(open) => !open && setTarget(null)}
-        title={`撤销 ${target?.username ?? ''} 的全部 Key`}
+        title={target?.action.title ?? ''}
         description={
-          target?.id === me?.id
-            ? '这会撤销包括你当前登录 Key 在内的全部 Key，你将立即退出控制台。'
-            : '该用户的所有 Key（包括其签发的下级 Key）立即失效，MCP 客户端随即断开；用户需重新绑定并申请 Key。'
+          suspending
+            ? `停用 ${target?.user.username ?? ''} 会结束其会话、撤销全部 Key，并暂停由其 PAT 授权的自动同步。`
+            : `用户 ${target?.user.username ?? ''}`
         }
-        confirmLabel="撤销全部 Key"
-        typedPhrase={target?.id}
-        loading={revoke.isPending}
-        onConfirm={() =>
-          target &&
-          revoke.mutate(target.id, {
-            onSuccess: () => {
-              toast.success('已撤销该用户的全部 Key', { description: target.username });
-              setTarget(null);
-            },
-            onError: (error) => toastError(error, '撤销失败'),
-          })
-        }
+        destructive={suspending || target?.action.kind === 'keys'}
+        confirmLabel="确认"
+        loading={revoke.isPending || update.isPending}
+        onConfirm={submit}
       />
     </>
   );

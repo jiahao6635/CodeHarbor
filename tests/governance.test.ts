@@ -9,7 +9,8 @@ import { AuditWriter } from '../src/audit-writer.js';
 import { CredentialCipher, createAccessKey, hashAccessKey } from '../src/auth.js';
 import { CodeupError } from '../src/codeup.js';
 import { RateLimiter } from '../src/rate-limit.js';
-import { type AuditEvent, createApp } from '../src/server.js';
+import type { AuditEvent } from '../src/server.js';
+import { createLegacyTestApp as createApp } from './helpers/legacy-auth.js';
 import { openTestStore } from './helpers/postgres.js';
 
 type Response = { status: number; body: any };
