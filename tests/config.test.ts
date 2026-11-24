@@ -66,6 +66,26 @@ test('production requires PostgreSQL with verified TLS and Vault', () => {
   assert.doesNotThrow(() => validateProduction({ NODE_ENV: 'test' }, 'postgresql://host/db'));
 });
 
+test('production plaintext PostgreSQL is opt-in for one exact endpoint', () => {
+  const env = { NODE_ENV: 'production' };
+  const optIn = { ...env, CODEHARBOR_POSTGRES_PLAINTEXT_ENDPOINT: 'db.internal:5432' };
+  const url = 'postgresql://db.internal:5432/codeharbor?sslmode=disable';
+  assert.throws(() => validateDatabaseTls(env, url), /verified TLS/);
+  assert.doesNotThrow(() => validateDatabaseTls(optIn, url));
+  assert.doesNotThrow(() => validateDatabaseTls(optIn, 'postgresql://db.example/codeharbor?sslmode=verify-full'));
+  for (const invalid of [
+    url.replace('db.internal', 'other.internal'),
+    url.replace(':5432', ':5433'),
+    url.replace(':5432', ''),
+    url.replace('sslmode=disable', 'sslmode=prefer'),
+    `${url}&sslmode=disable`,
+    `${url}&host=other.internal`,
+  ]) {
+    assert.throws(() => validateDatabaseTls(optIn, invalid), /verified TLS/);
+  }
+  assert.throws(() => validateDatabaseTls({ ...optIn, NODE_TLS_REJECT_UNAUTHORIZED: '0' }, url), /verified TLS/);
+});
+
 test('database URL is read from one protected source without echoing it', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codeharbor-config-'));
   try {
