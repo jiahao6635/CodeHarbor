@@ -5,6 +5,7 @@ import type {
   AccountStatus,
   AdminKeyInfo,
   AdminRepository,
+  AdminSystemPerformance,
   AuditEvent,
   CodeupRepository,
   ConsoleConfig,
@@ -30,6 +31,7 @@ export const queryKeys = {
   adminUsers: ['admin', 'users'] as const,
   adminKeys: (owner: string | undefined, page: number) => ['admin', 'keys', owner ?? '', page] as const,
   adminAudit: (filter: AuditFilter) => ['admin', 'audit', filter] as const,
+  adminSystemPerformance: ['admin', 'system', 'performance'] as const,
 };
 
 const ACTIVE_REPOSITORY = new Set(['pending', 'indexing', 'updating']);
@@ -130,6 +132,17 @@ export function useAdminUsers() {
   return useQuery({
     queryKey: queryKeys.adminUsers,
     queryFn: async () => (await apiFetch<{ users: UserSummary[] }>('/api/v1/admin/users')).users,
+  });
+}
+
+export function useAdminSystemPerformance(autoRefresh: boolean) {
+  return useQuery({
+    queryKey: queryKeys.adminSystemPerformance,
+    queryFn: ({ signal }) => apiFetch<AdminSystemPerformance>('/api/v1/admin/system/performance', { signal }),
+    refetchInterval: autoRefresh ? 15_000 : false,
+    refetchOnWindowFocus: autoRefresh,
+    refetchOnReconnect: autoRefresh,
+    retry: false,
   });
 }
 

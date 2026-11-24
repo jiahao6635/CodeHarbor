@@ -15,6 +15,7 @@ const AdminRepositoriesPage = lazy(() => import('@/pages/admin/repositories'));
 const AdminUsersPage = lazy(() => import('@/pages/admin/users'));
 const AdminKeysPage = lazy(() => import('@/pages/admin/keys'));
 const AdminAuditPage = lazy(() => import('@/pages/admin/audit'));
+const AdminPerformancePage = lazy(() => import('@/pages/admin/performance'));
 const NotFoundPage = lazy(() => import('@/pages/not-found'));
 const RouteErrorPage = lazy(() => import('@/pages/error'));
 
@@ -65,6 +66,7 @@ const router = createBrowserRouter(
                     { path: 'users', element: page(<AdminUsersPage />) },
                     { path: 'keys', element: page(<AdminKeysPage />) },
                     { path: 'audit', element: page(<AdminAuditPage />) },
+                    { path: 'performance', element: page(<AdminPerformancePage />) },
                   ],
                 },
                 { path: '*', element: page(<NotFoundPage />) },

@@ -24,7 +24,10 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
   const probeCalls: string[] = [];
   let duringExplore: (() => void | Promise<void>) | undefined;
   let delayOldCredential: (() => Promise<void>) | undefined;
+  let duringIndexRuntimeProbe: ((signal?: AbortSignal) => Promise<void>) | undefined;
   let offline = false;
+  let indexRuntimeHealthy = true;
+  let runtimeFenced = false;
   const userFor = (token: string) => {
     if (revokedTokens.has(token)) throw new CodeupError('invalid_credential', 401);
     if (token === 'alice-pat' || token === 'alice-pat-2') return { id: 'alice', username: 'alice', name: 'Alice' };
@@ -66,7 +69,10 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
         return { result: 'matching code' };
       });
     },
-    async probe() {},
+    async probe(signal?: AbortSignal) {
+      if (!indexRuntimeHealthy) throw new Error('private runtime details');
+      await duringIndexRuntimeProbe?.(signal);
+    },
     async close() {},
   };
   let kickCount = 0;
@@ -111,6 +117,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
       probeCalls.push(request.token);
       return !deniedCloneTokens.has(request.token);
     },
+    fenced: () => ({ image_runtime: runtimeFenced }),
     audit: (event) => audit.push(event),
   });
   await app.listen({ port: 0, host: '127.0.0.1' });
@@ -200,6 +207,8 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal(openapi.status, 200);
     assert.match(openapi.body.openapi, /^3\./);
     assert.ok(openapi.body.paths['/api/v1/repositories']);
+    const performancePath = '/api/v1/admin/system/performance';
+    assert.ok(openapi.body.paths[performancePath]);
     assert.deepEqual((await request('GET', '/docs/json')).body, openapi.body);
     for (const path of ['/docs/', '/docs/json', '/docs/static/swagger-ui-bundle.js', '/openapi.json']) {
       const badHostStatus = await new Promise<number>((resolve, reject) => {
@@ -241,6 +250,76 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     });
     assert.equal(bobKey.status, 201);
     const bob = bobKey.body.token as string;
+
+    assert.equal((await request('GET', performancePath)).status, 401);
+    assert.equal((await request('GET', performancePath, bob)).status, 403);
+    const getPerformance = (signal?: AbortSignal) =>
+      fetch(`${base}${performancePath}`, { headers: { authorization: `Bearer ${alice}` }, signal });
+    const performance = await getPerformance();
+    assert.equal(performance.status, 200);
+    assert.equal(performance.headers.get('cache-control'), 'no-store');
+    const snapshot = await performance.json();
+    assert.equal(snapshot.health.status, 'ok');
+    assert.equal(snapshot.health.database, 'ok');
+    assert.equal(snapshot.health.indexRuntime, 'ok');
+    assert.equal(snapshot.health.fenced.image_runtime, false);
+    assert.ok(Number.isFinite(Date.parse(snapshot.performance.sampledAt)));
+    assert.ok(snapshot.performance.system.cpuCount >= 0);
+    assert.ok(snapshot.performance.system.totalMemoryBytes > 0);
+    assert.ok(snapshot.performance.process.uptimeSeconds > 0);
+    assert.ok(snapshot.performance.process.residentMemoryBytes > 0);
+    assert.ok(snapshot.performance.storage.totalBytes > 0);
+    assert.ok(!JSON.stringify(snapshot).includes(dir));
+
+    runtimeFenced = true;
+    assert.equal((await request('GET', performancePath, alice)).body.health.status, 'degraded');
+    runtimeFenced = false;
+
+    const checkHealth = app.store.checkHealth;
+    app.store.checkHealth = async () => {
+      throw new Error('private database details');
+    };
+    indexRuntimeHealthy = false;
+    try {
+      const degraded = await request('GET', performancePath, alice);
+      assert.equal(degraded.status, 200);
+      assert.equal(degraded.body.health.status, 'degraded');
+      assert.equal(degraded.body.health.database, 'unavailable');
+      assert.equal(degraded.body.health.indexRuntime, 'unavailable');
+      assert.doesNotMatch(JSON.stringify(degraded.body), /private (runtime|database) details/);
+      assert.equal((await request('GET', '/health/ready')).status, 503);
+    } finally {
+      app.store.checkHealth = checkHealth;
+      indexRuntimeHealthy = true;
+    }
+
+    let releaseProbe!: () => void;
+    const blockedProbe = new Promise<void>((resolve) => {
+      releaseProbe = resolve;
+    });
+    const probeSignals: (AbortSignal | undefined)[] = [];
+    duringIndexRuntimeProbe = (signal) => {
+      probeSignals.push(signal);
+      return blockedProbe;
+    };
+    try {
+      const watchdog = AbortSignal.timeout(10_000);
+      const concurrent = await Promise.all([getPerformance(watchdog), getPerformance(watchdog)]);
+      for (const response of [...concurrent, await getPerformance(watchdog)]) {
+        assert.equal(response.status, 200);
+        const { health, performance } = await response.json();
+        assert.equal(health.status, 'degraded');
+        assert.equal(health.database, 'ok');
+        assert.equal(health.indexRuntime, 'unavailable');
+        assert.ok(performance.process.residentMemoryBytes > 0);
+      }
+      assert.equal(probeSignals.length, 1);
+      assert.equal(probeSignals[0]?.aborted, true);
+    } finally {
+      duringIndexRuntimeProbe = undefined;
+      releaseProbe();
+    }
+    assert.equal((await request('GET', performancePath, alice)).body.health.status, 'ok');
 
     assert.equal(
       (
@@ -323,6 +402,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
       expires_at: null,
       revoked: 0,
     });
+    assert.equal((await request('GET', performancePath, bobScoped.token)).status, 403);
     deniedCloneTokens.add('bob-pat');
     offline = true;
     const beforeReads = probeCalls.length;
@@ -831,16 +911,30 @@ test('metrics use a separate credential and contain only bounded aggregate label
   try {
     assert.equal((await fetch(`${base}/metrics`)).status, 401);
     assert.equal((await fetch(`${base}/metrics`, { headers: { authorization: 'Bearer wrong-token' } })).status, 401);
+    assert.equal(
+      (
+        await fetch(`${base}/api/v1/admin/system/performance`, {
+          headers: { authorization: `Bearer ${metricsToken}` },
+        })
+      ).status,
+      401,
+    );
     assert.equal((await fetch(`${base}/health/live?secret=not-in-metrics`)).status, 200);
     const result = await fetch(`${base}/metrics`, { headers: { authorization: `Bearer ${metricsToken}` } });
     assert.equal(result.status, 200);
-    assert.match(result.headers.get('content-type')!, /^text\/plain/);
+    assert.match(result.headers.get('content-type')!, /^text\/plain; version=0\.0\.4/);
     const content = await result.text();
     assert.match(content, /codeharbor_http_requests_total\{method="GET",status="200"\}/);
     assert.match(content, /codeharbor_http_request_duration_seconds_bucket/);
     assert.match(content, /^codeharbor_index_queue_queued_jobs 0$/m);
     assert.match(content, /^codeharbor_index_jobs_failure_ratio_24h NaN$/m);
     assert.match(content, /^codeharbor_index_build_samples_24h 0$/m);
+    assert.match(content, /^# TYPE codeharbor_process_resident_memory_bytes gauge$/m);
+    assert.match(content, /^# TYPE codeharbor_process_cpu_seconds_total counter$/m);
+    assert.match(content, /^codeharbor_process_resident_memory_bytes [1-9]\d*$/m);
+    assert.match(content, /^codeharbor_system_memory_total_bytes [1-9]\d*$/m);
+    assert.match(content, /^codeharbor_data_filesystem_available_bytes \d+$/m);
+    assert.ok(!content.includes(dir));
     assert.ok(!content.includes('not-in-metrics') && !content.includes(metricsToken));
     assert.ok(!content.includes('route=') && !content.includes('user=') && !content.includes('repo='));
     app.store.jobMetrics = async () => {
@@ -890,7 +984,13 @@ test('console build is served under /ui with client-side routing fallback and st
   allowedHosts.push(`127.0.0.1:${address.port}`);
   const base = `http://127.0.0.1:${address.port}`;
   try {
-    for (const path of ['/ui', '/ui/', '/ui/repositories/some-id', '/ui/admin/audit?since=1']) {
+    for (const path of [
+      '/ui',
+      '/ui/',
+      '/ui/repositories/some-id',
+      '/ui/admin/audit?since=1',
+      '/ui/admin/performance',
+    ]) {
       const page = await fetch(`${base}${path}`);
       assert.equal(page.status, 200, path);
       assert.match(page.headers.get('content-type') ?? '', /text\/html/);

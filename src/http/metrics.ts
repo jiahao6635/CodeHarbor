@@ -30,12 +30,16 @@ export class HttpMetrics {
     const output = [
       '# HELP codeharbor_http_requests_total HTTP requests.',
       '# TYPE codeharbor_http_requests_total counter',
-      '# HELP codeharbor_http_request_duration_seconds HTTP request duration.',
-      '# TYPE codeharbor_http_request_duration_seconds histogram',
     ];
     for (const row of this.series.values()) {
+      output.push(`codeharbor_http_requests_total{method="${row.method}",status="${row.status}"} ${row.count}`);
+    }
+    output.push(
+      '# HELP codeharbor_http_request_duration_seconds HTTP request duration.',
+      '# TYPE codeharbor_http_request_duration_seconds histogram',
+    );
+    for (const row of this.series.values()) {
       const labels = `method="${row.method}",status="${row.status}"`;
-      output.push(`codeharbor_http_requests_total{${labels}} ${row.count}`);
       DURATION_BUCKETS_S.forEach((limit, index) => {
         output.push(`codeharbor_http_request_duration_seconds_bucket{${labels},le="${limit}"} ${row.buckets[index]}`);
       });

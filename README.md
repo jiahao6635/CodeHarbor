@@ -70,11 +70,15 @@ export DATABASE_URL='postgres://codeharbor_test:codeharbor_test@127.0.0.1:54329/
 
 运行 `npm start`。`NODE_ENV=production` 要求完整的飞书登录配置、验证 PostgreSQL 服务端证书、Vault Transit 和镜像索引后端。服务使用一条专用会话持有实例互斥锁（`pg_advisory_lock`）并执行迁移，业务查询和事务走独立连接池（默认 10 个连接）；因此数据库连接应直连或使用 session pooling，不可使用事务池。锁会话断开后所有读写拒绝执行，需由 supervisor 重启。业务进程与 Worker 同实例运行，仍不能横向扩容。
 
-本服务不直接提供 TLS；跨主机访问时必须将其置于可信 TLS 反向代理后，限制内部 HTTP 入口，正确设置允许的 Host 和 Origin。不要向公网直接开放明文端口。健康检查为 `GET /health/live` 和 `GET /health/ready`；后者检查数据库，开发文件系统模式下检查上游 MCP 工具 schema，生产镜像模式下检查镜像调度控制器。`/metrics` 在配置独立 Bearer 密钥后提供聚合 HTTP 与索引队列指标，不包含源码、仓库或用户标签；仅限内网采集。指标含义和查询示例见[队列监控](docs/queue-metrics.md)。结构化 HTTP 和审计事件输出到 stdout，同时批量写入数据库 `audit_events` 表（代码查询只记录 SHA-256 摘要，不记录内容），管理员可通过 `GET /api/v1/admin/audit` 查询；生产环境仍须配置访问受控的日志采集、留存和告警。`/metrics` 额外暴露 `codeharbor_runtime_fenced{component}`（镜像运行时/图客户端进入 fail-closed 状态时为 1，需人工介入）和 `codeharbor_audit_dropped_total`，应接入告警。
+本服务不直接提供 TLS。跨主机访问需经过可信 TLS 反向代理，并限制内部 HTTP 入口和允许的 Host、Origin。`GET /health/live` 检查进程是否响应。`GET /health/ready` 检查数据库，以及开发文件系统模式下的上游 MCP 工具 schema 或生产镜像模式下的镜像调度控制器。`/metrics` 使用独立 Bearer 密钥提供 Prometheus 格式的进程、系统资源、HTTP 和索引队列指标，供内网采集。采集配置、指标口径和查询示例见[运行监控](docs/queue-metrics.md)。
+
+结构化 HTTP 和审计事件输出到 stdout，同时批量写入数据库 `audit_events` 表（代码查询只记录 SHA-256 摘要），管理员可通过 `GET /api/v1/admin/audit` 查询。生产环境仍须配置访问受控的日志采集、留存和告警。`/metrics` 额外暴露 `codeharbor_runtime_fenced{component}`（镜像运行时/图客户端进入 fail-closed 状态时为 1，需人工介入）和 `codeharbor_audit_dropped_total`，应接入告警。
 
 ## 管理控制台
 
 服务在 `/ui` 提供同源控制台。飞书登录后可绑定云效 PAT、接入仓库、查看索引进度、创建个人 API Key 和查看 MCP 配置。超级管理员还可查看所有仓库、管理用户和旧 Key、操作仓库启停删除，以及查询全局审计。
+
+超级管理员通过飞书登录后，从「管理 → 运行状态」打开 `/ui/admin/performance`，可查看数据库与索引运行时健康状态，以及当前 CPU、内存、数据目录所在文件系统和服务进程的资源采样。对应接口为 `GET /api/v1/admin/system/performance`。
 
 ```sh
 npm run install:web   # 安装前端依赖（独立于后端 package.json）

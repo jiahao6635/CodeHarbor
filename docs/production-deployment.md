@@ -142,7 +142,7 @@ schema 由仓库内 `migrations/NNNN_name.sql` 管理，服务启动时在持有
 
 ## 监控与恢复
 
-`/health/live` 表示进程响应；`/health/ready` 会检查持锁数据库连接及 CodeGraph MCP 工具。`/metrics` 使用独立 Bearer token，输出聚合 HTTP 请求和索引队列指标；指标含义、统计窗口和查询示例见[队列监控](queue-metrics.md)。云效错误等指标仍需另行补充。Fastify 输出结构化请求和审计日志；MCP 工具调用记录受控工具名、成功或失败及已授权的仓库 ID，不记录查询内容或源码。日志采集、访问控制、保留和告警由部署平台负责。
+`/health/live` 表示进程响应。`/health/ready` 检查数据库和索引运行时。超级管理员通过飞书登录控制台，在「管理 → 运行状态」查看组件探测和资源采样。`/metrics` 使用独立 Bearer token，输出进程、系统资源、HTTP 和索引队列指标。采集配置、统计窗口和查询示例见[运行监控](queue-metrics.md)。Fastify 输出结构化请求和审计日志。MCP 工具调用记录受控工具名、结果及已授权的仓库 ID。日志采集、访问控制、留存和告警由部署平台负责。
 
 定期测试 PostgreSQL 备份、Vault Transit 旧密钥版本与包装文件、索引磁盘备份或重建，以及 Git/云效凭证重新授权。恢复后检查数据库路径、CodeGraph 版本、仓库 commit 和密钥一致性，再恢复流量。安装与配置所需的具体凭证、云资源和内网权限需要公司提供。
 
