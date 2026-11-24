@@ -27,6 +27,40 @@ export interface ConsoleConfig {
   public_mcp_disabled: boolean;
 }
 
+export interface AdminSystemPerformance {
+  health: {
+    status: 'ok' | 'degraded';
+    database: 'ok' | 'unavailable';
+    indexRuntime: 'ok' | 'unavailable';
+    fenced: Record<string, boolean>;
+  };
+  performance: {
+    sampledAt: string;
+    system: {
+      cpuCount: number;
+      cpuUsageRatio: number | null;
+      loadAverage: { oneMinute: number; fiveMinutes: number; fifteenMinutes: number } | null;
+      totalMemoryBytes: number;
+      availableMemoryBytes: number;
+      uptimeSeconds: number;
+    };
+    cgroup: {
+      cpuUsageCores: number | null;
+      cpuLimitCores: number | null;
+      cpuSecondsTotal: number | null;
+      memoryUsageBytes: number | null;
+      memoryLimitBytes: number | null;
+    } | null;
+    process: {
+      uptimeSeconds: number;
+      residentMemoryBytes: number;
+      cpuUsageCores: number | null;
+      cpuSecondsTotal: number;
+    };
+    storage: { totalBytes: number; availableBytes: number } | null;
+  };
+}
+
 export interface Repository {
   repo_id: string;
   codeup_id: string;

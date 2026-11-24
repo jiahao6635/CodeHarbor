@@ -54,6 +54,9 @@ const keySecurity = [{ ApiKey: [] }];
 const accountRole = { type: 'string', enum: ['member', 'super_admin'] };
 const accountStatus = { type: 'string', enum: ['active', 'disabled'] };
 const jobId = object({ job_id: { type: 'string' } }, ['job_id']);
+const dependencyStatus = { type: 'string', enum: ['ok', 'unavailable'] };
+const nonnegativeNumber = { type: 'number', minimum: 0 };
+const nullableNumber = { ...nonnegativeNumber, nullable: true };
 
 export const openApiDocument = {
   openapi: '3.0.3',
@@ -101,13 +104,14 @@ export const openApiDocument = {
       get: {
         tags: ['运维'],
         summary: 'Prometheus 指标',
-        description: '需要单独配置的 metrics token；未启用时返回 404。',
+        description: '包含 HTTP、索引队列和运行性能指标。需要单独配置的 metrics token；未启用时返回 404。',
         security: [{ MetricsBearer: [] }],
         responses: {
           '200': { description: 'Prometheus 文本格式。', content: { 'text/plain': { schema: { type: 'string' } } } },
           '401': common['401'],
           '403': common['403'],
           '404': common['404'],
+          '503': error('指标暂时无法采集。'),
         },
       },
     },
@@ -496,6 +500,21 @@ export const openApiDocument = {
         },
       },
     },
+    '/api/v1/admin/system/performance': {
+      get: {
+        tags: ['管理', '运维'],
+        security: browserSecurity,
+        summary: '查看服务运行状态和性能快照',
+        description: '需要超级管理员飞书会话。依赖探测失败或运行时进入保护状态时，仍返回快照并标记为 degraded。',
+        responses: {
+          '200': ok('服务运行状态和性能快照。', ref('SystemPerformance')),
+          '401': common['401'],
+          '403': common['403'],
+          '429': error('认证失败次数过多。'),
+          '500': common['500'],
+        },
+      },
+    },
     '/api/v1/jobs/{jobId}': {
       get: {
         tags: ['仓库与索引'],
@@ -633,7 +652,84 @@ export const openApiDocument = {
         { error: { type: 'string', description: '稳定的错误代码，例如 UNAUTHENTICATED、FORBIDDEN、NOT_FOUND。' } },
         ['error'],
       ),
-      Health: object({ status: { type: 'string', enum: ['ok', 'unavailable'] } }, ['status']),
+      Health: object({ status: dependencyStatus }, ['status']),
+      SystemPerformance: object(
+        {
+          health: object(
+            {
+              status: { type: 'string', enum: ['ok', 'degraded'] },
+              database: dependencyStatus,
+              indexRuntime: dependencyStatus,
+              fenced: { type: 'object', additionalProperties: { type: 'boolean' } },
+            },
+            ['status', 'database', 'indexRuntime', 'fenced'],
+          ),
+          performance: object(
+            {
+              sampledAt: { type: 'string', format: 'date-time' },
+              system: object(
+                {
+                  cpuCount: { type: 'integer', minimum: 0 },
+                  cpuUsageRatio: { ...nullableNumber, maximum: 1 },
+                  loadAverage: {
+                    ...object(
+                      {
+                        oneMinute: nonnegativeNumber,
+                        fiveMinutes: nonnegativeNumber,
+                        fifteenMinutes: nonnegativeNumber,
+                      },
+                      ['oneMinute', 'fiveMinutes', 'fifteenMinutes'],
+                    ),
+                    nullable: true,
+                  },
+                  totalMemoryBytes: nonnegativeNumber,
+                  availableMemoryBytes: nonnegativeNumber,
+                  uptimeSeconds: nonnegativeNumber,
+                },
+                [
+                  'cpuCount',
+                  'cpuUsageRatio',
+                  'loadAverage',
+                  'totalMemoryBytes',
+                  'availableMemoryBytes',
+                  'uptimeSeconds',
+                ],
+              ),
+              cgroup: {
+                ...object(
+                  {
+                    cpuUsageCores: nullableNumber,
+                    cpuLimitCores: nullableNumber,
+                    cpuSecondsTotal: nullableNumber,
+                    memoryUsageBytes: nullableNumber,
+                    memoryLimitBytes: nullableNumber,
+                  },
+                  ['cpuUsageCores', 'cpuLimitCores', 'cpuSecondsTotal', 'memoryUsageBytes', 'memoryLimitBytes'],
+                ),
+                nullable: true,
+              },
+              process: object(
+                {
+                  uptimeSeconds: nonnegativeNumber,
+                  residentMemoryBytes: nonnegativeNumber,
+                  cpuUsageCores: nullableNumber,
+                  cpuSecondsTotal: nonnegativeNumber,
+                },
+                ['uptimeSeconds', 'residentMemoryBytes', 'cpuUsageCores', 'cpuSecondsTotal'],
+              ),
+              storage: {
+                ...object({ totalBytes: nonnegativeNumber, availableBytes: nonnegativeNumber }, [
+                  'totalBytes',
+                  'availableBytes',
+                ]),
+                nullable: true,
+              },
+            },
+            ['sampledAt', 'system', 'cgroup', 'process', 'storage'],
+          ),
+        },
+        ['health', 'performance'],
+      ),
       Account: object(
         {
           id: { type: 'string' },

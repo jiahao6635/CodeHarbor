@@ -81,7 +81,21 @@ test('Feishu verifies the browser, authorization code and tenant before creating
       writeUsers: [],
       feishu,
     },
-    { store, codeup, feishuFetch },
+    {
+      store,
+      codeup,
+      feishuFetch,
+      graph: {
+        async withQuery() {
+          throw new Error('Unexpected graph query');
+        },
+        async withExclusive() {
+          throw new Error('Unexpected graph operation');
+        },
+        async probe() {},
+        async close() {},
+      },
+    },
   );
   try {
     await store.createUser({
@@ -126,6 +140,8 @@ test('Feishu verifies the browser, authorization code and tenant before creating
         body: JSON.stringify({ pat }),
       });
 
+    const performancePath = '/api/v1/admin/system/performance';
+    assert.equal((await request(performancePath)).status, 401);
     assert.equal((await bind('first-pat')).status, 401);
     assert.equal((await request('/api/v1/auth/bootstrap/keys', { method: 'POST' })).status, 404);
     const unauthorizedTenant = await start();
@@ -144,6 +160,13 @@ test('Feishu verifies the browser, authorization code and tenant before creating
     assert.equal(loggedIn.headers.get('referrer-policy'), 'no-referrer');
     const adminCookie = cookie(loggedIn, '__Host-codeharbor_session');
     assert.equal(cookie(loggedIn, '__Host-codeharbor_oauth'), '__Host-codeharbor_oauth=');
+    const performance = await request(performancePath, { headers: { cookie: adminCookie } });
+    assert.equal(performance.status, 200);
+    assert.equal((await performance.json()).health.status, 'ok');
+    assert.equal(
+      (await request(performancePath, { headers: { cookie: adminCookie, authorization: 'Bearer fixture' } })).status,
+      401,
+    );
 
     assert.equal(
       (await callback(adminFlow.state, 'admin', adminFlow.cookie)).headers.get('location'),
@@ -171,6 +194,7 @@ test('Feishu verifies the browser, authorization code and tenant before creating
       await callback(memberFlow.state, 'member', memberFlow.cookie),
       '__Host-codeharbor_session',
     );
+    assert.equal((await request(performancePath, { headers: { cookie: memberCookie } })).status, 403);
     assert.equal((await bind('next-pat', memberCookie, ORIGIN)).status, 409);
     const accounts = await store.listAccounts();
     const member = accounts.find((account) => account.feishu_open_id === MEMBER);

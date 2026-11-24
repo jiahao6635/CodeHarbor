@@ -6,6 +6,7 @@ import {
   LockKey,
   Moon,
   Plugs,
+  Pulse,
   ShieldCheck,
   SignOut,
   Sun,
@@ -39,6 +40,7 @@ const ADMIN: NavItem[] = [
   { to: '/admin/users', label: '用户', icon: UsersThree },
   { to: '/admin/keys', label: 'Key', icon: Key },
   { to: '/admin/audit', label: '审计', icon: ClipboardText },
+  { to: '/admin/performance', label: '运行状态', icon: Pulse },
 ];
 
 function NavGroup({ title, items, collapsed }: { title?: string; items: NavItem[]; collapsed: boolean }) {
