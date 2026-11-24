@@ -6,6 +6,7 @@ import {
   EXPIRY_OPTIONS,
   MAX_EXPIRES_IN,
   parseExpiry,
+  repositorySyncInterval,
 } from './validation';
 
 describe('branchName mirrors the server rules', () => {
@@ -27,6 +28,15 @@ describe('codeupRepositoryId', () => {
     expect(codeupRepositoryId.safeParse('abc').success).toBe(false);
     expect(codeupRepositoryId.safeParse('1'.repeat(31)).success).toBe(false);
   });
+});
+
+it('validates sync interval minutes and preserves null for the global default', () => {
+  for (const value of [null, 1, 1440]) {
+    expect(repositorySyncInterval.parse(value)).toBe(value);
+  }
+  for (const value of [Number.NaN, 0, 1.5, 1441]) {
+    expect(repositorySyncInterval.safeParse(value).success).toBe(false);
+  }
 });
 
 describe('expiry options', () => {

@@ -57,7 +57,7 @@ export interface AppConfig {
   feishu?: FeishuConfig;
   writeUsers: string[];
   codegraphBin: string;
-  reconcileMs?: number;
+  defaultSyncIntervalMinutes?: number;
   /** Monitoring credential loaded by the caller from a protected secret source. */
   metricsToken?: string;
   /** Disable the legacy public MCP endpoint when the dedicated service is enabled. */
@@ -83,6 +83,7 @@ export interface AppConfig {
 /** Everything route modules need; built once by createApp. */
 export interface AppContext {
   config: AppConfig;
+  defaultSyncIntervalMinutes: number;
   store: StoreBackend;
   cipher: CredentialCipher;
   codeup: CodeupClient;

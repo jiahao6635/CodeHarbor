@@ -22,8 +22,14 @@ import {
   requireWriteHook,
 } from '../http/guards.js';
 import { identifier, parseBody, parseParams, parseQuery, positivePage, singleQuery, text } from '../http/validation.js';
-import { publicRepository } from '../http/views.js';
-import type { AccountRecord, RepositoryRecord, UserRecord } from '../store.js';
+import { publicRepository as toPublicRepository } from '../http/views.js';
+import {
+  type AccountRecord,
+  MAX_SYNC_INTERVAL_MINUTES,
+  MIN_SYNC_INTERVAL_MINUTES,
+  type RepositoryRecord,
+  type UserRecord,
+} from '../store.js';
 
 const idParams = z.object({ id: identifier });
 const pageQuery = z.object({ page: singleQuery(positivePage).default(1) });
@@ -45,6 +51,7 @@ const createBody = z.strictObject({
     .transform(String)
     .pipe(z.string().regex(/^\d{1,30}$/)),
   branch: branchName.optional(),
+  sync_interval_minutes: z.number().int().min(MIN_SYNC_INTERVAL_MINUTES).max(MAX_SYNC_INTERVAL_MINUTES).nullish(),
   authorize_automatic_sync: z.literal(true),
 });
 const syncCredentialBody = z.strictObject({ authorize_automatic_sync: z.literal(true) });
@@ -54,6 +61,7 @@ export function registerRepositoryRoutes(app: FastifyInstance, ctx: AppContext):
   const feishu = authorization.enforceFeishu;
   const authenticate = authenticateRepositoryHook(ctx);
   const browser = feishu ? authenticateBrowserHook(ctx) : authenticateHook(ctx);
+  const publicRepository = (repo: RepositoryRecord) => toPublicRepository(repo, ctx.defaultSyncIntervalMinutes);
 
   async function ownerOf(request: Parameters<typeof principalOf>[0]) {
     const user = await store.getUser(principalOf(request).owner);
@@ -283,6 +291,7 @@ export function registerRepositoryRoutes(app: FastifyInstance, ctx: AppContext):
         codeup_id: input.codeup_repository_id,
         name: remote.name,
         branch,
+        sync_interval_minutes: input.sync_interval_minutes ?? null,
         owner: user.id,
         sync_owner: user.id,
         sync_credential_version: user.credential_version,

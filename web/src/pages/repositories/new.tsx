@@ -7,7 +7,7 @@ import { Link, useNavigate } from 'react-router';
 import { toast } from 'sonner';
 import { z } from 'zod';
 import { ApiError } from '@/api/client';
-import { useCodeupRepositories, useCreateRepository } from '@/api/hooks';
+import { useCodeupRepositories, useConsoleConfig, useCreateRepository } from '@/api/hooks';
 import type { CodeupRepository, CreatedRepository } from '@/api/types';
 import { useAbility } from '@/auth/session';
 import { CodeupBranchPicker } from '@/components/codeup-branch-picker';
@@ -20,17 +20,24 @@ import { Alert } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Input } from '@/components/ui/input';
+import { Input, NativeSelect } from '@/components/ui/input';
 import { describedBy, Field, Label } from '@/components/ui/label';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/cn';
 import { describeError } from '@/lib/errors';
-import { branchName, codeupRepositoryId } from '@/lib/validation';
+import {
+  branchName,
+  codeupRepositoryId,
+  MAX_SYNC_INTERVAL_MINUTES,
+  MIN_SYNC_INTERVAL_MINUTES,
+  repositorySyncInterval,
+} from '@/lib/validation';
 
 const schema = z.object({
   codeup_repository_id: codeupRepositoryId,
   branch: branchName,
+  sync_interval_minutes: repositorySyncInterval,
   authorize: z.literal(true, { error: '必须确认授权自动同步' }),
 });
 type FormValues = z.infer<typeof schema>;
@@ -161,6 +168,7 @@ export default function RepositoryNewPage() {
 function RepositoryCreateForm() {
   const navigate = useNavigate();
   const client = useQueryClient();
+  const { data: config } = useConsoleConfig();
   const create = useCreateRepository();
   const [created, setCreated] = useState<CreatedRepository | null>(null);
   const [selectedName, setSelectedName] = useState<string | null>(null);
@@ -168,7 +176,12 @@ function RepositoryCreateForm() {
   const [conflict, setConflict] = useState<{ repoId: string; branch: string } | null>(null);
   const form = useForm<FormValues>({
     resolver: zodResolver(schema),
-    defaultValues: { codeup_repository_id: '', branch: '', authorize: undefined as unknown as true },
+    defaultValues: {
+      codeup_repository_id: '',
+      branch: '',
+      sync_interval_minutes: null,
+      authorize: undefined as unknown as true,
+    },
   });
   const authorizeId = useId();
 
@@ -176,7 +189,11 @@ function RepositoryCreateForm() {
     setServerError(null);
     setConflict(null);
     create.mutate(
-      { codeup_repository_id: values.codeup_repository_id, branch: values.branch },
+      {
+        codeup_repository_id: values.codeup_repository_id,
+        branch: values.branch,
+        sync_interval_minutes: values.sync_interval_minutes,
+      },
       {
         onSuccess: (result) => {
           if ('webhook_token' in result) {
@@ -213,6 +230,8 @@ function RepositoryCreateForm() {
   const errors = form.formState.errors;
   const idValue = form.watch('codeup_repository_id');
   const selectedBranch = form.watch('branch');
+  const defaultSyncInterval = config?.default_sync_interval_minutes;
+  const customSyncInterval = form.watch('sync_interval_minutes') !== null;
   const validId = codeupRepositoryId.safeParse(idValue);
 
   const resetBranch = () => {
@@ -288,6 +307,48 @@ function RepositoryCreateForm() {
               onSelect={(name) => form.setValue('branch', name, { shouldValidate: true })}
               error={errors.branch?.message}
             />
+            <Field id="sync_interval_mode" label="定时检查周期">
+              <NativeSelect
+                id="sync_interval_mode"
+                value={customSyncInterval ? 'custom' : 'default'}
+                onChange={(event) => {
+                  const inherit = event.target.value === 'default';
+                  form.setValue('sync_interval_minutes', inherit ? null : (defaultSyncInterval ?? Number.NaN), {
+                    shouldValidate: inherit,
+                  });
+                }}
+              >
+                <option value="default">
+                  {defaultSyncInterval === undefined
+                    ? '使用全局默认'
+                    : `使用全局默认（每 ${defaultSyncInterval} 分钟）`}
+                </option>
+                <option value="custom">为此仓库自定义</option>
+              </NativeSelect>
+            </Field>
+            {customSyncInterval ? (
+              <Field
+                id="sync_interval_minutes"
+                label="自定义周期（分钟）"
+                helper="允许 1–1440 分钟。"
+                error={errors.sync_interval_minutes?.message}
+              >
+                <Input
+                  id="sync_interval_minutes"
+                  type="number"
+                  inputMode="numeric"
+                  min={MIN_SYNC_INTERVAL_MINUTES}
+                  max={MAX_SYNC_INTERVAL_MINUTES}
+                  step={1}
+                  aria-invalid={errors.sync_interval_minutes ? true : undefined}
+                  aria-describedby={describedBy('sync_interval_minutes', {
+                    helper: true,
+                    error: !!errors.sync_interval_minutes,
+                  })}
+                  {...form.register('sync_interval_minutes', { valueAsNumber: true })}
+                />
+              </Field>
+            ) : null}
             <div className="flex flex-col gap-1.5">
               <div className="flex items-start gap-2">
                 <Checkbox

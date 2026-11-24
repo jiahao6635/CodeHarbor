@@ -259,6 +259,11 @@ export default function RepositoryDetailPage() {
           <Definition term="分支" mono>
             {repo.branch}
           </Definition>
+          <Definition term="定时检查周期">
+            {repo.effective_sync_interval_minutes === undefined
+              ? '—'
+              : `每 ${repo.effective_sync_interval_minutes} 分钟（${repo.sync_interval_minutes === null ? '全局默认' : '仓库自定义'}）`}
+          </Definition>
           <Definition term="索引 commit" mono>
             {repo.indexed_commit ?? '—'}
           </Definition>

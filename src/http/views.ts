@@ -14,13 +14,15 @@ export function mcpRepository(repo: RepositoryRecord): McpRepository {
   };
 }
 
-export function publicRepository(repo: RepositoryRecord) {
+export function publicRepository(repo: RepositoryRecord, defaultSyncIntervalMinutes: number) {
   const view = mcpRepository(repo);
   return {
     repo_id: view.id,
     codeup_id: repo.codeup_id,
     name: view.name,
     branch: repo.branch,
+    sync_interval_minutes: repo.sync_interval_minutes,
+    effective_sync_interval_minutes: repo.sync_interval_minutes ?? defaultSyncIntervalMinutes,
     status: view.status,
     indexed_commit: view.indexedCommit,
     indexed_at: view.indexedAt,
@@ -31,8 +33,8 @@ export function publicRepository(repo: RepositoryRecord) {
 }
 
 /** Administrative view: adds ownership so operators can see who synchronises a repository. */
-export function adminRepository(repo: RepositoryRecord) {
-  return { ...publicRepository(repo), owner: repo.owner, sync_owner: repo.sync_owner };
+export function adminRepository(repo: RepositoryRecord, defaultSyncIntervalMinutes: number) {
+  return { ...publicRepository(repo, defaultSyncIntervalMinutes), owner: repo.owner, sync_owner: repo.sync_owner };
 }
 
 export function internalRepository(repo: RepositoryRecord): InternalMcpRepository {

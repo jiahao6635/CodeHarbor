@@ -355,7 +355,7 @@ MCP 工具的实际返回需符合协议 `content` / `structuredContent` 约定�
 
 仓库状态：`pending` → `indexing` → `ready`；有旧版且更新中为 `updating`；凭证失效为 `credential_required`；无可用版本且失败为 `failed`；停用为 `disabled`。`ready` 不代表实时最新，需检查 `stale` 和 commit。
 
-- Webhook 丢失：定期对账触发同步；默认建议 15 分钟，实际时效需评审。
+- Webhook 丢失时，定期对账会触发同步。全局间隔默认 6 小时，接入仓库时可单独设置。
 - 短暂云效或网络故障：MVP 标记任务失败并保留上次成功版本，后续手动请求或定期对账可再次触发；指数退避和次数上限属于后续生产化工作。
 - PAT 过期/撤销：停止以该凭证拉取，标记需要重新授权；已授权 Key 仍可读取上次发布的索引。
 - Git 分支删除、仓库不可访问：不覆盖已发布版本，标记异常并告警。
@@ -400,11 +400,12 @@ CODEHARBOR_DATA_DIR                # 持久化数据目录
 CODEHARBOR_SECRET_BACKEND          # 企业密钥管理配置引用
 CODEGRAPH_VERSION                  # 已验证并锁定的版本
 PERMISSION_CACHE_TTL_SECONDS       # 默认建议 300
-RECONCILE_INTERVAL_SECONDS         # 默认建议 900
 MAX_INDEX_WORKERS                  # 初期建议 1，根据资源调整
 ```
 
 具体配置字段和默认值为设计建议，并非现成环境变量。生产部署中将凭证存放于密钥管理，不提交配置文件或打印在启动日志中。
+
+仓库定时检查的实际环境变量是 `CODEHARBOR_DEFAULT_SYNC_INTERVAL_MINUTES`，默认值为 `360`。
 
 ### 9.3 备份、恢复与升级
 

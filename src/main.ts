@@ -4,7 +4,13 @@ import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AuditWriter } from './audit-writer.js';
-import { databaseUrl, feishuConfig, indexBackend as resolveIndexBackend, validateProduction } from './config.js';
+import {
+  DEFAULT_SYNC_INTERVAL_MINUTES,
+  databaseUrl,
+  feishuConfig,
+  indexBackend as resolveIndexBackend,
+  validateProduction,
+} from './config.js';
 import { imageAuthorization } from './image-authorization.js';
 import { serveImageAuthorizer } from './image-authorizer.js';
 import { SocketImageBuildExecutor } from './image-build-socket.js';
@@ -18,6 +24,7 @@ import { loadMasterKey } from './master-key.js';
 import { openPostgresStore } from './postgres-store.js';
 import { queryConcurrency } from './query-concurrency.js';
 import { createApp } from './server.js';
+import { MAX_SYNC_INTERVAL_MINUTES, MIN_SYNC_INTERVAL_MINUTES } from './store.js';
 
 const logger = createLogger({ name: 'codeharbor' });
 
@@ -78,6 +85,12 @@ async function main() {
     throw new Error('Invalid CODEHARBOR_UI_MCP_URL');
   }
   const trustProxy = flag('CODEHARBOR_TRUST_PROXY', false);
+  const defaultSyncIntervalMinutes = integer(
+    'CODEHARBOR_DEFAULT_SYNC_INTERVAL_MINUTES',
+    DEFAULT_SYNC_INTERVAL_MINUTES,
+    MIN_SYNC_INTERVAL_MINUTES,
+    MAX_SYNC_INTERVAL_MINUTES,
+  );
   const accessTtlMs = integer('CODEHARBOR_ACCESS_TTL_MS', 6 * 3_600_000, 60_000, 7 * 86_400_000);
   const mcpKeyRatePerMinute = integer('CODEHARBOR_MCP_KEY_RATE_PER_MIN', 120, 1, 100_000);
   const authFailureRatePerMinute = integer('CODEHARBOR_AUTH_FAILURE_RATE_PER_MIN', 30, 1, 100_000);
@@ -196,6 +209,7 @@ async function main() {
         uiDir,
         uiMcpUrl,
         trustProxy,
+        defaultSyncIntervalMinutes,
         accessTtlMs,
         mcpKeyRatePerMinute,
         authFailureRatePerMinute,
@@ -283,7 +297,7 @@ main().catch((error: unknown) => {
   // Only a fixed, non-secret-bearing summary reaches logs.
   const message =
     error instanceof Error &&
-    /^(YUNXIAO_ENDPOINT is required|Invalid PORT|CODEHARBOR_GIT_HOSTS must|PostgreSQL is required|Invalid PostgreSQL URL|Production PostgreSQL requires|Production requires|Configure only one database|Database URL file is unavailable)/.test(
+    /^(YUNXIAO_ENDPOINT is required|Invalid PORT|Invalid CODEHARBOR_DEFAULT_SYNC_INTERVAL_MINUTES$|CODEHARBOR_GIT_HOSTS must|PostgreSQL is required|Invalid PostgreSQL URL|Production PostgreSQL requires|Production requires|Configure only one database|Database URL file is unavailable)/.test(
       error.message,
     )
       ? error.message

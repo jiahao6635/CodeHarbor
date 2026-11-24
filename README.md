@@ -6,7 +6,7 @@ CodeHarbor 是面向 Agent 的代码知识服务：它拉取云效 Codeup 仓库
 
 - 用户使用企业飞书账号登录，再绑定自己的云效个人访问令牌（PAT）和创建限定仓库的 CodeHarbor API Key。
 - 从云效列表或按仓库 ID 选择仓库与远程分支。首次接入及提交变化后构建 CodeGraph 1.6.2 索引，详情页展示任务进度。相同 commit 的可用索引可以复用。
-- Codeup Push Webhook、手动同步和 15 分钟对账；保留上次成功索引，报告 commit 和新鲜度。
+- Codeup Push Webhook、手动同步和定时检查。定时检查默认 6 小时，接入仓库时可单独设置。保留上次成功索引，报告 commit 和新鲜度。
 - 单个 `/mcp` 地址，提供 `list_repositories`、`get_repository_status` 和全部 7 个代码工具：`codegraph_search`、`codegraph_callers`、`codegraph_callees`、`codegraph_impact`、`codegraph_node`、`codegraph_explore`、`codegraph_files`；全部代码工具必须传入 `repo_id`，按 Key 的仓库范围鉴权。
 - `write` Key 可在限定仓库范围内触发本人负责的仓库同步。平台管理使用超级管理员的飞书登录会话。
 - 生产模式使用仓库镜像后端：每个仓库的源码快照和索引打包为本机 Docker 镜像，查询容器使用经过适配的只读 CodeGraph；文件系统后端仅保留给开发和测试，配置与迁移边界见 [镜像后端指南](docs/image-backend.md)。
@@ -54,6 +54,7 @@ export DATABASE_URL='postgres://codeharbor_test:codeharbor_test@127.0.0.1:54329/
 | `CODEHARBOR_FEISHU_APP_SECRET_FILE` | 保存飞书 App Secret 的受保护文件路径 |
 | `CODEHARBOR_FEISHU_SUPER_ADMIN_OPEN_ID` | 初始超级管理员在该飞书应用中的 Open ID。指定账号首次成功登录且平台还没有启用的超级管理员时初始化角色 |
 | `CODEHARBOR_ACCESS_TTL_MS` | 云效角色和克隆权限检查的缓存上限可调低，实际最长 5 分钟 |
+| `CODEHARBOR_DEFAULT_SYNC_INTERVAL_MINUTES` | 仓库定时检查的全局默认间隔为 `360` 分钟（6 小时），可设为 `1`～`1440` 的整数（分钟） |
 | `CODEHARBOR_TRUST_PROXY` | `true` 时客户端地址取 `X-Forwarded-For` 最后一跳；仅在可信反向代理后开启 |
 | `CODEHARBOR_DOCS_ENABLED` | 是否提供 `/docs` 与 `/openapi.json`；生产默认 `false` |
 | `CODEHARBOR_UI_ENABLED` | 是否在 `/ui` 提供管理控制台，默认 `true`；需要先构建 `web/dist`（`npm run build:web`），显式设为 `true` 但缺少构建产物时启动失败 |
@@ -110,7 +111,7 @@ npm run check:web && npm run test:web
 | GET | `/api/v1/codeup/repositories?page=1` | 用本人 PAT 查询云效可见仓库 |
 | GET | `/api/v1/codeup/repositories/{id}/branches` | 查询云效分支、默认分支与分页 |
 | GET / POST | `/api/v1/repositories` | 列出有权查看的已接入仓库或接入仓库 |
-| GET | `/api/v1/repositories/{id}` | 仓库索引状态 |
+| GET | `/api/v1/repositories/{id}` | 仓库索引状态和实际定时检查周期 |
 | POST | `/api/v1/repositories/{id}/sync` | 异步更新索引 |
 | PUT | `/api/v1/repositories/{id}/sync-credential` | 仓库负责人或同步凭证持有人授权当前 PAT 自动同步 |
 | GET | `/api/v1/repositories/{id}/jobs` | 仓库索引任务与进度 |
@@ -119,6 +120,8 @@ npm run check:web && npm run test:web
 | POST | `/api/v1/hooks/codeup/{id}` | 云效 Webhook 验证 `X-Codeup-Token` |
 
 接入请求需包含 `codeup_repository_id` 和 `authorize_automatic_sync: true`。省略 `branch` 时使用云效仓库的默认分支。成功响应包含 CodeHarbor 仓库 ID、任务 ID、Webhook 路径和仅返回一次的 Webhook Token。将路径配置到 Codeup Webhook，填写 Token 并选择 Push 事件。无法配置时，可通过手动同步和定期对账更新索引。同步凭证持有人更新 PAT 后，所属仓库进入 `credential_required`，须在详情页重新授权同步。
+
+在控制台接入仓库时可继承全局默认，也可为该仓库指定周期。API 接入时可选传 `sync_interval_minutes`，接受 `1`～`1440` 的整数。省略或传 `null` 时继承全局默认，已有仓库也默认继承。仓库详情返回 `sync_interval_minutes` 和 `effective_sync_interval_minutes`。周期决定后台何时检查，任务仍需排队并执行。Webhook 和手动同步可随时触发。
 
 把 MCP URL `https://<trusted-host>/mcp` 和 `Authorization: Bearer <CodeHarbor Key>` 配置到 Agent。先调用 `list_repositories` 获取 CodeHarbor 的 `repo_id`，再用允许的工具查询源代码。
 

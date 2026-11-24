@@ -3,6 +3,8 @@ import { z } from 'zod';
 const integer = z.coerce.number().int();
 const nullableInteger = z.union([z.null(), integer]);
 const nullableText = z.union([z.null(), z.string()]);
+export const MIN_SYNC_INTERVAL_MINUTES = 1;
+export const MAX_SYNC_INTERVAL_MINUTES = 1440;
 
 export const userRowSchema = z.object({
   id: z.string(),
@@ -60,6 +62,7 @@ export const repositoryRowSchema = z.object({
   owner: z.string(),
   sync_owner: z.string(),
   sync_credential_version: integer,
+  sync_interval_minutes: integer.min(MIN_SYNC_INTERVAL_MINUTES).max(MAX_SYNC_INTERVAL_MINUTES).nullable(),
   hook_hash: z.string(),
   path: nullableText,
   commit: nullableText,
@@ -71,8 +74,9 @@ export const repositoryRowSchema = z.object({
   error: nullableText,
 });
 export type RepositoryRecord = z.infer<typeof repositoryRowSchema>;
-export type RepositoryInput = Omit<RepositoryRecord, 'previous_image' | 'previous_commit'> &
-  Partial<Pick<RepositoryRecord, 'previous_image' | 'previous_commit'>>;
+type OptionalRepositoryFields = 'previous_image' | 'previous_commit' | 'sync_interval_minutes';
+export type RepositoryInput = Omit<RepositoryRecord, OptionalRepositoryFields> &
+  Partial<Pick<RepositoryRecord, OptionalRepositoryFields>>;
 
 export const JOB_PHASES = [
   'queued',
@@ -212,6 +216,7 @@ export interface StoreAccess {
   getJob(id: string): Promise<JobRecord | undefined>;
   listJobs(repoId: string): Promise<JobRecord[]>;
   listPendingJobs(): Promise<JobRecord[]>;
+  hasPendingOrRecentJob(repoId: string, since: number): Promise<boolean>;
   updateJob(id: string, patch: JobUpdate): Promise<void>;
   jobMetrics(nowMs: number): Promise<JobMetrics>;
 

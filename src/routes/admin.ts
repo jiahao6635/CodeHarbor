@@ -86,7 +86,8 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AppContext): void
   /** Every repository including disabled ones, which the user-facing list hides. */
   app.get('/api/v1/admin/repositories', admin, async (request) => {
     await assertAdmin(request);
-    return { repositories: (await store.listRepositories()).map(adminRepository) };
+    const repositories = await store.listRepositories();
+    return { repositories: repositories.map((repo) => adminRepository(repo, ctx.defaultSyncIntervalMinutes)) };
   });
 
   app.get('/api/v1/admin/api-keys', admin, async (request) => {

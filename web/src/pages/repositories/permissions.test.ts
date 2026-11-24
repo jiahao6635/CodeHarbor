@@ -11,6 +11,7 @@ import RepositoryNewPage from './new';
 const hooks = vi.hoisted(() => ({
   useRepositories: vi.fn(),
   useCodeupRepositories: vi.fn(),
+  useConsoleConfig: vi.fn(),
   useCreateRepository: vi.fn(),
   mutate: vi.fn(),
 }));
@@ -39,6 +40,7 @@ beforeEach(() => {
     isPending: false,
     isError: false,
   });
+  hooks.useConsoleConfig.mockReturnValue({ data: { default_sync_interval_minutes: 20 } });
   hooks.useCreateRepository.mockReturnValue({ mutate: hooks.mutate, isPending: false });
 });
 
@@ -59,6 +61,9 @@ it.each(['member', 'super_admin'] as const)('offers repo and branch selection to
   expect(page).toContain('输入仓库 ID');
   expect(page).toContain('选择分支');
   expect(page).not.toContain('value="main"');
+  expect(page).toContain('接入并开始构建');
+  expect(page).toContain('使用全局默认（每 20 分钟）');
+  expect(page).toContain('为此仓库自定义');
   expect(hooks.useCodeupRepositories).toHaveBeenCalledWith(1, true);
   expect(hooks.mutate).not.toHaveBeenCalled();
 });

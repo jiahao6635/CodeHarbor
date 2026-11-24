@@ -53,7 +53,7 @@ export function useConsoleConfig() {
   return useQuery({
     queryKey: queryKeys.console,
     queryFn: () => apiFetch<ConsoleConfig>('/api/v1/console'),
-    staleTime: Number.POSITIVE_INFINITY,
+    staleTime: 60_000,
     retry: false,
   });
 }
@@ -208,7 +208,7 @@ export function useAuthorizeSyncCredential() {
 export function useCreateRepository() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (input: { codeup_repository_id: string; branch: string }) =>
+    mutationFn: (input: { codeup_repository_id: string; branch: string; sync_interval_minutes?: number | null }) =>
       apiFetch<CreatedRepository | { repository: Repository }>('/api/v1/repositories', {
         method: 'POST',
         body: { ...input, authorize_automatic_sync: true },

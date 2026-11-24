@@ -60,6 +60,7 @@ for (const localPostgres of [false, true]) {
     const controller = config.services['image-controller'];
     assert.equal(app.environment.CODEHARBOR_INDEX_BACKEND, 'image');
     assert.equal(app.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');
+    assert.equal(app.environment.CODEHARBOR_DEFAULT_SYNC_INTERVAL_MINUTES, '360');
     assert.equal(app.environment.CODEHARBOR_PUBLIC_ORIGIN, 'https://example.invalid');
     assert.equal(app.environment.CODEHARBOR_FEISHU_APP_SECRET_FILE, '/run/secrets/feishu_app_secret');
     assert.equal(controller.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');

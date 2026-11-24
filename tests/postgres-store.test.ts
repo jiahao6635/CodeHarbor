@@ -45,6 +45,7 @@ test('PostgreSQL store round-trips records, enforces the instance lock and fails
       owner: 'u',
       sync_owner: 'u',
       sync_credential_version: 1,
+      sync_interval_minutes: 30,
       hook_hash: 'hook',
       path: '/data/r',
       commit: 'abc',
@@ -83,7 +84,14 @@ test('PostgreSQL store round-trips records, enforces the instance lock and fails
     assert.equal(repo?.commit, 'abc');
     assert.equal(repo?.previous_image, previousImage);
     assert.equal(repo?.indexed_at, 123);
-    assert.equal((await store.getRepository('r2'))?.previous_image, null);
+    assert.equal(repo?.sync_interval_minutes, 30);
+    const inheritedRepo = await store.getRepository('r2');
+    assert.equal(inheritedRepo?.previous_image, null);
+    assert.equal(inheritedRepo?.sync_interval_minutes, null);
+    await assert.rejects(
+      store.updateRepository('r2', { sync_interval_minutes: 1441 }),
+      (error: unknown) => error instanceof pg.DatabaseError && error.code === '23514',
+    );
     assert.deepEqual(
       (await store.getRepositoriesByIds(['r2', 'r', 'missing'])).map((row) => row.id),
       ['r', 'r2'],
@@ -95,6 +103,8 @@ test('PostgreSQL store round-trips records, enforces the instance lock and fails
     assert.deepEqual(await store.listUsers(), [{ id: 'u', username: 'tester', credential_version: 1 }]);
 
     const now = Date.now();
+    assert.equal(await store.hasPendingOrRecentJob('r', now), true, 'an old queued job suppresses another sync');
+    assert.equal(await store.hasPendingOrRecentJob('r2', now), false);
     await store.createJob({
       id: 'success',
       repo_id: 'r',
@@ -173,6 +183,10 @@ test('PostgreSQL store round-trips records, enforces the instance lock and fails
     assert.equal((await store.getUser('u'))?.credential_version, 2);
     assert.equal((await store.getRepository('r'))?.status, 'updating');
     assert.equal((await store.getJob('j'))?.status, 'running');
+    assert.equal(await store.hasPendingOrRecentJob('r', now), true, 'an old running job suppresses another sync');
+    await store.updateJob('j', { status: 'succeeded' });
+    assert.equal(await store.hasPendingOrRecentJob('r', now - 1001), true, 'a recent completed job counts');
+    assert.equal(await store.hasPendingOrRecentJob('r', now - 1000), false, 'a job exactly at the cutoff is due');
     await store.updateRepository('r', {});
     await store.updateJob('j', {});
 
@@ -277,8 +291,10 @@ test('migrations apply once, record versions, and reject unknown or renamed vers
         VALUES('legacy-job', 'legacy-repo', 'succeeded', 'initial', 100);
     `);
     const first = await openPostgresStore(database.url);
+    const legacyRepo = await first.getRepository('legacy-repo');
     const legacyJob = await first.getJob('legacy-job');
     await first.close();
+    assert.equal(legacyRepo?.sync_interval_minutes, null);
     assert.equal(legacyJob?.status, 'succeeded');
     assert.equal(legacyJob?.phase, null);
     const applied = await client.query('SELECT version, name FROM schema_migrations ORDER BY version');

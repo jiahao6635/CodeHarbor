@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import fastifyStatic from '@fastify/static';
 import type { FastifyInstance } from 'fastify';
 import type { AppContext } from '../http/context.js';
-import { authenticateHook } from '../http/guards.js';
+import { authenticateRepositoryHook } from '../http/guards.js';
 
 export const UI_PREFIX = '/ui';
 export const UI_ASSET_ROUTE = /^\/ui\/assets\//;
@@ -29,9 +29,10 @@ export function registerConsoleRoutes(app: FastifyInstance, ctx: AppContext): vo
   if (!uiDir) return;
   if (!existsSync(join(uiDir, 'index.html'))) throw new Error(`Console build not found in ${uiDir}`);
 
-  app.get('/api/v1/console', { onRequest: authenticateHook(ctx) }, async () => ({
+  app.get('/api/v1/console', { onRequest: authenticateRepositoryHook(ctx) }, async () => ({
     mcp_url: ctx.config.uiMcpUrl ?? null,
     public_mcp_disabled: ctx.config.publicMcpDisabled ?? false,
+    default_sync_interval_minutes: ctx.defaultSyncIntervalMinutes,
   }));
 
   app.register(

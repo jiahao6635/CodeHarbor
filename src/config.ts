@@ -49,6 +49,8 @@ export async function feishuConfig(env: NodeJS.ProcessEnv): Promise<FeishuConfig
   return { origin: url.origin, appId, appSecret, tenantKey, superAdminOpenId };
 }
 
+export const DEFAULT_SYNC_INTERVAL_MINUTES = 360;
+
 /** Read connection material without including it in error messages or logs. */
 export async function databaseUrl(env: NodeJS.ProcessEnv): Promise<string> {
   if (env.CODEHARBOR_DATABASE_URL_FILE && env.DATABASE_URL) throw new Error('Configure only one database URL source');

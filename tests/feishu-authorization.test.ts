@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -14,6 +14,7 @@ const origin = 'https://console.example.test';
 test('Feishu governs metadata, scoped source access and legacy key approval independently', async () => {
   const db = await openTestStore();
   const dataDir = await mkdtemp(join(tmpdir(), 'codeharbor-authz-'));
+  await writeFile(join(dataDir, 'index.html'), '<!doctype html><title>CodeHarbor Console</title>');
   const credentialKey = randomBytes(32);
   const cipher = new CredentialCipher(credentialKey);
   const { store } = db;
@@ -40,6 +41,7 @@ test('Feishu governs metadata, scoped source access and legacy key approval inde
   const app = createApp(
     {
       dataDir,
+      uiDir: dataDir,
       credentialKey,
       codeupEndpoint: 'https://codeup.example.test',
       codegraphBin: process.execPath,
@@ -144,6 +146,10 @@ test('Feishu governs metadata, scoped source access and legacy key approval inde
       headers.set('origin', origin);
       return fetch(new URL(path, base), { ...options, headers });
     };
+    assert.equal((await request('/api/v1/console')).status, 401);
+    const consoleConfig = await request('/api/v1/console', { headers: { cookie: member } });
+    assert.equal(consoleConfig.status, 200);
+    assert.equal((await consoleConfig.json()).default_sync_interval_minutes, 360);
     const listed = async (cookie: string, path = '/api/v1/repositories') => {
       const response = await request(path, { headers: { cookie } });
       assert.equal(response.status, 200);

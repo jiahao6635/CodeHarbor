@@ -107,6 +107,7 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     allowedHosts,
     writeUsers: ['alice'],
     codegraphBin: 'codegraph',
+    defaultSyncIntervalMinutes: 30,
   };
   app = createApp(config, {
     store: db.store,
@@ -353,6 +354,8 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     const repo = created.body.repository.repo_id as string;
     const job = created.body.job_id as string;
     assert.equal(created.body.repository.codeup_id, '11');
+    assert.equal(created.body.repository.sync_interval_minutes, null);
+    assert.equal(created.body.repository.effective_sync_interval_minutes, 30);
     assert.equal(created.body.repository.webhook_path, `/api/v1/hooks/codeup/${repo}`);
     assert.equal(created.body.webhook_path, created.body.repository.webhook_path);
     assert.equal((await request('GET', `/api/v1/jobs/${job}`, alice)).status, 200);
@@ -385,10 +388,12 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     const duplicate = await request('POST', '/api/v1/repositories', alice, {
       codeup_repository_id: '11',
       branch: 'main',
+      sync_interval_minutes: 5,
       authorize_automatic_sync: true,
     });
     assert.equal(duplicate.status, 200);
     assert.equal(duplicate.body.repository.repo_id, repo);
+    assert.equal(duplicate.body.repository.sync_interval_minutes, null);
 
     // A bootstrap read key has null scope and must not inherit every repository.
     allowedByToken['bob-pat'].add('11');
@@ -474,11 +479,24 @@ test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundarie
     assert.equal((await request('GET', `/api/v1/repositories/${repo}`, alice)).status, 200);
     offline = false;
 
+    for (const invalid of [0, 1441, 1.5, '5']) {
+      const response = await request('POST', '/api/v1/repositories', alice, {
+        codeup_repository_id: '22',
+        sync_interval_minutes: invalid,
+        authorize_automatic_sync: true,
+      });
+      assert.equal(response.status, 400);
+    }
     const second = await request('POST', '/api/v1/repositories', alice, {
       codeup_repository_id: '22',
+      sync_interval_minutes: 5,
       authorize_automatic_sync: true,
     });
     assert.equal(second.status, 202);
+    const customSchedule = await request('GET', `/api/v1/repositories/${second.body.repository.repo_id}`, alice);
+    assert.equal(customSchedule.status, 200);
+    assert.equal(customSchedule.body.sync_interval_minutes, 5);
+    assert.equal(customSchedule.body.effective_sync_interval_minutes, 5);
     const noScope = await request('POST', '/api/v1/api-keys', alice, { scope: 'read', repos: null, expires_in: 3600 });
     assert.equal(noScope.status, 400);
     assert.equal(noScope.body.error, 'REPOSITORY_SCOPE_REQUIRED');
@@ -1010,6 +1028,21 @@ test('console build is served under /ui with client-side routing fallback and st
       assert.doesNotMatch(await traversal.text(), /secret/, path);
     }
     assert.equal((await fetch(`${base}/api/v1/console`)).status, 401);
+    const consoleKey = createAccessKey();
+    await db.store.createUser({ id: 'console', username: 'console', credential: 'unused', credential_version: 1 });
+    await db.store.createKey({
+      ...consoleKey,
+      owner: 'console',
+      scope: 'read',
+      repos: null,
+      expires_at: null,
+      revoked: 0,
+    });
+    const consoleConfig = await fetch(`${base}/api/v1/console`, {
+      headers: { authorization: `Bearer ${consoleKey.token}` },
+    });
+    assert.equal(consoleConfig.status, 200);
+    assert.equal((await consoleConfig.json()).default_sync_interval_minutes, 360);
     assert.equal((await fetch(`${base}/health/live`)).headers.get('content-security-policy'), null);
     assert.equal((await fetch(`${base}/uix`)).status, 404);
     assert.equal((await fetch(`${base}/ui/`, { headers: { origin: 'https://untrusted.example' } })).status, 403);
