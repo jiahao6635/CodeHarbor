@@ -21,7 +21,7 @@ type Row = Record<string, unknown>;
 type Queryable = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;
 
 const REPOSITORY_COLUMNS =
-  'id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha AS "commit", previous_image, previous_commit, indexed_at, status, error';
+  'id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, sync_interval_minutes, hook_hash, path, commit_sha AS "commit", previous_image, previous_commit, indexed_at, status, error';
 
 const REPOSITORY_UPDATE_COLUMNS: Record<string, string> = {
   name: 'name',
@@ -29,6 +29,7 @@ const REPOSITORY_UPDATE_COLUMNS: Record<string, string> = {
   owner: 'owner',
   sync_owner: 'sync_owner',
   sync_credential_version: 'sync_credential_version',
+  sync_interval_minutes: 'sync_interval_minutes',
   hook_hash: 'hook_hash',
   path: 'path',
   commit: 'commit_sha',
@@ -218,8 +219,8 @@ function access(db: Queryable, guard: () => void): StoreAccess {
 
     async createRepository(repo) {
       await q(
-        `INSERT INTO repositories(id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, hook_hash, path, commit_sha, previous_image, previous_commit, indexed_at, status, error)
-         VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+        `INSERT INTO repositories(id, codeup_id, name, branch, owner, sync_owner, sync_credential_version, sync_interval_minutes, hook_hash, path, commit_sha, previous_image, previous_commit, indexed_at, status, error)
+         VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
         [
           repo.id,
           repo.codeup_id,
@@ -228,6 +229,7 @@ function access(db: Queryable, guard: () => void): StoreAccess {
           repo.owner,
           repo.sync_owner,
           repo.sync_credential_version,
+          repo.sync_interval_minutes ?? null,
           repo.hook_hash,
           repo.path,
           repo.commit,
@@ -294,6 +296,14 @@ function access(db: Queryable, guard: () => void): StoreAccess {
       many(jobRowSchema.parse, 'SELECT * FROM jobs WHERE repo_id = $1 ORDER BY created_at, id', [repoId]),
     listPendingJobs: () =>
       many(jobRowSchema.parse, "SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at, id"),
+    async hasPendingOrRecentJob(repoId, since) {
+      const result = await q(
+        `SELECT EXISTS (SELECT 1 FROM jobs WHERE repo_id = $1 AND created_at > $2)
+             OR EXISTS (SELECT 1 FROM jobs WHERE repo_id = $1 AND status IN ('queued', 'running')) AS found`,
+        [repoId, since],
+      );
+      return result.rows[0].found === true;
+    },
     async updateJob(id, patch) {
       const entries = Object.entries(patch).filter(
         ([key, value]) => JOB_UPDATE_COLUMNS.has(key) && value !== undefined,

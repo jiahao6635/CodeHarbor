@@ -25,6 +25,7 @@ export interface Me {
 export interface ConsoleConfig {
   mcp_url: string | null;
   public_mcp_disabled: boolean;
+  default_sync_interval_minutes?: number;
 }
 
 export interface AdminSystemPerformance {
@@ -66,6 +67,8 @@ export interface Repository {
   codeup_id: string;
   name: string;
   branch: string;
+  sync_interval_minutes: number | null;
+  effective_sync_interval_minutes: number;
   status: RepositoryStatus;
   indexed_commit: string | null;
   indexed_at: string | null;

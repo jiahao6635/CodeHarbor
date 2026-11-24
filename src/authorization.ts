@@ -277,7 +277,7 @@ export class Authorization {
   }
 
   /**
-   * Runs every reconcile round: re-verifies stale cached permissions, seeds
+   * Runs on the background maintenance timer: re-verifies stale cached permissions, seeds
    * missing (user, repository) pairs for users holding self-scoped keys, and
    * applies audit retention. Codeup outages end the round early; nothing is
    * granted without a successful check.

@@ -5,6 +5,7 @@ import type { CredentialCipher } from './auth.js';
 import { checkCloneAccess } from './clone-access.js';
 import type { GraphClient } from './codegraph.js';
 import { type CodeupClient, CodeupError, hasRepositoryRole } from './codeup.js';
+import { DEFAULT_SYNC_INTERVAL_MINUTES } from './config.js';
 import {
   buildIndexCandidate,
   getRemoteHead,
@@ -15,7 +16,10 @@ import {
   pruneIndexVersions,
 } from './indexer.js';
 import type { Logger } from './logger.js';
-import type { JobRecord, StoreBackend } from './store.js';
+import type { JobRecord, RepositoryRecord, StoreAccess, StoreBackend } from './store.js';
+
+const MINUTE_MS = 60_000;
+const MAINTENANCE_INTERVAL_MS = 15 * MINUTE_MS;
 
 export type WorkerOptions = {
   store: StoreBackend;
@@ -27,7 +31,7 @@ export type WorkerOptions = {
   codegraphBin?: string;
   reconcileIntervalMs?: number;
   logger?: Logger;
-  /** Background hooks run every reconcile round before jobs are enqueued. */
+  /** Background authorization and retention work runs on its own interval. */
   maintenance?: () => Promise<void>;
   /** Injected only by tests. */
   build?: (request: IndexRequest) => Promise<IndexCandidate>;
@@ -41,12 +45,17 @@ export type WorkerOptions = {
 export class IndexWorker {
   private running = false;
   private active: Promise<void> | undefined;
-  private timer: NodeJS.Timeout | undefined;
+  private reconcileTimer: NodeJS.Timeout | undefined;
+  private reconciling: Promise<void> | undefined;
+  private maintenanceTimer: NodeJS.Timeout | undefined;
+  private maintaining: Promise<void> | undefined;
 
   private readonly log: Pick<Logger, 'error' | 'warn' | 'info'>;
+  private readonly reconcileIntervalMs: number;
 
   constructor(private readonly options: WorkerOptions) {
     this.log = options.logger ?? { error() {}, warn() {}, info() {} };
+    this.reconcileIntervalMs = options.reconcileIntervalMs ?? DEFAULT_SYNC_INTERVAL_MINUTES * MINUTE_MS;
   }
 
   async start(): Promise<void> {
@@ -69,34 +78,54 @@ export class IndexWorker {
       this.running = false;
       throw error;
     }
-    const interval = this.options.reconcileIntervalMs ?? 15 * 60_000;
-    if (interval > 0) {
-      this.timer = setInterval(() => {
-        void this.reconcile().catch((error: unknown) => this.log.error({ err: error }, 'Index reconciliation failed'));
-      }, interval);
-      this.timer.unref();
+    if (this.reconcileIntervalMs > 0) {
+      this.reconcileTimer = setInterval(
+        () => {
+          this.reconciling ??= this.reconcile()
+            .catch((error: unknown) => this.log.error({ err: error }, 'Index reconciliation failed'))
+            .finally(() => {
+              this.reconciling = undefined;
+            });
+        },
+        Math.min(this.reconcileIntervalMs, MINUTE_MS),
+      );
+      this.reconcileTimer.unref();
+
+      if (this.options.maintenance) {
+        this.maintenanceTimer = setInterval(() => {
+          this.maintaining ??= this.maintain().finally(() => {
+            this.maintaining = undefined;
+          });
+        }, MAINTENANCE_INTERVAL_MS);
+        this.maintenanceTimer.unref();
+      }
     }
     this.kick();
   }
 
-  private async reconcile(): Promise<void> {
+  private async maintain(): Promise<void> {
     try {
       await this.options.maintenance?.();
     } catch (error) {
       this.log.error({ err: error }, 'Index maintenance failed');
     }
+  }
+
+  private async reconcile(now = Date.now()): Promise<void> {
     for (const repo of await this.options.store.listRepositories()) {
       // A timer cannot renew consent; wait for the explicit sync-credential authorization flow.
       if (repo.status !== 'disabled' && repo.status !== 'credential_required')
-        await this.enqueueJob(repo.id, 'reconcile', true);
+        await this.enqueueJob(repo.id, 'reconcile', now);
     }
   }
 
   async stop(): Promise<void> {
     this.running = false;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
-    await this.active;
+    clearInterval(this.reconcileTimer);
+    clearInterval(this.maintenanceTimer);
+    this.reconcileTimer = undefined;
+    this.maintenanceTimer = undefined;
+    await Promise.all([this.active, this.reconciling]);
   }
 
   async enqueue(repoId: string, reason: string): Promise<JobRecord> {
@@ -105,22 +134,28 @@ export class IndexWorker {
     return job;
   }
 
-  private async enqueueJob(repoId: string, reason: string, reconcile = false): Promise<JobRecord | null> {
+  private async periodicJobDue(tx: StoreAccess, repo: RepositoryRecord, now: number): Promise<boolean> {
+    if (repo.status === 'credential_required') return false;
+    const interval =
+      repo.sync_interval_minutes === null ? this.reconcileIntervalMs : repo.sync_interval_minutes * MINUTE_MS;
+    // Compare minute buckets so a job enqueued just after a tick is due on the corresponding later tick.
+    const bucket = interval % MINUTE_MS === 0 ? MINUTE_MS : 1;
+    const since = Math.floor(now / bucket) * bucket - interval + bucket - 1;
+    return !(await tx.hasPendingOrRecentJob(repo.id, since));
+  }
+
+  private async enqueueJob(repoId: string, reason: string, reconcileAt?: number): Promise<JobRecord | null> {
     const store = this.options.store;
     const job = await store.transaction(async (tx) => {
-      // Lock the fresh row so PAT rotation cannot invalidate it between this check and the write.
-      const repo = await tx.getRepository(repoId, { forUpdate: reconcile });
-      if (!repo || repo.status === 'disabled' || (reconcile && repo.status === 'credential_required')) return null;
-      const jobs = await tx.listJobs(repoId);
+      // Serialize enqueue decisions for this repository, including credential and queue checks.
+      const repo = await tx.getRepository(repoId, { forUpdate: true });
+      if (!repo || repo.status === 'disabled') return null;
+      if (reconcileAt !== undefined && !(await this.periodicJobDue(tx, repo, reconcileAt))) return null;
+      const jobs = reconcileAt === undefined ? await tx.listJobs(repoId) : [];
       const queued = jobs.find((item) => item.status === 'queued');
       const preserveDeletion = repo.status === 'branch_deleted' && jobs.some((item) => item.status === 'running');
-      if (queued) {
-        if (repo.status === 'branch_deleted' && !preserveDeletion)
-          await tx.updateRepository(repoId, { status: repo.path ? 'updating' : 'pending', error: null });
-        return queued;
-      }
       const now = Date.now();
-      const created: JobRecord = {
+      const next: JobRecord = queued ?? {
         id: randomUUID(),
         repo_id: repoId,
         status: 'queued',
@@ -132,10 +167,10 @@ export class IndexWorker {
         build_duration_ms: null,
         error: null,
       };
-      await tx.createJob(created);
-      if (!preserveDeletion)
+      if (!queued) await tx.createJob(next);
+      if (!preserveDeletion && (!queued || repo.status === 'branch_deleted'))
         await tx.updateRepository(repoId, { status: repo.path ? 'updating' : 'pending', error: null });
-      return created;
+      return next;
     });
     if (job) this.kick();
     return job;

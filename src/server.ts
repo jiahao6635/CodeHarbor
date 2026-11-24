@@ -9,6 +9,7 @@ import { BrowserSessionService } from './browser-auth.js';
 import { checkCloneAccess } from './clone-access.js';
 import { CodeGraphClient, type GraphClient } from './codegraph.js';
 import { CodeupClient } from './codeup.js';
+import { DEFAULT_SYNC_INTERVAL_MINUTES } from './config.js';
 import type { AppConfig, AppContext, AuditEvent } from './http/context.js';
 import { toErrorReply } from './http/errors.js';
 import { HttpMetrics } from './http/metrics.js';
@@ -68,6 +69,7 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
   }
   const accessTtlMs = config.accessTtlMs ?? 6 * 3_600_000;
   if (!Number.isSafeInteger(accessTtlMs) || accessTtlMs < 60_000) throw new Error('Invalid access TTL');
+  const defaultSyncIntervalMinutes = config.defaultSyncIntervalMinutes ?? DEFAULT_SYNC_INTERVAL_MINUTES;
 
   const { store } = deps;
   const cipher = new CredentialCipher(config.credentialKey);
@@ -97,7 +99,7 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
       dataDir: config.dataDir,
       allowedGitHosts: config.allowedGitHosts,
       codegraphBin: config.codegraphBin,
-      reconcileIntervalMs: config.reconcileMs,
+      reconcileIntervalMs: defaultSyncIntervalMinutes * 60_000,
       logger: deps.logger,
       maintenance: () => authorization.maintenance(),
       ...(imagePipeline
@@ -113,6 +115,7 @@ export function createApp(config: AppConfig, deps: AppDependencies) {
 
   const ctx: AppContext = {
     config,
+    defaultSyncIntervalMinutes,
     store,
     cipher,
     codeup,

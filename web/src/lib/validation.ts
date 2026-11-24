@@ -26,6 +26,16 @@ export const codeupRepositoryId = z
   .trim()
   .regex(/^\d{1,30}$/, '云效仓库 ID 必须是数字');
 
+export const MIN_SYNC_INTERVAL_MINUTES = 1;
+export const MAX_SYNC_INTERVAL_MINUTES = 1440;
+const SYNC_INTERVAL_ERROR = '请输入 1–1440 之间的整数';
+export const repositorySyncInterval = z
+  .number({ error: SYNC_INTERVAL_ERROR })
+  .int(SYNC_INTERVAL_ERROR)
+  .min(MIN_SYNC_INTERVAL_MINUTES, SYNC_INTERVAL_ERROR)
+  .max(MAX_SYNC_INTERVAL_MINUTES, SYNC_INTERVAL_ERROR)
+  .nullable();
+
 export const identifier = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/, '不是有效的仓库 ID');
 
 export const pat = z

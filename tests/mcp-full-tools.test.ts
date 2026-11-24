@@ -180,6 +180,7 @@ async function fixture(
     owner: 'alice',
     sync_owner: 'alice',
     sync_credential_version: 1,
+    sync_interval_minutes: null,
     hook_hash: 'fixture-hook',
     path: REPO_PATH,
     commit: COMMIT,

@@ -561,18 +561,70 @@ test('new PAT version requires explicit authorization before use for synchroniza
   }
 });
 
+test('reconciliation applies each repository interval to persisted job history without stacking pending work', async (t) => {
+  const f = await fixture();
+  const minute = 60_000;
+  const start = Math.floor(Date.now() / minute) * minute;
+  let now = start;
+  t.mock.method(Date, 'now', () => now);
+  const worker = new IndexWorker({
+    ...f,
+    dataDir: '/unused',
+    allowedGitHosts: ['git.example.com'],
+    reconcileIntervalMs: 12 * minute,
+  });
+  const reconcile = async (minutes: number) => {
+    now = start + minutes * minute;
+    await (worker as unknown as { reconcile(): Promise<void> }).reconcile();
+  };
+  const history = async (repoId: string) => (await f.store.listJobs(repoId)).map((job) => job.reason);
+  try {
+    const original = await f.store.getRepository('repo_1');
+    assert.ok(original);
+    await f.store.createRepository({ ...original, id: 'short_repo', codeup_id: '456', sync_interval_minutes: 5 });
+    await f.store.createRepository({ ...original, id: 'busy_repo', codeup_id: '789', sync_interval_minutes: 5 });
+    for (const repoId of ['repo_1', 'short_repo', 'busy_repo']) {
+      await f.store.createJob({
+        id: `${repoId}-previous-job`,
+        repo_id: repoId,
+        reason: 'initial',
+        status: repoId === 'busy_repo' ? 'running' : 'succeeded',
+        created_at: repoId === 'busy_repo' ? start - 60 * minute : start + 1,
+        error: null,
+      });
+    }
+
+    await reconcile(4);
+    assert.deepEqual(await history('short_repo'), ['initial']);
+    await reconcile(5);
+    assert.deepEqual(await history('short_repo'), ['initial', 'reconcile']);
+    const firstCheck = (await f.store.listJobs('short_repo')).at(-1);
+    assert.ok(firstCheck);
+    await f.store.updateJob(firstCheck.id, { status: 'succeeded', finished_at: now });
+    await reconcile(9);
+    assert.deepEqual(await history('short_repo'), ['initial', 'reconcile']);
+    await reconcile(10);
+    assert.deepEqual(await history('short_repo'), ['initial', 'reconcile', 'reconcile']);
+    await reconcile(11);
+    assert.deepEqual(await history('repo_1'), ['initial']);
+    await reconcile(12);
+    assert.deepEqual(await history('repo_1'), ['initial', 'reconcile']);
+    assert.deepEqual(await history('short_repo'), ['initial', 'reconcile', 'reconcile']);
+    assert.deepEqual(await history('busy_repo'), ['initial']);
+  } finally {
+    await worker.stop();
+    await f.close();
+  }
+});
+
 test('reconciliation skips repositories awaiting credentials and resumes after explicit authorization', async () => {
   const f = await fixture();
-  let maintenanceCalls = 0;
   let builds = 0;
   const worker = new IndexWorker({
     ...f,
     dataDir: '/unused',
     allowedGitHosts: ['git.example.com'],
     reconcileIntervalMs: 0,
-    maintenance: async () => {
-      maintenanceCalls++;
-    },
     head: async () => 'a'.repeat(40),
     healthy: async () => true,
     build: async () => {
@@ -598,7 +650,6 @@ test('reconciliation skips repositories awaiting credentials and resumes after e
     const reconcile = () => (worker as unknown as { reconcile(): Promise<void> }).reconcile();
     await reconcile();
     await reconcile();
-    assert.equal(maintenanceCalls, 2);
     assert.deepEqual(await f.store.getRepository('repo_1'), awaiting);
     assert.deepEqual(await f.store.listJobs('repo_1'), []);
     assert.deepEqual(await f.store.listJobs('disabled_repo'), []);

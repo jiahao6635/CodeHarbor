@@ -1,7 +1,7 @@
 // Keep this contract aligned with the handlers in src/routes/*. MCP RPC is described
 // at the transport boundary; its tool schemas are provided by tools/list.
 import type { StaticDocumentSpec } from '@fastify/swagger';
-import { JOB_PHASES } from './store.js';
+import { JOB_PHASES, MAX_SYNC_INTERVAL_MINUTES, MIN_SYNC_INTERVAL_MINUTES } from './store.js';
 
 type OpenApiDocument = Extract<StaticDocumentSpec['document'], { openapi: string }>;
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` });
@@ -57,6 +57,13 @@ const jobId = object({ job_id: { type: 'string' } }, ['job_id']);
 const dependencyStatus = { type: 'string', enum: ['ok', 'unavailable'] };
 const nonnegativeNumber = { type: 'number', minimum: 0 };
 const nullableNumber = { ...nonnegativeNumber, nullable: true };
+const syncInterval = { type: 'integer', minimum: MIN_SYNC_INTERVAL_MINUTES, maximum: MAX_SYNC_INTERVAL_MINUTES };
+const repositorySyncInterval = {
+  ...syncInterval,
+  nullable: true,
+  description: '定时检查间隔（分钟）。null 表示继承全局默认。',
+};
+const effectiveSyncInterval = { ...syncInterval, description: '仓库实际使用的定时检查间隔（分钟）。' };
 
 export const openApiDocument = {
   openapi: '3.0.3',
@@ -166,6 +173,27 @@ export const openApiDocument = {
         responses: { '200': ok('当前身份。', ref('Me')), ...common },
       },
     },
+    '/api/v1/console': {
+      get: {
+        tags: ['运维'],
+        summary: '控制台配置',
+        description: '启用控制台时可用。',
+        responses: {
+          '200': ok(
+            '控制台配置。',
+            object(
+              {
+                mcp_url: { type: 'string', nullable: true },
+                public_mcp_disabled: { type: 'boolean' },
+                default_sync_interval_minutes: { ...syncInterval, description: '全局默认定时检查间隔（分钟）。' },
+              },
+              ['mcp_url', 'public_mcp_disabled', 'default_sync_interval_minutes'],
+            ),
+          ),
+          ...common,
+        },
+      },
+    },
     '/api/v1/codeup/repositories': {
       get: {
         tags: ['云效仓库'],
@@ -262,6 +290,7 @@ export const openApiDocument = {
                 ],
               },
               branch: { type: 'string', minLength: 1, maxLength: 255, description: '省略时使用云效默认分支。' },
+              sync_interval_minutes: repositorySyncInterval,
               authorize_automatic_sync: {
                 type: 'boolean',
                 enum: [true],
@@ -772,6 +801,8 @@ export const openApiDocument = {
           codeup_id: { type: 'string', description: '云效仓库数字 ID。' },
           name: { type: 'string' },
           branch: { type: 'string' },
+          sync_interval_minutes: repositorySyncInterval,
+          effective_sync_interval_minutes: effectiveSyncInterval,
           status: { type: 'string' },
           indexed_commit: { type: 'string', nullable: true },
           indexed_at: { type: 'string', format: 'date-time', nullable: true },
@@ -786,6 +817,8 @@ export const openApiDocument = {
           'codeup_id',
           'name',
           'branch',
+          'sync_interval_minutes',
+          'effective_sync_interval_minutes',
           'status',
           'indexed_commit',
           'indexed_at',
@@ -800,6 +833,8 @@ export const openApiDocument = {
           codeup_id: { type: 'string' },
           name: { type: 'string' },
           branch: { type: 'string' },
+          sync_interval_minutes: repositorySyncInterval,
+          effective_sync_interval_minutes: effectiveSyncInterval,
           status: { type: 'string' },
           indexed_commit: { type: 'string', nullable: true },
           indexed_at: { type: 'string', format: 'date-time', nullable: true },
@@ -814,6 +849,8 @@ export const openApiDocument = {
           'codeup_id',
           'name',
           'branch',
+          'sync_interval_minutes',
+          'effective_sync_interval_minutes',
           'status',
           'indexed_commit',
           'indexed_at',

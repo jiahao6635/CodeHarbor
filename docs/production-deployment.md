@@ -33,6 +33,7 @@
 - `CODEHARBOR_TRUST_PROXY`：模板固定为 `true`，Nginx 传递 `X-Forwarded-For`，应用按真实客户端地址做认证失败限流；Nginx 层另有 `/mcp` 20r/s、`/api/v1/auth/` 1r/s 的每地址限流。
 - `CODEHARBOR_DOCS_ENABLED`：默认 `false`；Nginx 模板同时对 `/docs`、`/openapi.json` 返回 404。
 - `CODEHARBOR_ACCESS_TTL_MS` 控制云效权限缓存，实际最长 5 分钟。持久化审计由 `CODEHARBOR_AUDIT_RETENTION_DAYS` 控制，默认保留 180 天。
+- `CODEHARBOR_DEFAULT_SYNC_INTERVAL_MINUTES` 设置定时检查的全局默认间隔，默认 360 分钟（6 小时），接受 1 到 1440 的整数。修改后按部署方式重新创建应用容器或重启应用。已有仓库和接入时选择全局默认的仓库会使用新默认值。接入时选了独立周期的仓库使用自己的配置。
 - `CODEHARBOR_DATABASE_URL_FILE`：保存 PostgreSQL URL 的文件路径。也支持直接使用 `DATABASE_URL`，两者任选其一。生产 URL 须指定一次 `sslmode=verify-full` 或 `sslmode=disable`，可另外指定 `application_name`。
 - `CODEHARBOR_VAULT_ADDR`、`CODEHARBOR_VAULT_TRANSIT_KEY`、`CODEHARBOR_VAULT_TOKEN_FILE`、`CODEHARBOR_VAULT_WRAPPED_KEY_FILE`：参见 [Vault Transit 指南](vault-transit.md)。
 - `CODEHARBOR_METRICS_TOKEN_FILE`、`CODEHARBOR_TLS_CERT`、`CODEHARBOR_TLS_KEY`：分别指向监控 token、TLS 证书和私钥文件。
@@ -141,6 +142,8 @@ docker compose -f deploy/compose.yaml -f deploy/compose.postgres.yaml -f deploy/
 ## 数据库 schema 迁移
 
 schema 由仓库内 `migrations/NNNN_name.sql` 管理，服务启动时在持有实例锁的会话中按序执行未应用的版本，并记入 `schema_migrations(version, name, applied_at)`；每个版本在独立事务中执行，失败整体回滚且服务拒绝启动。数据库中的版本高于当前构建、或同一版本名称不一致时也会拒绝启动，避免误用旧镜像连接新库。升级流程：先备份数据库，再部署新版本让其自动迁移；回滚到旧版本前必须恢复备份，迁移本身不提供 down 脚本。本次增量迁移保留已建仓库、历史任务、加密 PAT 和 Key 哈希，并添加飞书账号、会话和任务阶段。升级前制定旧 Key 切换窗口。升级后旧 Key 需由持有人先绑定原云效账号，再由超级管理员复核并批准已明确限定仓库且仍有效的 Key。无范围 Key 需要重新创建。
+
+迁移 `0005_repository_sync_interval.sql` 添加仓库定时检查配置。已有仓库自动继承全局默认。
 
 ## 监控与恢复
 
