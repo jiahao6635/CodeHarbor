@@ -14,6 +14,7 @@ import { useAbility } from '@/auth/session';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { CopyButton } from '@/components/copy-button';
 import { ErrorNotice } from '@/components/error-notice';
+import { IndexBuildProgress } from '@/components/index-build-progress';
 import { PageHeader } from '@/components/page-header';
 import { RelativeTime } from '@/components/relative-time';
 import { JobStatusBadge, jobReasonLabel, RepositoryStatusBadge } from '@/components/status-badge';
@@ -167,7 +168,7 @@ function JobHistory({ repoId }: { repoId: string }) {
 
 export default function RepositoryDetailPage() {
   const { id = '' } = useParams();
-  const { me, canWrite, isAdmin } = useAbility();
+  const { isAdmin } = useAbility();
   const query = useRepository(id);
   const authorize = useAuthorizeSyncCredential();
 
@@ -198,7 +199,7 @@ export default function RepositoryDetailPage() {
         title={repo.name}
         actions={
           <>
-            {canWrite ? <SyncButton repo={repo} size="md" /> : null}
+            {repo.can_manage ? <SyncButton repo={repo} size="md" /> : null}
             {isAdmin ? <AdminActions repo={repo} /> : null}
           </>
         }
@@ -207,7 +208,7 @@ export default function RepositoryDetailPage() {
       {repo.status === 'credential_required' ? (
         <Alert tone="warning" title="需要重新授权自动同步" className="mb-4">
           <p>{explanation}</p>
-          {canWrite ? (
+          {repo.can_authorize_sync ? (
             <div className="mt-2">
               <Button
                 size="sm"
@@ -222,9 +223,7 @@ export default function RepositoryDetailPage() {
                 <ArrowsClockwise aria-hidden="true" />
                 用我当前的 PAT 重新授权
               </Button>
-              <p className="mt-1 text-xs">
-                仅仓库接入者或当前同步凭证持有人（{me?.username}）可以执行；其他人会收到「资源不存在」。
-              </p>
+              <p className="mt-1 text-xs">请确认允许使用你当前的 PAT 自动同步。</p>
             </div>
           ) : null}
         </Alert>
@@ -244,6 +243,12 @@ export default function RepositoryDetailPage() {
             ) : null}
           </div>
         </CardHeader>
+        <div className="mb-4">
+          <IndexBuildProgress
+            repoId={repo.repo_id}
+            repositoryActive={['indexing', 'pending', 'updating'].includes(repo.status)}
+          />
+        </div>
         <dl className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
           <Definition term="CodeHarbor 仓库 ID" mono>
             {repo.repo_id}

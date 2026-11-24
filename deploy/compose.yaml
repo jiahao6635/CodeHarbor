@@ -19,7 +19,11 @@ services:
       CODEHARBOR_GIT_HOSTS: ${CODEHARBOR_GIT_HOSTS:?set CODEHARBOR_GIT_HOSTS}
       CODEHARBOR_ALLOWED_HOSTS: ${CODEHARBOR_ALLOWED_HOSTS:?set CODEHARBOR_ALLOWED_HOSTS}
       CODEHARBOR_ALLOWED_ORIGINS: ${CODEHARBOR_ALLOWED_ORIGINS:-}
-      CODEHARBOR_WRITE_USERS: ${CODEHARBOR_WRITE_USERS:-}
+      CODEHARBOR_PUBLIC_ORIGIN: ${CODEHARBOR_PUBLIC_ORIGIN:?set CODEHARBOR_PUBLIC_ORIGIN}
+      CODEHARBOR_FEISHU_APP_ID: ${CODEHARBOR_FEISHU_APP_ID:?set CODEHARBOR_FEISHU_APP_ID}
+      CODEHARBOR_FEISHU_APP_SECRET_FILE: /run/secrets/feishu_app_secret
+      CODEHARBOR_FEISHU_TENANT_KEY: ${CODEHARBOR_FEISHU_TENANT_KEY:?set CODEHARBOR_FEISHU_TENANT_KEY}
+      CODEHARBOR_FEISHU_SUPER_ADMIN_OPEN_ID: ${CODEHARBOR_FEISHU_SUPER_ADMIN_OPEN_ID:?set CODEHARBOR_FEISHU_SUPER_ADMIN_OPEN_ID}
       CODEHARBOR_TRUST_PROXY: 'true'
       CODEHARBOR_DOCS_ENABLED: ${CODEHARBOR_DOCS_ENABLED:-false}
       CODEHARBOR_UI_ENABLED: ${CODEHARBOR_UI_ENABLED:-true}
@@ -38,7 +42,7 @@ services:
       - codeharbor_data:/data
     tmpfs:
       - /tmp:rw,exec,nosuid,nodev,size=512m,mode=1777
-    secrets: [database_url, vault_token, wrapped_key, metrics_token]
+    secrets: [database_url, vault_token, wrapped_key, metrics_token, feishu_app_secret]
     networks: [backend]
   nginx:
     image: ${CODEHARBOR_NGINX_IMAGE:?set an approved immutable nginx image reference}
@@ -64,3 +68,5 @@ secrets:
     file: ${CODEHARBOR_VAULT_WRAPPED_KEY_FILE:?set CODEHARBOR_VAULT_WRAPPED_KEY_FILE}
   metrics_token:
     file: ${CODEHARBOR_METRICS_TOKEN_FILE:?set CODEHARBOR_METRICS_TOKEN_FILE}
+  feishu_app_secret:
+    file: ${CODEHARBOR_FEISHU_APP_SECRET_FILE:?set CODEHARBOR_FEISHU_APP_SECRET_FILE}

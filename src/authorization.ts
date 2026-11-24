@@ -2,7 +2,8 @@ import type { CredentialCipher } from './auth.js';
 import { hashAccessKey } from './auth.js';
 import { type CodeupClient, CodeupError, hasRepositoryRole } from './codeup.js';
 import { fail } from './http/errors.js';
-import type { AccessRecord, KeyRecord, RepositoryRecord, StoreBackend } from './store.js';
+import type { IndexRequest } from './indexer.js';
+import type { AccessRecord, AccountRecord, KeyRecord, RepositoryRecord, StoreBackend, UserRecord } from './store.js';
 
 export type Principal = KeyRecord;
 
@@ -13,12 +14,21 @@ export type AuthorizationOptions = {
   writeUsers: string[];
   accessTtlMs: number;
   auditRetentionDays: number;
+  enforceFeishu?: boolean;
+  dataDir?: string;
+  allowedGitHosts?: string[];
+  probe?: (request: IndexRequest, signal?: AbortSignal) => Promise<boolean>;
 };
 
 const BEARER = /^Bearer (ch_[A-Za-z0-9_-]{43})$/;
 const MAINTENANCE_BUDGET = 200;
 /** Bounded on-demand verification keeps listing cost independent of repository count. */
 const LIST_VERIFY_BUDGET = 20;
+export const MAX_CODEUP_ACCESS_AGE_MS = 5 * 60_000;
+const MAX_CODEUP_ACCESS_ENTRIES = 16_384;
+const CODEUP_LIST_CONCURRENCY = 8;
+const cloudAccessKey = (user: UserRecord, repo: RepositoryRecord, source: boolean) =>
+  JSON.stringify([user.id, user.credential_version, repo.id, repo.codeup_id, repo.branch, source]);
 
 export function bearerToken(authorization: string): string | null {
   return BEARER.exec(authorization)?.[1] ?? null;
@@ -43,35 +53,55 @@ export function createMutex(): <T>(fn: () => Promise<T>) => Promise<T> {
 }
 
 const keyActive = (key: KeyRecord, now: number) => !key.revoked && (key.expires_at === null || key.expires_at > now);
+export const canManageRepository = (owner: string, repo: RepositoryRecord) =>
+  repo.owner === owner || repo.sync_owner === owner;
+
+type KeyOwner = { account: AccountRecord; user: UserRecord };
 
 export class Authorization {
   private readonly store: StoreBackend;
+  private readonly cloudAccessCache = new Map<string, { checkedAt: number; allowed: boolean }>();
   readonly mutate = createMutex();
+  readonly enforceFeishu: boolean;
 
   constructor(private readonly options: AuthorizationOptions) {
     this.store = options.store;
+    this.enforceFeishu = options.enforceFeishu ?? false;
   }
 
   async authenticateBearer(authorization: string): Promise<Principal | null> {
     const token = bearerToken(authorization);
     if (!token) return null;
     const key = await this.store.getKey(hashAccessKey(token));
-    if (!key || !keyActive(key, Date.now()) || !(await this.store.getUser(key.owner))) return null;
+    if (!key || !(await this.isActiveKey(key))) return null;
     return key;
   }
 
+  async isActiveKey(key: KeyRecord): Promise<boolean> {
+    if (!keyActive(key, Date.now())) return false;
+    return this.enforceFeishu ? !!(await this.keyOwner(key)) : !!(await this.store.getUser(key.owner));
+  }
+
+  private async keyOwner(key: KeyRecord): Promise<KeyOwner | null> {
+    if (key.legacy_pending || !key.repos?.length) return null;
+    const account = await this.store.getAccountByCodeupId(key.owner);
+    if (account?.status !== 'active') return null;
+    const user = await this.store.getUser(key.owner);
+    return user ? { account, user } : null;
+  }
+
   isWrite(key: Principal): boolean {
-    return key.scope === 'write' && this.options.writeUsers.includes(key.owner);
+    return key.scope === 'write' && (this.enforceFeishu || this.options.writeUsers.includes(key.owner));
   }
 
   /** Platform administrator: unrestricted write key held by a configured user. */
   isAdmin(key: Principal): boolean {
-    return key.repos === null && this.isWrite(key);
+    return !this.enforceFeishu && key.repos === null && this.isWrite(key);
   }
 
   /** Self-scoped read key: visibility follows the owner's live Codeup permissions. */
   isSelfScoped(key: Principal): boolean {
-    return key.repos === null && key.scope === 'read';
+    return !this.enforceFeishu && key.repos === null && key.scope === 'read';
   }
 
   requireWrite(key: Principal): void {
@@ -81,6 +111,104 @@ export class Authorization {
   requireAdmin(key: Principal): void {
     this.requireWrite(key);
     if (!this.isAdmin(key)) fail(403, 'FORBIDDEN');
+  }
+
+  private freshProof(key: string) {
+    const proof = this.cloudAccessCache.get(key);
+    const ttl = Math.min(this.options.accessTtlMs, MAX_CODEUP_ACCESS_AGE_MS);
+    return proof && proof.checkedAt + ttl > performance.now() ? proof : undefined;
+  }
+
+  hasFreshCloudAccess(user: UserRecord, repo: RepositoryRecord, source: boolean): boolean {
+    return this.freshProof(cloudAccessKey(user, repo, source))?.allowed === true;
+  }
+
+  async checkCloudAccess(
+    user: UserRecord,
+    repo: RepositoryRecord,
+    source: boolean,
+    signal?: AbortSignal,
+    fresh = false,
+  ): Promise<boolean> {
+    signal?.throwIfAborted();
+    const cacheKey = cloudAccessKey(user, repo, source);
+    const checkedAt = performance.now();
+    const cached = this.freshProof(cacheKey);
+    if (!fresh && cached) return cached.allowed;
+    let allowed = false;
+    try {
+      const token = this.options.cipher.decrypt(user.credential, user.id);
+      const remote = await this.options.codeup.getRepository(token, repo.codeup_id);
+      if (hasRepositoryRole(remote)) {
+        if (!source) {
+          allowed = true;
+        } else if (remote.httpUrlToRepo && this.options.probe && this.options.dataDir && this.options.allowedGitHosts) {
+          allowed = await this.options.probe(
+            {
+              dataDir: this.options.dataDir,
+              repositoryId: repo.id,
+              branch: repo.branch,
+              cloneUrl: remote.httpUrlToRepo,
+              allowedGitHosts: this.options.allowedGitHosts,
+              gitUsername: user.username,
+              token,
+            },
+            signal,
+          );
+        }
+      }
+    } catch (error) {
+      if (!(error instanceof CodeupError) || !['invalid_credential', 'forbidden', 'not_found'].includes(error.kind))
+        throw error;
+    }
+    signal?.throwIfAborted();
+    if (this.cloudAccessCache.size >= MAX_CODEUP_ACCESS_ENTRIES) {
+      const oldest = this.cloudAccessCache.keys().next().value;
+      if (oldest !== undefined) this.cloudAccessCache.delete(oldest);
+    }
+    if ((this.cloudAccessCache.get(cacheKey)?.checkedAt ?? -1) <= checkedAt) {
+      this.cloudAccessCache.set(cacheKey, { allowed, checkedAt });
+    }
+    return allowed && this.hasFreshCloudAccess(user, repo, source);
+  }
+
+  /** Check for rotation/revocation and the exact indexed generation before returning repository information. */
+  private async authorizeFeishuKey(
+    key: Principal,
+    repo: RepositoryRecord,
+    source: boolean,
+    signal?: AbortSignal,
+  ): Promise<RepositoryRecord | null> {
+    if (repo.status === 'disabled' || (source && repo.status === 'branch_deleted') || !key.repos?.includes(repo.id))
+      return null;
+    const owner = await this.keyOwner(key);
+    if (!owner || !(await this.checkCloudAccess(owner.user, repo, source, signal))) return null;
+    return await this.mutate(async () => {
+      signal?.throwIfAborted();
+      const [currentKey, latest] = await Promise.all([this.store.getKey(key.hash), this.store.getRepository(repo.id)]);
+      if (
+        !currentKey ||
+        !keyActive(currentKey, Date.now()) ||
+        currentKey.owner !== key.owner ||
+        !currentKey.repos?.includes(repo.id) ||
+        !latest ||
+        latest.status === 'disabled' ||
+        (source && latest.status === 'branch_deleted') ||
+        latest.codeup_id !== repo.codeup_id ||
+        latest.branch !== repo.branch ||
+        latest.path !== repo.path ||
+        latest.commit !== repo.commit
+      )
+        return null;
+      const currentOwner = await this.keyOwner(currentKey);
+      signal?.throwIfAborted();
+      return currentOwner?.account.id === owner.account.id &&
+        currentOwner.user.credential_version === owner.user.credential_version &&
+        keyActive(currentKey, Date.now()) &&
+        this.hasFreshCloudAccess(currentOwner.user, latest, source)
+        ? latest
+        : null;
+    });
   }
 
   private accessFresh(row: AccessRecord | undefined, now: number): boolean {
@@ -156,6 +284,10 @@ export class Authorization {
    */
   async maintenance(): Promise<void> {
     const now = Date.now();
+    if (this.enforceFeishu) {
+      await this.store.purgeAuditEvents(now - this.options.auditRetentionDays * 86_400_000);
+      return;
+    }
     const background = (owner: string): Principal => ({
       hash: '',
       prefix: '',
@@ -217,12 +349,46 @@ export class Authorization {
   async visible(key: Principal, id: string, signal?: AbortSignal): Promise<RepositoryRecord> {
     const repo = await this.store.getRepository(id);
     if (!repo || repo.status === 'disabled') fail(404, 'NOT_FOUND');
-    const authorized = await this.authorize(key, repo, signal);
+    const authorized = this.enforceFeishu
+      ? await this.authorizeFeishuKey(key, repo, false, signal)
+      : await this.authorize(key, repo, signal);
     if (!authorized) fail(404, 'NOT_FOUND');
     return authorized;
   }
 
+  private async listFeishuVisible(key: Principal, signal?: AbortSignal): Promise<RepositoryRecord[]> {
+    const owner = await this.keyOwner(key);
+    if (!owner) fail(401, 'UNAUTHENTICATED');
+    const scoped = (await this.store.getRepositoriesByIds(key.repos ?? [])).filter(
+      (repo) => repo.status !== 'disabled',
+    );
+    for (let offset = 0; offset < scoped.length; offset += CODEUP_LIST_CONCURRENCY) {
+      signal?.throwIfAborted();
+      const batch = scoped.slice(offset, offset + CODEUP_LIST_CONCURRENCY);
+      await Promise.all(batch.map((repo) => this.checkCloudAccess(owner.user, repo, false, signal)));
+    }
+    return await this.mutate(async () => {
+      const current = await this.store.getKey(key.hash);
+      if (!current || current.owner !== key.owner || !keyActive(current, Date.now())) fail(401, 'UNAUTHENTICATED');
+      const currentOwner = await this.keyOwner(current);
+      if (
+        currentOwner?.account.id !== owner.account.id ||
+        currentOwner.user.credential_version !== owner.user.credential_version
+      )
+        fail(401, 'UNAUTHENTICATED');
+      const latest = await this.store.getRepositoriesByIds(
+        scoped.filter((repo) => current.repos?.includes(repo.id)).map((repo) => repo.id),
+      );
+      signal?.throwIfAborted();
+      if (!keyActive(current, Date.now())) fail(401, 'UNAUTHENTICATED');
+      return latest.filter(
+        (repo) => repo.status !== 'disabled' && this.hasFreshCloudAccess(currentOwner.user, repo, false),
+      );
+    });
+  }
+
   async listVisible(key: Principal, signal?: AbortSignal): Promise<RepositoryRecord[]> {
+    if (this.enforceFeishu) return this.listFeishuVisible(key, signal);
     if (!(await this.store.getUser(key.owner))) fail(401, 'UNAUTHENTICATED');
     const candidates = (
       key.repos === null ? await this.store.listRepositories() : await this.store.getRepositoriesByIds(key.repos)
@@ -257,6 +423,12 @@ export class Authorization {
 
   /** Code queries require an explicit repository scope or a self-scoped key; administrators cannot query. */
   async queryVisible(key: Principal, id: string, signal?: AbortSignal): Promise<RepositoryRecord> {
+    if (this.enforceFeishu) {
+      const repo = await this.store.getRepository(id);
+      const authorized = repo && (await this.authorizeFeishuKey(key, repo, true, signal));
+      if (!authorized) fail(404, 'NOT_FOUND');
+      return authorized;
+    }
     if (this.isAdmin(key)) fail(404, 'NOT_FOUND');
     return await this.visible(key, id, signal);
   }

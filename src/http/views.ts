@@ -49,5 +49,12 @@ export function internalRepository(repo: RepositoryRecord): InternalMcpRepositor
 
 /** Key hashes never leave the service. */
 export function publicKey(key: KeyRecord) {
-  return { prefix: key.prefix, scope: key.scope, repos: key.repos, expires_at: key.expires_at, revoked: !!key.revoked };
+  return {
+    prefix: key.prefix,
+    scope: key.scope,
+    repos: key.repos,
+    expires_at: key.expires_at,
+    revoked: !!key.revoked,
+    legacy_pending: !!key.legacy_pending,
+  };
 }

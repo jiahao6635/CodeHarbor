@@ -58,6 +58,7 @@ export class IndexWorker {
           if (job.status === 'running')
             await tx.updateJob(job.id, {
               status: 'queued',
+              phase: 'queued',
               queued_at: Date.now(),
               finished_at: null,
               build_duration_ms: null,
@@ -123,6 +124,7 @@ export class IndexWorker {
         id: randomUUID(),
         repo_id: repoId,
         status: 'queued',
+        phase: 'queued',
         reason,
         created_at: now,
         queued_at: now,
@@ -177,7 +179,13 @@ export class IndexWorker {
       return;
     }
     await store.transaction(async (tx) => {
-      await tx.updateJob(job.id, { status: 'running', error: null, finished_at: null, build_duration_ms: null });
+      await tx.updateJob(job.id, {
+        status: 'running',
+        phase: 'validating',
+        error: null,
+        finished_at: null,
+        build_duration_ms: null,
+      });
       await tx.updateRepository(repo.id, { status: repo.path ? 'updating' : 'indexing', error: null });
     });
     let candidate: IndexCandidate | null = null;
@@ -187,6 +195,10 @@ export class IndexWorker {
       const user = await store.getUser(repo.sync_owner);
       if (!user || user.credential_version !== repo.sync_credential_version || repo.sync_credential_version === 0) {
         throw new IndexError('CREDENTIAL_REQUIRED', 'Sync credential requires authorization');
+      }
+      const account = await store.getAccountByCodeupId(user.id);
+      if (account && account.status !== 'active') {
+        throw new IndexError('CREDENTIAL_REQUIRED', 'Sync credential owner is disabled');
       }
       const token = cipher.decrypt(user.credential, user.id);
       const source = await codeup.getRepository(token, repo.codeup_id);
@@ -201,6 +213,7 @@ export class IndexWorker {
         gitUsername: user.username,
         token,
         codegraphBin: this.options.codegraphBin,
+        onProgress: (phase) => store.updateJob(job.id, { phase }),
       };
       if (
         !(await (this.options.probe ?? checkCloneAccess)({
@@ -222,6 +235,7 @@ export class IndexWorker {
           buildDurationMs = Math.max(0, Math.round(performance.now() - started));
         }
       }
+      await store.updateJob(job.id, { phase: 'publishing' });
       // Image packaging can take time after indexing; never publish an older branch head.
       if (candidate && (await (this.options.head ?? getRemoteHead)(request)) !== candidate.commit) {
         throw new IndexError('REMOTE_CHANGED', 'Remote branch changed during indexing');
@@ -240,8 +254,12 @@ export class IndexWorker {
       }
       const publish = async () => {
         await store.transaction(async (tx) => {
-          const latest = await tx.getRepository(repo.id);
-          const latestUser = await tx.getUser(user.id);
+          const latestUser = await tx.getUser(user.id, { forUpdate: true });
+          const latestAccount = await tx.getAccountByCodeupId(user.id, { forUpdate: true });
+          if (latestAccount && latestAccount.status !== 'active') {
+            throw new IndexError('CREDENTIAL_REQUIRED', 'Sync credential owner is disabled');
+          }
+          const latest = await tx.getRepository(repo.id, { forUpdate: true });
           if (
             latest &&
             latest.sync_owner === user.id &&
@@ -280,6 +298,7 @@ export class IndexWorker {
           });
           await tx.updateJob(job.id, {
             status: 'succeeded',
+            phase: 'complete',
             error: null,
             finished_at: Date.now(),
             build_duration_ms: buildDurationMs,

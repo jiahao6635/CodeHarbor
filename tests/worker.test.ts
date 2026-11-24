@@ -102,7 +102,9 @@ test('coalesces queued work while preserving events during a build', async () =>
     reconcileIntervalMs: 0,
     head: async () => 'b'.repeat(40),
     healthy: async () => true,
-    build: async () => {
+    build: async (request) => {
+      await request.onProgress?.('cloning');
+      await request.onProgress?.('indexing');
       builds++;
       await blocked;
       return { path: '/candidate', commit: 'b'.repeat(40), generation: 'v1' };
@@ -110,9 +112,11 @@ test('coalesces queued work while preserving events during a build', async () =>
   });
   try {
     const first = await worker.enqueue('repo_1', 'initial');
+    assert.equal(first.phase, 'queued');
     assert.equal((await worker.enqueue('repo_1', 'duplicate')).id, first.id);
     await worker.start();
     await waitFor(() => builds === 1);
+    assert.equal((await f.store.getJob(first.id))?.phase, 'indexing');
     const next = await worker.enqueue('repo_1', 'push');
     assert.notEqual(next.id, first.id);
     assert.equal((await worker.enqueue('repo_1', 'duplicate')).id, next.id);
@@ -122,8 +126,10 @@ test('coalesces queued work while preserving events during a build', async () =>
     assert.equal((await f.store.getRepository('repo_1'))?.commit, 'b'.repeat(40));
     assert.equal((await f.store.getRepository('repo_1'))?.status, 'ready');
     assert.ok((await f.store.getJob(first.id))?.finished_at);
+    assert.equal((await f.store.getJob(first.id))?.phase, 'complete');
     assert.ok(((await f.store.getJob(first.id))?.build_duration_ms ?? -1) >= 0);
     assert.ok((await f.store.getJob(next.id))?.finished_at);
+    assert.equal((await f.store.getJob(next.id))?.phase, 'complete');
     assert.equal((await f.store.getJob(next.id))?.build_duration_ms, null, 'no-op reconcile has no build sample');
   } finally {
     release();
@@ -142,7 +148,8 @@ test('failed builds preserve the previous published index', async () => {
     allowedGitHosts: ['git.example.com'],
     reconcileIntervalMs: 0,
     head: async () => 'b'.repeat(40),
-    build: async () => {
+    build: async (request) => {
+      await request.onProgress?.('indexing');
       throw new Error('secret internal error');
     },
   });
@@ -154,6 +161,7 @@ test('failed builds preserve the previous published index', async () => {
     assert.equal((await f.store.getRepository('repo_1'))?.commit, 'a'.repeat(40));
     assert.equal((await f.store.getRepository('repo_1'))?.status, 'stale');
     assert.equal((await f.store.getJob(job.id))?.error, 'Index update failed');
+    assert.equal((await f.store.getJob(job.id))?.phase, 'indexing');
     assert.ok((await f.store.getJob(job.id))?.finished_at);
     assert.ok(((await f.store.getJob(job.id))?.build_duration_ms ?? -1) >= 0, 'failed builds retain a duration');
   } finally {
@@ -169,6 +177,7 @@ test('restarting an interrupted job resets queue time and clears the interrupted
     id: 'interrupted',
     repo_id: 'repo_1',
     status: 'running',
+    phase: 'indexing',
     reason: 'initial',
     created_at: old,
     queued_at: old,
@@ -202,11 +211,52 @@ test('restarting an interrupted job resets queue time and clears the interrupted
     assert.ok((job?.queued_at ?? 0) > old);
     assert.equal(job?.finished_at, null);
     assert.equal(job?.build_duration_ms, null);
+    assert.equal(job?.phase, 'validating');
     release();
     await waitFor(async () => (await f.store.getJob('interrupted'))?.status === 'succeeded');
     assert.ok(((await f.store.getJob('interrupted'))?.build_duration_ms ?? -1) >= 0);
   } finally {
     release();
+    await worker.stop();
+    await f.close();
+  }
+});
+
+test('a disabled sync owner cannot publish an in-flight job or start another build', async () => {
+  const f = await fixture();
+  let builds = 0;
+  const worker = new IndexWorker({
+    ...f,
+    dataDir: '/unused',
+    allowedGitHosts: ['git.example.com'],
+    reconcileIntervalMs: 0,
+    head: async () => 'a'.repeat(40),
+    build: async () => {
+      builds++;
+      await f.store.updateAccount('account', { status: 'disabled' });
+      return { path: '/candidate', commit: 'a'.repeat(40), generation: 'v1' };
+    },
+  });
+  try {
+    await f.store.upsertFeishuAccount({
+      id: 'account',
+      feishu_tenant_key: 'tenant',
+      feishu_open_id: 'open',
+      name: 'Account',
+      role: 'member',
+    });
+    await f.store.linkCodeupAccount('account', 'user');
+    const interrupted = await worker.enqueue('repo_1', 'initial');
+    await worker.start();
+    await waitFor(async () => (await f.store.getJob(interrupted.id))?.status === 'failed');
+    assert.equal((await f.store.getJob(interrupted.id))?.phase, 'publishing');
+    assert.equal((await f.store.getRepository('repo_1'))?.path, null);
+
+    const rejected = await worker.enqueue('repo_1', 'manual');
+    await waitFor(async () => (await f.store.getJob(rejected.id))?.status === 'failed');
+    assert.equal((await f.store.getJob(rejected.id))?.phase, 'validating');
+    assert.equal(builds, 1);
+  } finally {
     await worker.stop();
     await f.close();
   }

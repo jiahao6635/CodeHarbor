@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AuditWriter } from './audit-writer.js';
-import { databaseUrl, indexBackend as resolveIndexBackend, validateProduction } from './config.js';
+import { databaseUrl, feishuConfig, indexBackend as resolveIndexBackend, validateProduction } from './config.js';
 import { imageAuthorization } from './image-authorization.js';
 import { serveImageAuthorizer } from './image-authorizer.js';
 import { SocketImageBuildExecutor } from './image-build-socket.js';
@@ -41,6 +41,7 @@ async function main() {
   if (!endpoint) throw new Error('YUNXIAO_ENDPOINT is required');
   const dbUrl = await databaseUrl(process.env);
   validateProduction(process.env, dbUrl);
+  const feishu = await feishuConfig(process.env);
   const indexBackend = resolveIndexBackend(process.env);
   const key = await loadMasterKey();
   const metricsToken = process.env.CODEHARBOR_METRICS_TOKEN_FILE
@@ -186,7 +187,8 @@ async function main() {
         allowedGitHosts,
         allowedHosts,
         allowedOrigins: list(process.env.CODEHARBOR_ALLOWED_ORIGINS),
-        writeUsers: list(process.env.CODEHARBOR_WRITE_USERS),
+        feishu,
+        writeUsers: [],
         codegraphBin: platformCodegraph,
         metricsToken,
         publicMcpDisabled,

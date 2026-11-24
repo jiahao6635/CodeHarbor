@@ -8,7 +8,7 @@ const CONTROL_CHARACTERS = /[\x00-\x1f\x7f]/;
 export const branchName = z
   .string()
   .trim()
-  .min(1, '请输入分支名')
+  .min(1, '请选择分支')
   .max(255, '分支名过长')
   .refine((value) => !CONTROL_CHARACTERS.test(value), '分支名包含非法字符')
   .refine(
@@ -28,13 +28,6 @@ export const codeupRepositoryId = z
 
 export const identifier = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/, '不是有效的仓库 ID');
 
-export const accessKey = z
-  .string()
-  .trim()
-  .min(1, '请输入 CodeHarbor Key')
-  .max(512, 'Key 过长')
-  .refine((value) => !CONTROL_CHARACTERS.test(value), 'Key 包含非法字符');
-
 export const pat = z
   .string()
   .min(1, '请输入云效个人访问令牌')
@@ -53,30 +46,11 @@ export const EXPIRY_OPTIONS = [
 
 export const DEFAULT_EXPIRES_IN = 30 * 86_400;
 export const MAX_EXPIRES_IN = 90 * 86_400;
-export const UNLIMITED_EXPIRY_HELP = '无截止日期，仍可手动撤销；云效PAT失效仍可能影响使用';
-
-type ExpiryOption = (typeof EXPIRY_OPTIONS)[number];
+export const UNLIMITED_EXPIRY_HELP = '无截止日期，仍可手动撤销；云效 PAT 失效后无法用此 Key 查询源码。';
 
 /** Native selects use "null" for unlimited validity, never an empty value or zero. */
 export function parseExpiry(value: string): number | null {
   const option = EXPIRY_OPTIONS.find((option) => String(option.seconds) === value);
   if (!option) throw new Error('Invalid key expiry');
   return option.seconds;
-}
-
-export function childExpiryOptions(parentExpiry: number | null | undefined, now = Date.now()): ExpiryOption[] {
-  return EXPIRY_OPTIONS.filter(
-    (option) =>
-      parentExpiry === null ||
-      (parentExpiry !== undefined && option.seconds !== null && now + option.seconds * 1000 <= parentExpiry),
-  );
-}
-
-/** Undefined means unselected/unavailable; null is an explicit unlimited selection. */
-export function resolveChildExpiry(options: readonly ExpiryOption[], chosen: number | null | undefined) {
-  if (chosen !== undefined && options.some((option) => option.seconds === chosen)) return chosen;
-  return options
-    .map((option) => option.seconds)
-    .filter((seconds) => seconds !== null)
-    .at(-1);
 }

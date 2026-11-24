@@ -2,8 +2,10 @@ import pg from 'pg';
 import { loadMigrations, migrate } from './migrate.js';
 import {
   accessRowSchema,
+  accountRowSchema,
   auditRowSchema,
   BUILD_DURATION_BUCKETS_MS,
+  browserSessionRowSchema,
   type JobMetrics,
   jobMetricsBucketSchema,
   jobMetricsRowSchema,
@@ -36,7 +38,7 @@ const REPOSITORY_UPDATE_COLUMNS: Record<string, string> = {
   status: 'status',
   error: 'error',
 };
-const JOB_UPDATE_COLUMNS = new Set(['status', 'error', 'queued_at', 'finished_at', 'build_duration_ms']);
+const JOB_UPDATE_COLUMNS = new Set(['status', 'phase', 'error', 'queued_at', 'finished_at', 'build_duration_ms']);
 
 const parseKey = (row: Row) => keyRowSchema.parse({ ...row, repos: JSON.parse(String(row.repos)) });
 const userSummarySchema = userRowSchema.omit({ credential: true });
@@ -102,7 +104,8 @@ function access(db: Queryable, guard: () => void): StoreAccess {
         user.credential_version,
       ]);
     },
-    getUser: (id) => one(userRowSchema.parse, 'SELECT * FROM users WHERE id = $1', [id]),
+    getUser: (id, options) =>
+      one(userRowSchema.parse, `SELECT * FROM users WHERE id = $1${options?.forUpdate ? ' FOR UPDATE' : ''}`, [id]),
     async updateUserCredential(id, username, credential) {
       await q(
         'UPDATE users SET username = $1, credential = $2, credential_version = credential_version + 1 WHERE id = $3',
@@ -111,10 +114,85 @@ function access(db: Queryable, guard: () => void): StoreAccess {
     },
     listUsers: () => many(userSummarySchema.parse, 'SELECT id, username, credential_version FROM users ORDER BY id'),
 
+    async upsertFeishuAccount(identity) {
+      const { rows } = await q(
+        `INSERT INTO accounts(id, feishu_tenant_key, feishu_open_id, name, role) VALUES($1, $2, $3, $4, $5)
+         ON CONFLICT (feishu_tenant_key, feishu_open_id) DO UPDATE SET name = EXCLUDED.name RETURNING *`,
+        [identity.id, identity.feishu_tenant_key, identity.feishu_open_id, identity.name, identity.role],
+      );
+      return accountRowSchema.parse(rows[0]);
+    },
+    getAccount: (id, options) =>
+      one(accountRowSchema.parse, `SELECT * FROM accounts WHERE id = $1${options?.forUpdate ? ' FOR UPDATE' : ''}`, [
+        id,
+      ]),
+    getAccountByCodeupId: (id, options) =>
+      one(
+        accountRowSchema.parse,
+        `SELECT * FROM accounts WHERE codeup_user_id = $1${options?.forUpdate ? ' FOR UPDATE' : ''}`,
+        [id],
+      ),
+    listAccounts: () => many(accountRowSchema.parse, 'SELECT * FROM accounts ORDER BY name, id'),
+    async updateAccount(id, patch) {
+      await q('UPDATE accounts SET role = COALESCE($2, role), status = COALESCE($3, status) WHERE id = $1', [
+        id,
+        patch.role ?? null,
+        patch.status ?? null,
+      ]);
+    },
+    async linkCodeupAccount(id, codeupUserId) {
+      await q('UPDATE accounts SET codeup_user_id = $2 WHERE id = $1', [id, codeupUserId]);
+    },
+    async clearUserAccess(userId) {
+      await q('DELETE FROM repository_access WHERE user_id = $1', [userId]);
+    },
+
+    async createBrowserSession(session) {
+      await q('INSERT INTO browser_sessions(hash, account_id, expires_at) VALUES($1, $2, $3)', [
+        session.hash,
+        session.account_id,
+        session.expires_at,
+      ]);
+    },
+    getBrowserSession: (hash) =>
+      one(browserSessionRowSchema.parse, 'SELECT * FROM browser_sessions WHERE hash = $1', [hash]),
+    async deleteBrowserSession(hash) {
+      await q('DELETE FROM browser_sessions WHERE hash = $1', [hash]);
+    },
+    async deleteAccountSessions(accountId) {
+      await q('DELETE FROM browser_sessions WHERE account_id = $1', [accountId]);
+    },
+    async createFeishuOAuthState(state) {
+      await q(
+        'INSERT INTO feishu_oauth_states(state_hash, browser_hash, code_verifier, expires_at) VALUES($1, $2, $3, $4)',
+        [state.state_hash, state.browser_hash, state.code_verifier, state.expires_at],
+      );
+    },
+    async consumeFeishuOAuthState(stateHash, browserHash, now) {
+      const { rows } = await q(
+        'DELETE FROM feishu_oauth_states WHERE state_hash = $1 AND browser_hash = $2 AND expires_at > $3 RETURNING code_verifier',
+        [stateHash, browserHash, now],
+      );
+      return typeof rows[0]?.code_verifier === 'string' ? rows[0].code_verifier : undefined;
+    },
+    async purgeExpiredBrowserAuth(now) {
+      await q('DELETE FROM feishu_oauth_states WHERE expires_at <= $1', [now]);
+      await q('DELETE FROM browser_sessions WHERE expires_at <= $1', [now]);
+    },
+
     async createKey(key) {
       await q(
-        'INSERT INTO keys(hash, prefix, owner, scope, repos, expires_at, revoked) VALUES($1, $2, $3, $4, $5, $6, $7)',
-        [key.hash, key.prefix, key.owner, key.scope, JSON.stringify(key.repos), key.expires_at, key.revoked],
+        'INSERT INTO keys(hash, prefix, owner, scope, repos, expires_at, revoked, legacy_pending) VALUES($1, $2, $3, $4, $5, $6, $7, $8)',
+        [
+          key.hash,
+          key.prefix,
+          key.owner,
+          key.scope,
+          JSON.stringify(key.repos),
+          key.expires_at,
+          key.revoked,
+          key.legacy_pending ?? false,
+        ],
       );
     },
     getKey: (hash) => one(parseKey, 'SELECT * FROM keys WHERE hash = $1', [hash]),
@@ -130,6 +208,9 @@ function access(db: Queryable, guard: () => void): StoreAccess {
     getKeysByPrefix: (prefix) => many(parseKey, 'SELECT * FROM keys WHERE prefix = $1', [prefix]),
     async revokeKey(hash) {
       await q('UPDATE keys SET revoked = 1 WHERE hash = $1', [hash]);
+    },
+    async approveLegacyKey(hash) {
+      await q('UPDATE keys SET legacy_pending = FALSE WHERE hash = $1', [hash]);
     },
     async revokeUserKeys(owner) {
       await q('UPDATE keys SET revoked = 1 WHERE owner = $1', [owner]);
@@ -193,11 +274,12 @@ function access(db: Queryable, guard: () => void): StoreAccess {
 
     async createJob(job) {
       await q(
-        'INSERT INTO jobs(id, repo_id, status, reason, created_at, queued_at, finished_at, build_duration_ms, error) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+        'INSERT INTO jobs(id, repo_id, status, phase, reason, created_at, queued_at, finished_at, build_duration_ms, error) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
         [
           job.id,
           job.repo_id,
           job.status,
+          job.phase ?? (job.status === 'queued' ? 'queued' : null),
           job.reason,
           job.created_at,
           job.queued_at ?? job.created_at,

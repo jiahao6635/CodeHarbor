@@ -7,8 +7,8 @@ import { test } from 'node:test';
 import pg from 'pg';
 import { CodeupError } from '../src/codeup.js';
 import { openPostgresStore } from '../src/postgres-store.js';
-import { createApp } from '../src/server.js';
 import type { StoreBackend } from '../src/store.js';
+import { createLegacyTestApp as createApp } from './helpers/legacy-auth.js';
 import { TEST_DATABASE_URL } from './helpers/postgres.js';
 
 const baseUrl = TEST_DATABASE_URL;

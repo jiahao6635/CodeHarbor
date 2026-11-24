@@ -12,6 +12,33 @@ export const userRowSchema = z.object({
 });
 export type UserRecord = z.infer<typeof userRowSchema>;
 
+export const accountRowSchema = z.object({
+  id: z.string(),
+  feishu_tenant_key: z.string(),
+  feishu_open_id: z.string(),
+  name: z.string(),
+  role: z.enum(['member', 'super_admin']),
+  status: z.enum(['active', 'disabled']),
+  codeup_user_id: nullableText,
+});
+export type AccountRecord = z.infer<typeof accountRowSchema>;
+export type FeishuAccountInput = Pick<AccountRecord, 'id' | 'feishu_tenant_key' | 'feishu_open_id' | 'name' | 'role'>;
+export type AccountUpdate = Partial<Pick<AccountRecord, 'role' | 'status'>>;
+
+export const browserSessionRowSchema = z.object({
+  hash: z.string(),
+  account_id: z.string(),
+  expires_at: integer,
+});
+export type BrowserSessionRecord = z.infer<typeof browserSessionRowSchema>;
+
+export type FeishuOAuthState = {
+  state_hash: string;
+  browser_hash: string;
+  code_verifier: string;
+  expires_at: number;
+};
+
 export const keyRowSchema = z.object({
   hash: z.string(),
   prefix: z.string(),
@@ -21,6 +48,7 @@ export const keyRowSchema = z.object({
   repos: z.union([z.null(), z.array(z.string())]),
   expires_at: nullableInteger,
   revoked: integer,
+  legacy_pending: z.boolean().optional(),
 });
 export type KeyRecord = z.infer<typeof keyRowSchema>;
 
@@ -46,10 +74,22 @@ export type RepositoryRecord = z.infer<typeof repositoryRowSchema>;
 export type RepositoryInput = Omit<RepositoryRecord, 'previous_image' | 'previous_commit'> &
   Partial<Pick<RepositoryRecord, 'previous_image' | 'previous_commit'>>;
 
+export const JOB_PHASES = [
+  'queued',
+  'validating',
+  'cloning',
+  'indexing',
+  'packaging',
+  'publishing',
+  'complete',
+] as const;
+export type JobPhase = (typeof JOB_PHASES)[number];
+
 export const jobRowSchema = z.object({
   id: z.string(),
   repo_id: z.string(),
   status: z.enum(['queued', 'running', 'succeeded', 'failed']),
+  phase: z.enum(JOB_PHASES).nullable(),
   reason: z.string(),
   created_at: integer,
   /** Waiting start is reset when an interrupted attempt is requeued. */
@@ -61,8 +101,8 @@ export const jobRowSchema = z.object({
   error: nullableText,
 });
 export type JobRecord = z.infer<typeof jobRowSchema>;
-export type JobInput = Omit<JobRecord, 'queued_at' | 'finished_at' | 'build_duration_ms'> &
-  Partial<Pick<JobRecord, 'queued_at' | 'finished_at' | 'build_duration_ms'>>;
+export type JobInput = Omit<JobRecord, 'phase' | 'queued_at' | 'finished_at' | 'build_duration_ms'> &
+  Partial<Pick<JobRecord, 'phase' | 'queued_at' | 'finished_at' | 'build_duration_ms'>>;
 
 /** Cached Codeup repository permission for a bound user; refreshed on demand and by the worker. */
 export const accessRowSchema = z.object({
@@ -122,16 +162,32 @@ export type JobMetrics = {
 
 export type RepositoryUpdate = Partial<Omit<RepositoryRecord, 'id' | 'codeup_id'>>;
 export type JobUpdate = Partial<
-  Pick<JobRecord, 'status' | 'error' | 'queued_at' | 'finished_at' | 'build_duration_ms'>
+  Pick<JobRecord, 'status' | 'phase' | 'error' | 'queued_at' | 'finished_at' | 'build_duration_ms'>
 >;
 export type UserSummary = Pick<UserRecord, 'id' | 'username' | 'credential_version'>;
 
 /** Every store operation; transaction callbacks must exclusively use the supplied tx object. */
 export interface StoreAccess {
   createUser(user: UserRecord): Promise<void>;
-  getUser(id: string): Promise<UserRecord | undefined>;
+  getUser(id: string, options?: { forUpdate?: boolean }): Promise<UserRecord | undefined>;
   updateUserCredential(id: string, username: string, credential: string): Promise<void>;
   listUsers(): Promise<UserSummary[]>;
+
+  upsertFeishuAccount(identity: FeishuAccountInput): Promise<AccountRecord>;
+  getAccount(id: string, options?: { forUpdate?: boolean }): Promise<AccountRecord | undefined>;
+  getAccountByCodeupId(id: string, options?: { forUpdate?: boolean }): Promise<AccountRecord | undefined>;
+  listAccounts(): Promise<AccountRecord[]>;
+  updateAccount(id: string, patch: AccountUpdate): Promise<void>;
+  linkCodeupAccount(id: string, codeupUserId: string): Promise<void>;
+  clearUserAccess(userId: string): Promise<void>;
+
+  createBrowserSession(session: BrowserSessionRecord): Promise<void>;
+  getBrowserSession(hash: string): Promise<BrowserSessionRecord | undefined>;
+  deleteBrowserSession(hash: string): Promise<void>;
+  deleteAccountSessions(accountId: string): Promise<void>;
+  createFeishuOAuthState(state: FeishuOAuthState): Promise<void>;
+  consumeFeishuOAuthState(stateHash: string, browserHash: string, now: number): Promise<string | undefined>;
+  purgeExpiredBrowserAuth(now: number): Promise<void>;
 
   createKey(key: KeyRecord): Promise<void>;
   getKey(hash: string): Promise<KeyRecord | undefined>;
@@ -140,6 +196,7 @@ export interface StoreAccess {
   listAllKeys(owner: string | undefined, limit: number, offset: number): Promise<KeyRecord[]>;
   getKeysByPrefix(prefix: string): Promise<KeyRecord[]>;
   revokeKey(hash: string): Promise<void>;
+  approveLegacyKey(hash: string): Promise<void>;
   revokeUserKeys(owner: string): Promise<void>;
 
   createRepository(repo: RepositoryInput): Promise<void>;

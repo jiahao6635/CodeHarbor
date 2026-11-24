@@ -264,10 +264,23 @@ test('migrations apply once, record versions, and reject unknown or renamed vers
     const bundled = await loadMigrations();
     assert.equal(bundled[0]?.version, 1);
     assert.equal(bundled[0]?.name, 'init');
+    await writeFile(join(temp, '0001_init.sql'), bundled[0].sql);
+    const legacy = await openPostgresStore(database.url, { migrationsDir: temp });
+    await legacy.close();
 
-    const first = await openPostgresStore(database.url);
-    await first.close();
     await client.connect();
+    await client.query(`
+      INSERT INTO users(id, username, credential) VALUES('legacy', 'legacy', 'encrypted');
+      INSERT INTO repositories(id, codeup_id, name, branch, owner, sync_owner, hook_hash, status)
+        VALUES('legacy-repo', 'legacy-codeup', 'legacy', 'main', 'legacy', 'legacy', 'hash', 'ready');
+      INSERT INTO jobs(id, repo_id, status, reason, created_at)
+        VALUES('legacy-job', 'legacy-repo', 'succeeded', 'initial', 100);
+    `);
+    const first = await openPostgresStore(database.url);
+    const legacyJob = await first.getJob('legacy-job');
+    await first.close();
+    assert.equal(legacyJob?.status, 'succeeded');
+    assert.equal(legacyJob?.phase, null);
     const applied = await client.query('SELECT version, name FROM schema_migrations ORDER BY version');
     assert.deepEqual(
       applied.rows.map((row) => [Number(row.version), row.name]),
@@ -277,37 +290,43 @@ test('migrations apply once, record versions, and reject unknown or renamed vers
     await second.close();
     assert.equal((await client.query('SELECT count(*) FROM schema_migrations')).rows[0].count, String(bundled.length));
 
-    await writeFile(join(temp, '0001_init.sql'), bundled[0].sql);
-    await writeFile(join(temp, '0002_add_note.sql'), 'ALTER TABLE users ADD COLUMN note TEXT;');
+    const fileName = (version: number, name: string) => `${String(version).padStart(4, '0')}_${name}.sql`;
+    for (const migration of bundled) {
+      await writeFile(join(temp, fileName(migration.version, migration.name)), migration.sql);
+    }
+    const next = bundled.length + 1;
+    const addNote = join(temp, fileName(next, 'add_note'));
+    const renamed = join(temp, fileName(next, 'renamed'));
+    const gap = join(temp, fileName(next + 2, 'gap'));
+    await writeFile(addNote, 'ALTER TABLE users ADD COLUMN note TEXT;');
     const upgraded = await openPostgresStore(database.url, { migrationsDir: temp });
     try {
       await upgraded.createUser({ id: 'u', username: 'u', credential: 'c', credential_version: 1 });
     } finally {
       await upgraded.close();
     }
-    assert.equal((await client.query('SELECT note FROM users')).rows[0].note, null);
-    assert.equal((await client.query('SELECT max(version) FROM schema_migrations')).rows[0].max, 2);
+    assert.equal((await client.query("SELECT note FROM users WHERE id = 'u'")).rows[0].note, null);
+    assert.equal((await client.query('SELECT max(version) FROM schema_migrations')).rows[0].max, next);
 
     await assert.rejects(openPostgresStore(database.url), /newer than this build/);
 
-    await writeFile(join(temp, '0002_add_note.sql'), 'SELECT 1;');
-    await rm(join(temp, '0002_add_note.sql'));
-    await writeFile(join(temp, '0002_renamed.sql'), 'SELECT 1;');
+    await rm(addNote);
+    await writeFile(renamed, 'SELECT 1;');
     await assert.rejects(openPostgresStore(database.url, { migrationsDir: temp }), /applied as "add_note"/);
 
-    await writeFile(join(temp, '0002_add_note.sql'), 'SELECT 1;');
-    await rm(join(temp, '0002_renamed.sql'));
-    await writeFile(join(temp, '0004_gap.sql'), 'SELECT 1;');
+    await writeFile(addNote, 'SELECT 1;');
+    await rm(renamed);
+    await writeFile(gap, 'SELECT 1;');
     await assert.rejects(loadMigrations(temp), /contiguous/);
-    await rm(join(temp, '0004_gap.sql'));
+    await rm(gap);
     await writeFile(
-      join(temp, '0003_broken.sql'),
+      join(temp, fileName(next + 1, 'broken')),
       'ALTER TABLE users ADD COLUMN ok TEXT; SELECT * FROM missing_table;',
     );
     await assert.rejects(openPostgresStore(database.url, { migrationsDir: temp }));
     assert.equal(
       (await client.query('SELECT max(version) FROM schema_migrations')).rows[0].max,
-      2,
+      next,
       'failed migration rolls back',
     );
     const columns = await client.query(

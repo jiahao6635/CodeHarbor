@@ -1,6 +1,7 @@
 // Keep this contract aligned with the handlers in src/routes/*. MCP RPC is described
 // at the transport boundary; its tool schemas are provided by tools/list.
 import type { StaticDocumentSpec } from '@fastify/swagger';
+import { JOB_PHASES } from './store.js';
 
 type OpenApiDocument = Extract<StaticDocumentSpec['document'], { openapi: string }>;
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` });
@@ -37,7 +38,7 @@ const strings = { type: 'array', items: { type: 'string' } };
 const scope = {
   type: 'string',
   enum: ['read', 'write'],
-  description: 'write 仅允许平台管理和触发索引，不授予代码写入权限。',
+  description: 'write 还可触发有权维护的仓库同步。',
 };
 const expiresIn = {
   type: 'integer',
@@ -47,13 +48,11 @@ const expiresIn = {
   default: 2592000,
   description: '有效期，单位秒；省略时默认 30 天，有限期限最多 90 天；显式 null 表示无限期（无截止日期），仍可撤销。',
 };
-const repoScope = {
-  ...strings,
-  nullable: true,
-  maxItems: 100,
-  description:
-    'CodeHarbor 仓库 ID 列表；MCP 代码查询要求列表明确包含仓库 ID。null 不能直接查询代码，仅受配置允许的 write 管理员可用于平台管理。',
-};
+const repoScope = { ...strings, nullable: true, maxItems: 100, description: '限定的 CodeHarbor 仓库 ID。' };
+const browserSecurity = [{ BrowserSession: [] }];
+const keySecurity = [{ ApiKey: [] }];
+const accountRole = { type: 'string', enum: ['member', 'super_admin'] };
+const accountStatus = { type: 'string', enum: ['active', 'disabled'] };
 const jobId = object({ job_id: { type: 'string' } }, ['job_id']);
 
 export const openApiDocument = {
@@ -62,10 +61,10 @@ export const openApiDocument = {
     title: 'CodeHarbor API',
     version: '0.1.0',
     description:
-      'CodeHarbor 管理 API 与 MCP 入口。管理接口使用 CodeHarbor API Key。明确仓库列表的 Key 按列表授权；自助申请的无范围 read Key 按持有者当前云效仓库权限授权（按需核验并缓存，默认 6 小时复核；PAT 失效会自动撤销该用户全部 Key）。云效 PAT 仍用于仓库接入和同步。索引任务异步执行，提交成功不代表索引完成。管理员（配置中的 write 用户）可禁用/删除仓库、撤销任意 Key、查看审计。',
+      '通过飞书登录管理 CodeHarbor 账号和 API Key。REST 与 MCP 的 Key 权限取明确仓库范围和持有人的当前云效权限的交集。',
   },
   servers: [{ url: '/' }],
-  security: [{ ApiKey: [] }],
+  security: [...browserSecurity, ...keySecurity],
   tags: [
     { name: '认证' },
     { name: '云效仓库' },
@@ -112,38 +111,54 @@ export const openApiDocument = {
         },
       },
     },
+    '/api/v1/auth/feishu/start': {
+      get: {
+        tags: ['认证'],
+        summary: '开始飞书登录',
+        security: [],
+        responses: { '302': { description: '跳转到飞书授权。' } },
+      },
+    },
+    '/api/v1/auth/feishu/callback': {
+      get: {
+        tags: ['认证'],
+        summary: '飞书登录回调',
+        security: [],
+        responses: { '302': { description: '跳转到控制台。' } },
+      },
+    },
+    '/api/v1/auth/logout': {
+      post: {
+        tags: ['认证'],
+        security: browserSecurity,
+        summary: '退出飞书会话',
+        responses: { '204': { description: '已退出。' }, ...common },
+      },
+    },
     '/api/v1/auth/yunxiao/bind': {
       post: {
         tags: ['认证'],
         summary: '绑定云效个人访问令牌',
-        description:
-          'PAT 将加密保存。返回的 bootstrap_token 仅用于创建首个 API Key，5 分钟过期且成功使用后失效；重新绑定会使依赖该账号的自动同步仓库需要重新授权。',
-        security: [],
+        description: '用当前飞书会话绑定自己的 PAT。更换 PAT 后，受影响的仓库需要重新确认同步授权。',
+        security: browserSecurity,
         requestBody: request(
           object({ pat: { type: 'string', minLength: 1, maxLength: 4096, format: 'password' } }, ['pat']),
         ),
         responses: {
-          '200': ok('绑定成功；bootstrap_token 只在此响应中返回。', ref('BootstrapSession')),
+          '200': ok(
+            '绑定成功。',
+            object({ user: object({ id: { type: 'string' }, name: { type: 'string' } }, ['id', 'name']) }, ['user']),
+          ),
           ...common,
+          '409': error('该云效账号已被认领，或当前飞书账号已绑定其他云效账号。'),
           '429': error('绑定请求过于频繁。'),
         },
-      },
-    },
-    '/api/v1/auth/bootstrap/keys': {
-      post: {
-        tags: ['认证'],
-        summary: '创建首个 API Key',
-        description:
-          '使用绑定后获得的 bootstrap_token。read Key 无明确仓库范围，可通过 MCP 查询持有者在云效中具有权限的已接入仓库（按需核验并缓存）；write 仅允许配置中的管理员创建并用于平台管理，管理员可再签发明确仓库范围的 Key。普通 read 初始 Key 无法自己派生 Key。令牌明文仅在成功响应中返回一次。',
-        security: [{ BootstrapBearer: [] }],
-        requestBody: request(object({ scope, expires_in: expiresIn }, ['scope'])),
-        responses: { '201': ok('密钥创建成功。', ref('BootstrapKey')), ...common },
       },
     },
     '/api/v1/me': {
       get: {
         tags: ['认证'],
-        summary: '当前身份和密钥权限',
+        summary: '当前会话或密钥身份',
         responses: { '200': ok('当前身份。', ref('Me')), ...common },
       },
     },
@@ -151,7 +166,8 @@ export const openApiDocument = {
       get: {
         tags: ['云效仓库'],
         summary: '列出云效可见仓库',
-        description: '仅无限定仓库范围的 API Key 可调用。可见不等于具有克隆权限；接入仓库时会进一步检查。',
+        description: '使用当前飞书账号绑定的云效 PAT。接入仓库时另行检查克隆权限。',
+        security: browserSecurity,
         parameters: [
           {
             name: 'page',
@@ -175,10 +191,48 @@ export const openApiDocument = {
         },
       },
     },
+    '/api/v1/codeup/repositories/{id}/branches': {
+      get: {
+        tags: ['云效仓库'],
+        summary: '搜索云效仓库的真实分支',
+        security: browserSecurity,
+        parameters: [
+          pathParam('id', '云效仓库数字 ID'),
+          { name: 'search', in: 'query', schema: { type: 'string', maxLength: 255 } },
+          { name: 'page', in: 'query', schema: { type: 'integer', minimum: 1, default: 1 } },
+        ],
+        responses: {
+          '200': ok(
+            '仓库分支。',
+            object(
+              {
+                branches: {
+                  type: 'array',
+                  items: object({ name: { type: 'string' }, is_default: { type: 'boolean' } }, ['name', 'is_default']),
+                },
+                default_branch: { type: 'string', nullable: true },
+                next_page: { type: 'integer', nullable: true },
+              },
+              ['branches', 'default_branch', 'next_page'],
+            ),
+          ),
+          ...common,
+          '409': error('需要绑定或更新 PAT。'),
+        },
+      },
+    },
     '/api/v1/repositories': {
       get: {
         tags: ['仓库与索引'],
-        summary: '列出当前密钥可访问的已接入仓库',
+        summary: '列出当前身份可访问的已接入仓库',
+        parameters: [
+          {
+            name: 'for_key',
+            in: 'query',
+            schema: { type: 'string', enum: ['1'] },
+            description: '在飞书会话中按个人云效权限列出可选择的仓库。',
+          },
+        ],
         responses: {
           '200': ok(
             '仓库列表。',
@@ -191,7 +245,8 @@ export const openApiDocument = {
         tags: ['仓库与索引'],
         summary: '接入仓库并创建索引任务',
         description:
-          '需要 write，接入新仓库需要无限定仓库范围的密钥。确认授权后使用已绑定 PAT 自动同步；创建成功后立即保存 webhook_token，后续不会再次返回。若仓库已接入，返回 200 且不再返回 webhook token。',
+          '以飞书会话和已绑定的 PAT 接入并验证分支。每个云效仓库跟踪一个分支，重复提交相同分支返回已有仓库。首次接入只返回一次 Webhook token。',
+        security: browserSecurity,
         requestBody: request(
           object(
             {
@@ -202,7 +257,7 @@ export const openApiDocument = {
                   { type: 'integer', minimum: 0 },
                 ],
               },
-              branch: { type: 'string', default: 'main', minLength: 1, maxLength: 255 },
+              branch: { type: 'string', minLength: 1, maxLength: 255, description: '省略时使用云效默认分支。' },
               authorize_automatic_sync: {
                 type: 'boolean',
                 enum: [true],
@@ -216,6 +271,10 @@ export const openApiDocument = {
           '200': ok('该仓库已接入。', object({ repository: ref('Repository') }, ['repository'])),
           '202': ok('仓库已接入并已创建初始索引任务。', ref('CreatedRepository')),
           ...common,
+          '409': ok(
+            '已跟踪其他分支，或云效 PAT 当前不可用。',
+            object({ error: { type: 'string' }, repository: ref('Repository') }, ['error']),
+          ),
         },
       },
     },
@@ -229,7 +288,8 @@ export const openApiDocument = {
       delete: {
         tags: ['管理'],
         summary: '删除已禁用仓库',
-        description: '需要管理员 Key；仅允许删除已禁用仓库，任务与权限缓存级联删除。',
+        description: '超级管理员可删除已禁用的仓库，任务与权限缓存级联删除。',
+        security: browserSecurity,
         parameters: [pathParam('repoId', 'CodeHarbor 仓库 ID')],
         responses: {
           '200': ok('仓库已删除。', object({ deleted: { type: 'boolean', enum: [true] } }, ['deleted'])),
@@ -242,7 +302,7 @@ export const openApiDocument = {
       post: {
         tags: ['仓库与索引'],
         summary: '触发索引同步',
-        description: '需要 write；返回任务 ID，可查询任务状态。',
+        description: '仓库接入者或同步凭证持有人可触发任务；使用 Key 时需要 write。',
         parameters: [pathParam('repoId', 'CodeHarbor 仓库 ID')],
         responses: { '202': ok('已接受任务。', jobId), ...common },
       },
@@ -251,7 +311,8 @@ export const openApiDocument = {
       put: {
         tags: ['仓库与索引'],
         summary: '重新授权自动同步凭据',
-        description: '需要 write，且调用者是仓库所有者或当前同步凭据所有者；更新授权并触发任务。',
+        description: '仓库接入者或当前同步凭证持有人用飞书会话更新授权并触发任务。',
+        security: browserSecurity,
         parameters: [pathParam('repoId', 'CodeHarbor 仓库 ID')],
         requestBody: request(
           object({ authorize_automatic_sync: { type: 'boolean', enum: [true] } }, ['authorize_automatic_sync']),
@@ -263,7 +324,8 @@ export const openApiDocument = {
       post: {
         tags: ['管理'],
         summary: '禁用仓库',
-        description: '需要管理员 Key。禁用后对所有 Key 不可见，不再同步。',
+        description: '超级管理员可以禁用仓库。禁用的仓库停止同步。',
+        security: browserSecurity,
         parameters: [pathParam('repoId', 'CodeHarbor 仓库 ID')],
         responses: { '200': ok('仓库已禁用。', object({ repository: ref('Repository') }, ['repository'])), ...common },
       },
@@ -272,6 +334,7 @@ export const openApiDocument = {
       post: {
         tags: ['管理'],
         summary: '恢复已禁用仓库并触发同步',
+        security: browserSecurity,
         parameters: [pathParam('repoId', 'CodeHarbor 仓库 ID')],
         responses: {
           '202': ok(
@@ -286,6 +349,7 @@ export const openApiDocument = {
     '/api/v1/admin/repositories': {
       get: {
         tags: ['管理'],
+        security: browserSecurity,
         summary: '列出全部已接入仓库（含已禁用）',
         description: '面向平台管理员；普通仓库列表不包含已禁用仓库。',
         responses: {
@@ -300,7 +364,8 @@ export const openApiDocument = {
     '/api/v1/admin/users': {
       get: {
         tags: ['管理'],
-        summary: '列出已绑定用户',
+        security: browserSecurity,
+        summary: '列出飞书用户',
         responses: {
           '200': ok(
             '用户列表。',
@@ -308,11 +373,7 @@ export const openApiDocument = {
               {
                 users: {
                   type: 'array',
-                  items: object({
-                    id: { type: 'string' },
-                    username: { type: 'string' },
-                    credential_version: { type: 'integer' },
-                  }),
+                  items: ref('Account'),
                 },
               },
               ['users'],
@@ -322,11 +383,26 @@ export const openApiDocument = {
         },
       },
     },
+    '/api/v1/admin/users/{userId}': {
+      patch: {
+        tags: ['管理'],
+        security: browserSecurity,
+        summary: '变更平台用户角色或状态',
+        parameters: [pathParam('userId', '平台账号 ID')],
+        requestBody: request(object({ role: accountRole, status: accountStatus })),
+        responses: {
+          '200': ok('已更新账号。', object({ user: ref('Account') }, ['user'])),
+          ...common,
+          '409': error('最后一位启用的超级管理员不可停用或降级。'),
+        },
+      },
+    },
     '/api/v1/admin/users/{userId}/revoke-keys': {
       post: {
         tags: ['管理'],
+        security: browserSecurity,
         summary: '撤销某用户的全部 Key',
-        parameters: [pathParam('userId', '云效用户 ID')],
+        parameters: [pathParam('userId', '平台账号 ID')],
         responses: {
           '200': ok(
             '已撤销。',
@@ -339,6 +415,7 @@ export const openApiDocument = {
     '/api/v1/admin/api-keys': {
       get: {
         tags: ['管理'],
+        security: browserSecurity,
         summary: '列出平台全部 Key',
         parameters: [
           { name: 'owner', in: 'query', schema: { type: 'string' } },
@@ -361,9 +438,30 @@ export const openApiDocument = {
         },
       },
     },
+    '/api/v1/admin/api-keys/{prefix}/approve': {
+      post: {
+        tags: ['管理'],
+        security: browserSecurity,
+        summary: '审核并启用限定仓库的旧 API Key',
+        parameters: [pathParam('prefix', '密钥前缀')],
+        responses: {
+          '200': ok(
+            '已通过审核。',
+            object({ approved: { type: 'boolean' }, owner: { type: 'string' }, prefix: { type: 'string' } }, [
+              'approved',
+              'owner',
+              'prefix',
+            ]),
+          ),
+          ...common,
+          '409': error('Key 或持有人当前状态不允许审核通过。'),
+        },
+      },
+    },
     '/api/v1/admin/api-keys/{prefix}': {
       delete: {
         tags: ['管理'],
+        security: browserSecurity,
         summary: '撤销任意用户的 Key',
         parameters: [pathParam('prefix', '密钥前缀，如 ch_ 后跟 8 个字符')],
         responses: {
@@ -383,6 +481,7 @@ export const openApiDocument = {
     '/api/v1/admin/audit': {
       get: {
         tags: ['管理'],
+        security: browserSecurity,
         summary: '查询持久化审计事件',
         description: '按时间倒序。代码查询只记录 SHA-256 摘要，不记录内容。',
         parameters: [
@@ -420,8 +519,9 @@ export const openApiDocument = {
     '/api/v1/api-keys': {
       get: {
         tags: ['API Key'],
+        security: browserSecurity,
         summary: '列出当前账号的密钥',
-        description: '限定仓库范围的密钥只返回自身。不会返回密钥明文。',
+        description: '列出本人名下的 Key 前缀和元数据。',
         responses: {
           '200': ok('密钥列表。', object({ keys: { type: 'array', items: ref('KeyInfo') } }, ['keys'])),
           ...common,
@@ -429,18 +529,24 @@ export const openApiDocument = {
       },
       post: {
         tags: ['API Key'],
+        security: browserSecurity,
         summary: '创建 API Key',
-        description:
-          '需要 write。read Key 必须提供明确的 repos 仓库 ID 列表；新密钥的范围不能超过当前密钥，过期时间不能晚于当前密钥；只有无截止日期的父 Key 才能创建无限期下级 Key。Key 的 owner 固定为调用者，不支持指定目标用户；代发时审计主体仍是签发者，可用 Key 前缀区分。密钥明文仅返回一次。',
-        requestBody: request(object({ scope, repos: repoScope, expires_in: expiresIn }, ['scope'])),
+        description: '创建限定仓库的 Key。权限随持有人的云效访问权限变化。密钥明文仅返回一次。',
+        requestBody: request(
+          object(
+            { scope, repos: { ...strings, minItems: 1, maxItems: 100, uniqueItems: true }, expires_in: expiresIn },
+            ['scope', 'repos'],
+          ),
+        ),
         responses: { '201': ok('密钥创建成功。', ref('CreatedKey')), ...common },
       },
     },
     '/api/v1/api-keys/{prefix}': {
       delete: {
         tags: ['API Key'],
+        security: browserSecurity,
         summary: '撤销 API Key',
-        description: '需要 write；限定仓库范围的密钥只能撤销自身。',
+        description: '在飞书会话中撤销本人名下的密钥。',
         parameters: [pathParam('prefix', '密钥前缀，如 ch_ 后跟 8 个字符')],
         responses: {
           '200': ok('密钥已撤销。', object({ revoked: { type: 'boolean', enum: [true] } }, ['revoked'])),
@@ -484,8 +590,9 @@ export const openApiDocument = {
       post: {
         tags: ['MCP'],
         summary: 'MCP Streamable HTTP 入口',
+        security: keySecurity,
         description:
-          '使用 CodeHarbor API Key，通过 MCP 客户端进行 initialize、tools/list 和 tools/call。工具包括 list_repositories、get_repository_status，以及 codegraph_search、codegraph_callers、codegraph_callees、codegraph_impact、codegraph_node、codegraph_explore、codegraph_files。代码工具必须传 repo_id；支持固定上游版本的参数（如 file、limit、maxFiles），不接受 projectPath 或仓库外路径。明确仓库列表的 Key 按列表授权；无范围 read Key 按持有者当前云效权限授权并缓存复核。每个 Key 每分钟有请求配额，超出返回 429。write 不能修改仓库代码。',
+          '使用 CodeHarbor API Key，通过 MCP 客户端进行 initialize、tools/list 和 tools/call。工具包括 list_repositories、get_repository_status，以及 codegraph_search、codegraph_callers、codegraph_callees、codegraph_impact、codegraph_node、codegraph_explore、codegraph_files。代码工具必须传 repo_id；支持固定上游版本的参数（如 file、limit、maxFiles），不接受 projectPath 或仓库外路径。权限取 Key 仓库范围和持有人云效权限的交集，源码查询还核验对应分支的克隆权限。每个 Key 每分钟有请求配额，超出返回 429。write 不能修改仓库代码。',
         requestBody: request({ type: 'object', description: 'MCP JSON-RPC 消息。' }, true),
         responses: {
           '200': { description: 'MCP 响应；格式和头部遵循 MCP 协议。' },
@@ -507,11 +614,11 @@ export const openApiDocument = {
         bearerFormat: 'CodeHarbor API Key',
         description: '通过 API Key 管理接口获得；并非云效 PAT。',
       },
-      BootstrapBearer: {
-        type: 'http',
-        scheme: 'bearer',
-        bearerFormat: 'Bootstrap token',
-        description: '绑定云效 PAT 后得到的一次性短期令牌。',
+      BrowserSession: {
+        type: 'apiKey',
+        in: 'cookie',
+        name: '__Host-codeharbor_session',
+        description: '通过飞书登录获得。',
       },
       MetricsBearer: { type: 'http', scheme: 'bearer', description: '单独配置的 metrics token。' },
       WebhookToken: {
@@ -527,33 +634,30 @@ export const openApiDocument = {
         ['error'],
       ),
       Health: object({ status: { type: 'string', enum: ['ok', 'unavailable'] } }, ['status']),
-      BootstrapSession: object(
+      Account: object(
         {
-          bootstrap_token: { type: 'string' },
-          expires_in: { type: 'integer', description: '单位秒。' },
-          user: object({ id: { type: 'string' }, name: { type: 'string' } }, ['id', 'name']),
+          id: { type: 'string' },
+          username: { type: 'string' },
+          name: { type: 'string' },
+          role: accountRole,
+          status: accountStatus,
+          codeup_user_id: { type: 'string', nullable: true },
+          has_pat: { type: 'boolean' },
         },
-        ['bootstrap_token', 'expires_in', 'user'],
-      ),
-      BootstrapKey: object(
-        {
-          token: { type: 'string' },
-          prefix: { type: 'string' },
-          scope,
-          expires_in: { type: 'integer', nullable: true, description: '单位秒；null 表示无限期（无截止日期）。' },
-        },
-        ['token', 'prefix', 'scope', 'expires_in'],
+        ['id', 'username', 'role', 'status', 'codeup_user_id', 'has_pat'],
       ),
       Me: object(
         {
           id: { type: 'string' },
           username: { type: 'string' },
-          key_scope: scope,
-          key_prefix: { type: 'string' },
+          role: accountRole,
+          has_pat: { type: 'boolean' },
+          key_scope: { ...scope, nullable: true },
+          key_prefix: { type: 'string', nullable: true },
           key_repos: repoScope,
           key_expires_at: { type: 'integer', nullable: true, description: 'Unix 毫秒时间戳。' },
-          can_write: { type: 'boolean', description: '密钥可执行平台管理与触发索引。' },
-          is_admin: { type: 'boolean', description: '无限定仓库范围的 write 密钥，由配置允许的用户持有。' },
+          can_write: { type: 'boolean', description: '账号可接入仓库，或密钥具备同步能力。' },
+          is_admin: { type: 'boolean', description: '飞书会话属于超级管理员。' },
         },
         ['id', 'username', 'key_scope', 'key_prefix', 'key_repos', 'key_expires_at', 'can_write', 'is_admin'],
       ),
@@ -578,6 +682,8 @@ export const openApiDocument = {
           stale: { type: 'boolean' },
           error: { type: 'string', nullable: true },
           webhook_path: { type: 'string', description: 'Codeup Webhook 路径；token 仅在接入时返回。' },
+          can_manage: { type: 'boolean' },
+          can_authorize_sync: { type: 'boolean' },
         },
         [
           'repo_id',
@@ -636,6 +742,12 @@ export const openApiDocument = {
           id: { type: 'string' },
           repo_id: { type: 'string' },
           status: { type: 'string', enum: ['queued', 'running', 'succeeded', 'failed'] },
+          phase: {
+            type: 'string',
+            nullable: true,
+            enum: [...JOB_PHASES, null],
+            description: '当前或最后执行的阶段。历史记录可能为空。',
+          },
           reason: { type: 'string' },
           created_at: { type: 'integer', description: '首次创建时的 Unix 毫秒时间戳。' },
           queued_at: {
@@ -651,7 +763,18 @@ export const openApiDocument = {
           },
           error: { type: 'string', nullable: true },
         },
-        ['id', 'repo_id', 'status', 'reason', 'created_at', 'queued_at', 'finished_at', 'build_duration_ms', 'error'],
+        [
+          'id',
+          'repo_id',
+          'status',
+          'phase',
+          'reason',
+          'created_at',
+          'queued_at',
+          'finished_at',
+          'build_duration_ms',
+          'error',
+        ],
       ),
       AdminKeyInfo: object(
         {
@@ -661,6 +784,8 @@ export const openApiDocument = {
           repos: repoScope,
           expires_at: { type: 'integer', nullable: true },
           revoked: { type: 'boolean' },
+          legacy_pending: { type: 'boolean' },
+          legacy_approvable: { type: 'boolean' },
         },
         ['prefix', 'owner', 'scope', 'repos', 'expires_at', 'revoked'],
       ),
@@ -686,6 +811,7 @@ export const openApiDocument = {
           repos: repoScope,
           expires_at: { type: 'integer', nullable: true, description: 'Unix 毫秒时间戳。' },
           revoked: { type: 'boolean' },
+          legacy_pending: { type: 'boolean' },
         },
         ['prefix', 'scope', 'repos', 'expires_at', 'revoked'],
       ),

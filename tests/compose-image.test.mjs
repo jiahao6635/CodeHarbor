@@ -10,6 +10,11 @@ const env = {
   YUNXIAO_ENDPOINT: 'https://example.invalid',
   CODEHARBOR_GIT_HOSTS: 'example.invalid',
   CODEHARBOR_ALLOWED_HOSTS: 'example.invalid',
+  CODEHARBOR_PUBLIC_ORIGIN: 'https://example.invalid',
+  CODEHARBOR_FEISHU_APP_ID: 'cli_fixture',
+  CODEHARBOR_FEISHU_APP_SECRET_FILE: '/tmp/feishu-app-secret',
+  CODEHARBOR_FEISHU_TENANT_KEY: 'fixture-tenant',
+  CODEHARBOR_FEISHU_SUPER_ADMIN_OPEN_ID: 'ou_fixture_admin',
   CODEHARBOR_VAULT_ADDR: 'https://vault.invalid',
   CODEHARBOR_VAULT_TRANSIT_KEY: 'test',
   CODEHARBOR_NGINX_IMAGE: 'nginx:alpine',
@@ -55,6 +60,8 @@ for (const localPostgres of [false, true]) {
     const controller = config.services['image-controller'];
     assert.equal(app.environment.CODEHARBOR_INDEX_BACKEND, 'image');
     assert.equal(app.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');
+    assert.equal(app.environment.CODEHARBOR_PUBLIC_ORIGIN, 'https://example.invalid');
+    assert.equal(app.environment.CODEHARBOR_FEISHU_APP_SECRET_FILE, '/run/secrets/feishu_app_secret');
     assert.equal(controller.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '10');
     assert.equal(controller.environment.CODEHARBOR_IMAGE_MAX_IMAGES, '512');
     assert.equal(controller.environment.CODEHARBOR_IMAGE_STORAGE_BUDGET_BYTES, '68719476736');
@@ -73,7 +80,14 @@ for (const localPostgres of [false, true]) {
     assert.equal(controller.read_only, true);
     assert.deepEqual(controller.cap_drop, ['ALL']);
     assert.ok(!controller.cap_add?.length);
-    for (const name of ['image_query_token', 'image_build_token', 'image_auth_token', 'database_url', 'vault_token'])
+    for (const name of [
+      'image_query_token',
+      'image_build_token',
+      'image_auth_token',
+      'database_url',
+      'vault_token',
+      'feishu_app_secret',
+    ])
       assert.ok(app.secrets.some((item) => item.source === name));
     if (localPostgres) {
       assert.ok(config.services.postgres);
@@ -115,6 +129,8 @@ test('image Compose passes one configurable query limit to platform and controll
   assert.equal(services.codeharbor.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '7');
   assert.equal(services['image-controller'].environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, '7');
   assert.equal(services.mcp.environment.CODEHARBOR_MCP_QUERY_CONCURRENCY, undefined);
+  assert.equal(services.mcp.environment.CODEHARBOR_FEISHU_APP_SECRET_FILE, undefined);
+  assert.ok(!services.mcp.secrets.some((secret) => secret.source === 'feishu_app_secret'));
   assert.equal(services.mcp.environment.CODEHARBOR_TRUST_PROXY, 'true');
   assert.equal(services.mcp.environment.CODEHARBOR_MCP_KEY_RATE_PER_MIN, '120');
   assert.equal(services.mcp.environment.CODEHARBOR_AUTH_FAILURE_RATE_PER_MIN, '30');

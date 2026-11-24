@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { createAccessKey, hashAccessKey } from '../src/auth.js';
 import { CodeupError } from '../src/codeup.js';
-import { type AppConfig, type AuditEvent, createApp } from '../src/server.js';
+import type { AppConfig, AuditEvent } from '../src/server.js';
+import { createLegacyTestApp as createApp } from './helpers/legacy-auth.js';
 import { openTestStore } from './helpers/postgres.js';
 
 test('HTTP bootstrap, permissions, MCP and webhooks enforce repository boundaries', async () => {

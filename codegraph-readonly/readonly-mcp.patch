@@ -31,10 +31,9 @@
      const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
      this.session = new MCPSession(transport, this.engine, {
        explicitProjectPath: this.projectPath,
---- a/src/mcp/tools.ts
-+++ b/src/mcp/tools.ts
-@@ -2179,6 +2179,6 @@
-         'codegraph_search',
+--- a/src/mcp/tools.ts	2026-11-20 11:03:43
++++ b/src/mcp/tools.ts	2026-11-20 11:03:43
+@@ -2180,5 +2180,5 @@
          'codegraph_node',
        ]);
 -      if (stats.fileCount < TINY_REPO_FILE_THRESHOLD) {

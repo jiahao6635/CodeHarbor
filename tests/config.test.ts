@@ -3,7 +3,36 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { databaseUrl, indexBackend, validateDatabaseTls, validateProduction } from '../src/config.js';
+import { databaseUrl, feishuConfig, indexBackend, validateDatabaseTls, validateProduction } from '../src/config.js';
+
+test('Feishu production needs a secure canonical origin and a mount-backed app secret', async () => {
+  assert.equal(await feishuConfig({ NODE_ENV: 'test' }), undefined);
+  await assert.rejects(feishuConfig({ NODE_ENV: 'production' }), /Incomplete/);
+  const dir = await mkdtemp(join(tmpdir(), 'codeharbor-feishu-config-'));
+  const secretPath = join(dir, 'feishu-secret');
+  try {
+    await writeFile(secretPath, 'fixture-app-secret\n', { mode: 0o600 });
+    const env = {
+      NODE_ENV: 'production',
+      CODEHARBOR_PUBLIC_ORIGIN: 'https://codeharbor.example/',
+      CODEHARBOR_FEISHU_APP_ID: 'cli_test',
+      CODEHARBOR_FEISHU_APP_SECRET_FILE: secretPath,
+      CODEHARBOR_FEISHU_TENANT_KEY: 'testtenant',
+      CODEHARBOR_FEISHU_SUPER_ADMIN_OPEN_ID: 'ou_admin',
+    };
+    const configured = await feishuConfig(env);
+    assert.equal(configured?.origin, 'https://codeharbor.example');
+    assert.equal(configured?.appSecret, 'fixture-app-secret');
+    await assert.rejects(feishuConfig({ ...env, CODEHARBOR_PUBLIC_ORIGIN: 'http://localhost:8080' }), /ORIGIN/);
+    await assert.rejects(feishuConfig({ ...env, CODEHARBOR_PUBLIC_ORIGIN: 'https://codeharbor.example/ui' }), /ORIGIN/);
+    assert.equal(
+      (await feishuConfig({ ...env, NODE_ENV: 'test', CODEHARBOR_PUBLIC_ORIGIN: 'http://localhost:8080' }))?.origin,
+      'http://localhost:8080',
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test('index backend accepts only known values', () => {
   assert.equal(indexBackend({}), 'filesystem');

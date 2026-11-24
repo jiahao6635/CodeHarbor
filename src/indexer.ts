@@ -3,6 +3,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
+import type { JobPhase } from './store.js';
 
 /** The caller must obtain cloneUrl from Codeup, not from an API client. */
 export interface IndexRequest {
@@ -15,6 +16,7 @@ export interface IndexRequest {
   token: string;
   codegraphBin?: string;
   timeoutMs?: number;
+  onProgress?: (phase: Extract<JobPhase, 'cloning' | 'indexing' | 'packaging'>) => Promise<void>;
 }
 
 export interface IndexCandidate {
@@ -302,6 +304,7 @@ export async function buildIndexCandidate(request: IndexRequest): Promise<IndexC
     const git = (args: string[], cwd = home) =>
       run('git', [...gitOptions, ...args], cwd, gitEnv, timeout, `git ${args[0]}`);
     await git(['check-ref-format', '--branch', request.branch]);
+    await request.onProgress?.('cloning');
     await git(['clone', '--no-checkout', '--single-branch', '--branch', request.branch, '--', remote, worktree]);
     const commit = await git(['rev-parse', 'HEAD^{commit}'], worktree);
     if (!/^[0-9a-f]{40,64}$/.test(commit)) throw new IndexError('INVALID_COMMIT', 'Git returned an invalid commit');
@@ -317,6 +320,7 @@ export async function buildIndexCandidate(request: IndexRequest): Promise<IndexC
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
     const codegraph = request.codegraphBin ?? 'codegraph';
+    await request.onProgress?.('indexing');
     await run(codegraph, ['init', worktree, '--yes'], home, baseEnv, timeout, 'CodeGraph init');
     const statusOutput = await run(
       codegraph,

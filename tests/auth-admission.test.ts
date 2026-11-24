@@ -6,7 +6,8 @@ import type { AppContext } from '../src/http/context.js';
 import { HttpError } from '../src/http/errors.js';
 import { authenticateBearerRequest } from '../src/http/guards.js';
 import { RateLimiter } from '../src/rate-limit.js';
-import { type AuditEvent, createApp } from '../src/server.js';
+import type { AuditEvent } from '../src/server.js';
+import { createLegacyTestApp as createApp } from './helpers/legacy-auth.js';
 
 const validToken = `ch_${'v'.repeat(43)}`;
 const validKey: Principal = {

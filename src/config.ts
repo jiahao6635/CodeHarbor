@@ -1,4 +1,53 @@
 import { readFile } from 'node:fs/promises';
+import type { FeishuConfig } from './browser-auth.js';
+
+export async function feishuConfig(env: NodeJS.ProcessEnv): Promise<FeishuConfig | undefined> {
+  const origin = env.CODEHARBOR_PUBLIC_ORIGIN;
+  const appId = env.CODEHARBOR_FEISHU_APP_ID;
+  const secretFile = env.CODEHARBOR_FEISHU_APP_SECRET_FILE;
+  const tenantKey = env.CODEHARBOR_FEISHU_TENANT_KEY;
+  const superAdminOpenId = env.CODEHARBOR_FEISHU_SUPER_ADMIN_OPEN_ID;
+  const production = env.NODE_ENV === 'production';
+  if (!production && !origin && !appId && !secretFile && !tenantKey && !superAdminOpenId) return undefined;
+  if (!origin || !appId || !secretFile || !tenantKey || !superAdminOpenId) {
+    throw new Error('Incomplete CodeHarbor Feishu login configuration');
+  }
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    throw new Error('Invalid CODEHARBOR_PUBLIC_ORIGIN');
+  }
+  const devLoopback = !production && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+  if (
+    (url.protocol !== 'https:' && !(devLoopback && url.protocol === 'http:')) ||
+    url.username ||
+    url.password ||
+    url.pathname !== '/' ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error('Invalid CODEHARBOR_PUBLIC_ORIGIN');
+  }
+  if (
+    !/^cli_[A-Za-z0-9_-]{1,128}$/.test(appId) ||
+    !/^[A-Za-z0-9_-]{1,128}$/.test(tenantKey) ||
+    !/^ou_[A-Za-z0-9_-]{1,128}$/.test(superAdminOpenId)
+  ) {
+    throw new Error('Invalid Feishu application, tenant or bootstrap administrator identifier');
+  }
+  let appSecret: string;
+  try {
+    appSecret = (await readFile(secretFile, 'utf8')).trim();
+  } catch {
+    throw new Error('Feishu App Secret file is unavailable');
+  }
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: secrets must be single printable values
+  if (!appSecret || appSecret.length > 4096 || /[\x00-\x20\x7f]/.test(appSecret)) {
+    throw new Error('Invalid Feishu App Secret file');
+  }
+  return { origin: url.origin, appId, appSecret, tenantKey, superAdminOpenId };
+}
 
 /** Read connection material without including it in error messages or logs. */
 export async function databaseUrl(env: NodeJS.ProcessEnv): Promise<string> {

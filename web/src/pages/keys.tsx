@@ -4,7 +4,7 @@ import { Link } from 'react-router';
 import { toast } from 'sonner';
 import { useCreateKey, useKeys, useRepositories, useRevokeKey } from '@/api/hooks';
 import type { CreatedKey, KeyInfo, Scope } from '@/api/types';
-import { useAbility, useSession } from '@/auth/session';
+import { useAbility } from '@/auth/session';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { EmptyState } from '@/components/empty-state';
 import { ErrorNotice } from '@/components/error-notice';
@@ -28,17 +28,11 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatAbsolute, formatExpiry } from '@/lib/format';
 import { toastError } from '@/lib/toast';
-import {
-  childExpiryOptions,
-  parseExpiry,
-  resolveChildExpiry,
-  UNLIMITED_EXPIRY_HELP,
-  UNLIMITED_EXPIRY_OPTION,
-} from '@/lib/validation';
+import { DEFAULT_EXPIRES_IN, EXPIRY_OPTIONS, parseExpiry, UNLIMITED_EXPIRY_HELP } from '@/lib/validation';
 
 export function KeyScopeCell({ info }: { info: Pick<KeyInfo, 'scope' | 'repos'> }) {
   if (info.repos === null) {
-    return info.scope === 'write' ? <Badge tone="accent">平台管理</Badge> : <Badge tone="neutral">跟随云效权限</Badge>;
+    return <Badge tone="neutral">旧版未限定</Badge>;
   }
   return (
     <span className="text-xs text-muted-foreground" title={info.repos.join('\n')}>
@@ -56,46 +50,27 @@ function CreateKeyDialog({
   onOpenChange: (open: boolean) => void;
   onCreated: (key: CreatedKey) => void;
 }) {
-  const { me } = useAbility();
-  const repositories = useRepositories();
+  const repositories = useRepositories(true);
   const create = useCreateKey();
   const [scope, setScope] = useState<Scope>('read');
   const [selected, setSelected] = useState<string[]>([]);
-  const [chosenExpiry, setChosenExpiry] = useState<number | null | undefined>(undefined);
+  const [expiresIn, setExpiresIn] = useState<number | null>(DEFAULT_EXPIRES_IN);
   const [error, setError] = useState<string | null>(null);
   const scopeId = useId();
   const expiryId = useId();
 
-  const parentExpiry = me?.key_expires_at;
-  const expiryOptions = childExpiryOptions(parentExpiry);
-  // Default to the longest finite option; null is only used when explicitly selected.
-  const expiresIn = resolveChildExpiry(expiryOptions, chosenExpiry);
-  const expiryHelp =
-    typeof parentExpiry === 'number' ? (
-      <>
-        当前 Key 有到期日。要创建无限期的下级 Key，请先
-        <Link to="/onboarding" className="text-accent underline underline-offset-4">
-          用云效 PAT 申请无限期 write Key
-        </Link>
-        。
-      </>
-    ) : expiresIn === null ? (
-      UNLIMITED_EXPIRY_HELP
-    ) : undefined;
+  const expiryHelp = expiresIn === null ? UNLIMITED_EXPIRY_HELP : undefined;
+  const selectable = (repositories.data ?? []).filter((repo) => scope === 'read' || repo.can_manage);
+  const selectedRepos = selected.filter((id) => selectable.some((repo) => repo.repo_id === id));
 
   const submit = () => {
     setError(null);
-    // Recheck at submission in case the parent's remaining lifetime has shrunk.
-    if (expiresIn === undefined || !childExpiryOptions(parentExpiry).some((option) => option.seconds === expiresIn)) {
-      setError('当前 Key 的剩余有效期不足，请重新选择或更换 Key。');
-      return;
-    }
-    if (scope === 'read' && selected.length === 0) {
-      setError('read Key 必须至少选择一个仓库。');
+    if (selectedRepos.length === 0) {
+      setError('请至少选择一个仓库。');
       return;
     }
     create.mutate(
-      { scope, repos: scope === 'read' ? selected : null, expires_in: expiresIn },
+      { scope, repos: selectedRepos, expires_in: expiresIn },
       {
         onSuccess: (key) => {
           onOpenChange(false);
@@ -111,93 +86,83 @@ function CreateKeyDialog({
     <Dialog open={open} onOpenChange={(next) => !create.isPending && onOpenChange(next)}>
       <DialogContent size="lg">
         <DialogHeader>
-          <DialogTitle>创建下级 Key</DialogTitle>
-          <DialogDescription>
-            下级 Key 的有效期不能超过当前 Key（{parentExpiry === null ? '永不过期' : formatAbsolute(parentExpiry)}
-            ）。read Key 只能查询明确列出的仓库，不再核验云效权限，审计归属于你。
-          </DialogDescription>
+          <DialogTitle>创建 API Key</DialogTitle>
+          <DialogDescription>Key 只能访问选中的仓库，实际权限随你的云效权限变化。</DialogDescription>
         </DialogHeader>
         {error ? <Alert tone="error">{error}</Alert> : null}
         <Field id={scopeId} label="类型">
-          <NativeSelect id={scopeId} value={scope} onChange={(event) => setScope(event.target.value as Scope)}>
+          <NativeSelect
+            id={scopeId}
+            value={scope}
+            onChange={(event) => {
+              setScope(event.target.value as Scope);
+              setSelected([]);
+            }}
+          >
             <option value="read">read（限定仓库，供 CI / 机器人查询代码）</option>
-            <option value="write">write（平台管理，不能查询代码）</option>
+            <option value="write">write（查询和触发有权维护的仓库同步）</option>
           </NativeSelect>
         </Field>
-        {scope === 'read' ? (
-          <fieldset className="flex flex-col gap-2">
-            <legend className="mb-1 text-sm font-medium">仓库范围（最多 100 个）</legend>
-            {repositories.isPending ? (
-              <Skeleton className="h-24 w-full" />
-            ) : repositories.isError ? (
-              <ErrorNotice error={repositories.error} title="仓库列表加载失败" />
-            ) : repositories.data.length === 0 ? (
-              <p className="text-sm text-muted-foreground">当前没有可选择的仓库。</p>
-            ) : (
-              <ul className="max-h-56 overflow-y-auto rounded-sm border border-border">
-                {repositories.data.map((repo) => {
-                  const id = `repo-${repo.repo_id}`;
-                  const checked = selected.includes(repo.repo_id);
-                  return (
-                    <li
-                      key={repo.repo_id}
-                      className="flex items-center gap-3 border-b border-border px-3 py-2 last:border-0"
+        <fieldset className="flex flex-col gap-2">
+          <legend className="mb-1 text-sm font-medium">仓库范围（最多 100 个）</legend>
+          {repositories.isPending ? (
+            <Skeleton className="h-24 w-full" />
+          ) : repositories.isError ? (
+            <ErrorNotice error={repositories.error} title="仓库列表加载失败" />
+          ) : selectable.length === 0 ? (
+            <p className="text-sm text-muted-foreground">当前没有可选择的仓库。</p>
+          ) : (
+            <ul className="max-h-56 overflow-y-auto rounded-sm border border-border">
+              {selectable.map((repo) => {
+                const id = `repo-${repo.repo_id}`;
+                const checked = selectedRepos.includes(repo.repo_id);
+                return (
+                  <li
+                    key={repo.repo_id}
+                    className="flex items-center gap-3 border-b border-border px-3 py-2 last:border-0"
+                  >
+                    <Checkbox
+                      id={id}
+                      checked={checked}
+                      disabled={!checked && selectedRepos.length >= 100}
+                      onCheckedChange={(value) =>
+                        setSelected((current) =>
+                          value === true ? [...current, repo.repo_id] : current.filter((item) => item !== repo.repo_id),
+                        )
+                      }
+                    />
+                    <Label
+                      htmlFor={id}
+                      className="flex min-w-0 flex-1 cursor-pointer items-center justify-between gap-2 font-normal"
                     >
-                      <Checkbox
-                        id={id}
-                        checked={checked}
-                        disabled={!checked && selected.length >= 100}
-                        onCheckedChange={(value) =>
-                          setSelected((current) =>
-                            value === true
-                              ? [...current, repo.repo_id]
-                              : current.filter((item) => item !== repo.repo_id),
-                          )
-                        }
-                      />
-                      <Label
-                        htmlFor={id}
-                        className="flex min-w-0 flex-1 cursor-pointer items-center justify-between gap-2 font-normal"
-                      >
-                        <span className="truncate">{repo.name}</span>
-                        <span className="font-mono text-xs text-muted-foreground">{repo.branch}</span>
-                      </Label>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </fieldset>
-        ) : null}
+                      <span className="truncate">{repo.name}</span>
+                      <span className="font-mono text-xs text-muted-foreground">{repo.branch}</span>
+                    </Label>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </fieldset>
         <Field id={expiryId} label="有效期" helper={expiryHelp}>
           <NativeSelect
             id={expiryId}
-            value={expiresIn === undefined ? '' : String(expiresIn)}
-            onChange={(event) => setChosenExpiry(parseExpiry(event.target.value))}
+            value={String(expiresIn)}
+            onChange={(event) => setExpiresIn(parseExpiry(event.target.value))}
             aria-describedby={describedBy(expiryId, { helper: Boolean(expiryHelp) })}
           >
-            {expiryOptions.length === 0 ? (
-              <option value="" disabled>
-                无可用有效期
-              </option>
-            ) : null}
-            {expiryOptions.map((option) => (
+            {EXPIRY_OPTIONS.map((option) => (
               <option key={String(option.seconds)} value={String(option.seconds)}>
                 {option.label}
               </option>
             ))}
-            {parentExpiry !== null ? (
-              <option value={String(UNLIMITED_EXPIRY_OPTION.seconds)} disabled>
-                {UNLIMITED_EXPIRY_OPTION.label}
-              </option>
-            ) : null}
           </NativeSelect>
         </Field>
         <DialogFooter>
           <Button variant="secondary" onClick={() => onOpenChange(false)} disabled={create.isPending}>
             取消
           </Button>
-          <Button onClick={submit} loading={create.isPending} disabled={expiryOptions.length === 0}>
+          <Button onClick={submit} loading={create.isPending} disabled={selectedRepos.length === 0}>
             创建
           </Button>
         </DialogFooter>
@@ -206,23 +171,17 @@ function CreateKeyDialog({
   );
 }
 
-function KeyStatus({ info }: { info: KeyInfo }) {
+export function KeyStatus({ info }: { info: KeyInfo }) {
   if (info.revoked) return <Badge tone="error">已撤销</Badge>;
   if (info.expires_at !== null && info.expires_at <= Date.now()) return <Badge tone="pending">已过期</Badge>;
+  if (info.legacy_pending) return <Badge tone="warning">待审核</Badge>;
   return <Badge tone="ready">有效</Badge>;
 }
 
-function KeyRow({ info, current, onRevoke }: { info: KeyInfo; current: boolean; onRevoke: (info: KeyInfo) => void }) {
+function KeyRow({ info, onRevoke }: { info: KeyInfo; onRevoke: (info: KeyInfo) => void }) {
   return (
     <TableRow>
-      <TableCell className="font-mono text-xs">
-        {info.prefix}
-        {current ? (
-          <Badge tone="progress" className="ml-2">
-            当前登录
-          </Badge>
-        ) : null}
-      </TableCell>
+      <TableCell className="font-mono text-xs">{info.prefix}</TableCell>
       <TableCell>
         <Badge tone={info.scope === 'write' ? 'accent' : 'neutral'}>{info.scope}</Badge>
       </TableCell>
@@ -251,8 +210,7 @@ function KeyRow({ info, current, onRevoke }: { info: KeyInfo; current: boolean; 
 }
 
 export default function KeysPage() {
-  const { me, canWrite, isUnrestricted } = useAbility();
-  const { signOut } = useSession();
+  const { hasPat } = useAbility();
   const keys = useKeys();
   const revoke = useRevokeKey();
   const [createOpen, setCreateOpen] = useState(false);
@@ -261,14 +219,9 @@ export default function KeysPage() {
 
   const confirmRevoke = () => {
     if (!revoking) return;
-    const isCurrent = revoking.prefix === me?.key_prefix;
     revoke.mutate(revoking.prefix, {
       onSuccess: () => {
         setRevoking(null);
-        if (isCurrent) {
-          signOut('manual');
-          return;
-        }
         toast.success('Key 已撤销', { description: revoking.prefix });
       },
       onError: (error) => toastError(error, '撤销失败'),
@@ -279,18 +232,18 @@ export default function KeysPage() {
     <>
       <PageHeader
         title="Key"
-        description={
-          isUnrestricted
-            ? '你名下的全部 CodeHarbor Key。撤销后立即失效，无法恢复。'
-            : '限定仓库范围的 Key 只能查看和撤销自身。'
-        }
+        description="你名下的 CodeHarbor API Key，可用于 Agent 和 CI。"
         actions={
-          canWrite ? (
+          hasPat ? (
             <Button onClick={() => setCreateOpen(true)}>
               <Plus aria-hidden="true" />
-              创建下级 Key
+              创建 API Key
             </Button>
-          ) : null
+          ) : (
+            <Button asChild variant="secondary">
+              <Link to="/onboarding">绑定云效 PAT</Link>
+            </Button>
+          )
         }
       />
       {keys.isPending ? (
@@ -313,13 +266,13 @@ export default function KeysPage() {
           </TableHeader>
           <TableBody>
             {keys.data.map((info) => (
-              <KeyRow key={info.prefix} info={info} current={info.prefix === me?.key_prefix} onRevoke={setRevoking} />
+              <KeyRow key={info.prefix} info={info} onRevoke={setRevoking} />
             ))}
           </TableBody>
         </Table>
       )}
 
-      <CreateKeyDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={setCreated} />
+      {createOpen ? <CreateKeyDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={setCreated} /> : null}
       <SecretReveal
         open={created !== null}
         title="新的 CodeHarbor Key"
@@ -335,11 +288,7 @@ export default function KeysPage() {
         open={revoking !== null}
         onOpenChange={(open) => !open && setRevoking(null)}
         title={`撤销 Key ${revoking?.prefix ?? ''}`}
-        description={
-          revoking?.prefix === me?.key_prefix
-            ? '这是你当前登录使用的 Key。撤销后将立即退出控制台，且使用它的 MCP 客户端会同时失效。'
-            : '撤销后使用该 Key 的所有客户端立即失去访问权限，此操作不可恢复。'
-        }
+        description="撤销后，使用此 Key 的客户端会立即失去访问权限。"
         confirmLabel="撤销"
         loading={revoke.isPending}
         onConfirm={confirmRevoke}

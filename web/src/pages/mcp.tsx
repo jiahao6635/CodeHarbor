@@ -1,5 +1,4 @@
 import { useConsoleConfig } from '@/api/hooks';
-import { useAbility } from '@/auth/session';
 import { CopyButton } from '@/components/copy-button';
 import { PageHeader } from '@/components/page-header';
 import { Alert } from '@/components/ui/alert';
@@ -34,7 +33,6 @@ function Snippet({ code, label }: { code: string; label: string }) {
 }
 
 export default function McpPage() {
-  const { me } = useAbility();
   const config = useConsoleConfig();
   const mcpUrl = mcpEndpoint(config.data, window.location.origin);
   const separateAddress = mcpOnSeparateAddress(config.data, window.location.origin);
@@ -53,12 +51,6 @@ export default function McpPage() {
         description="将 CodeHarbor 配置为 Agent 的 MCP 服务器，用 CodeHarbor Key 认证；不要向 Agent 暴露云效 PAT。"
       />
       <div className="flex flex-col gap-4">
-        {me?.is_admin ? (
-          <Alert tone="info">
-            管理 Key（无限定仓库范围的 write Key）不能查询代码。请使用自助 read Key，或在 Key 页面创建限定仓库范围的
-            read Key 供 Agent 使用。
-          </Alert>
-        ) : null}
         {separateAddress ? (
           <Alert tone="warning" title="MCP 使用单独的地址">
             MCP 不在当前控制台域名下提供，需要通过下方地址访问；控制台能打开不代表 MCP 地址可达。

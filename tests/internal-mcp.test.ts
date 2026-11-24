@@ -20,7 +20,8 @@ import { test } from 'node:test';
 import { CredentialCipher, createAccessKey } from '../src/auth.js';
 import { CodeupError } from '../src/codeup.js';
 import { createInternalMcpHandler } from '../src/internal-mcp.js';
-import { type AuditEvent, createApp } from '../src/server.js';
+import type { AuditEvent } from '../src/server.js';
+import { createLegacyTestApp as createApp } from './helpers/legacy-auth.js';
 import { openTestStore } from './helpers/postgres.js';
 
 function send(path: string, data: unknown): Promise<any> {

@@ -11,6 +11,7 @@ export class CodeupError extends Error {
 }
 
 export type CodeupUser = { id: string; username: string; name: string };
+export type CodeupBranch = { name: string; is_default: boolean };
 export type CodeupRepository = {
   id: string;
   name: string;
@@ -63,6 +64,38 @@ function repository(value: unknown): CodeupRepository {
 /** A detail response proves a repository role, not permission to clone. */
 export function hasRepositoryRole(repo: CodeupRepository): boolean {
   return repo.accessLevel !== null && [20, 30, 40].includes(repo.accessLevel);
+}
+
+function branch(value: unknown): CodeupBranch {
+  const data = record(value);
+  if (typeof data.name !== 'string' || !data.name || data.name.length > 255 || typeof data.defaultBranch !== 'boolean')
+    throw new CodeupError('invalid_response');
+  return { name: data.name, is_default: data.defaultBranch };
+}
+
+function nextResultPage(headers: Headers, page: number, resultCount: number): number | null {
+  const next = headers.get('x-next-page');
+  const total = headers.get('x-total-pages');
+  if (
+    (next && (!/^\d+$/.test(next) || !Number.isSafeInteger(Number(next)))) ||
+    (total && (!/^\d+$/.test(total) || !Number.isSafeInteger(Number(total))))
+  )
+    throw new CodeupError('invalid_response');
+  const nextPage = next ? Number(next) : null;
+  const totalPages = total ? Number(total) : null;
+  // Region can repeat the last page in x-next-page; total pages proves termination.
+  if (
+    totalPages !== null &&
+    ((nextPage !== null && nextPage > page && nextPage !== page + 1) ||
+      (nextPage !== null && nextPage > totalPages) ||
+      (totalPages < page && resultCount > 0) ||
+      (totalPages > page && (nextPage === null || nextPage <= page)) ||
+      (totalPages <= page && nextPage !== null && nextPage > page))
+  )
+    throw new CodeupError('invalid_response');
+  if (nextPage !== null && nextPage <= page && (totalPages === null || totalPages > page))
+    throw new CodeupError('invalid_response');
+  return nextPage !== null && nextPage > page ? nextPage : null;
 }
 
 export class CodeupClient {
@@ -139,28 +172,7 @@ export class CodeupClient {
       token,
     );
     if (!Array.isArray(data)) throw new CodeupError('invalid_response');
-    const next = headers.get('x-next-page');
-    const total = headers.get('x-total-pages');
-    if (
-      (next && (!/^\d+$/.test(next) || !Number.isSafeInteger(Number(next)))) ||
-      (total && (!/^\d+$/.test(total) || !Number.isSafeInteger(Number(total))))
-    )
-      throw new CodeupError('invalid_response');
-    const nextPage = next ? Number(next) : null;
-    const totalPages = total ? Number(total) : null;
-    // Region can repeat the last page in x-next-page; total pages proves termination.
-    if (
-      totalPages !== null &&
-      ((nextPage !== null && nextPage > page && nextPage !== page + 1) ||
-        (nextPage !== null && nextPage > totalPages) ||
-        (totalPages < page && data.length > 0) ||
-        (totalPages > page && (nextPage === null || nextPage <= page)) ||
-        (totalPages <= page && nextPage !== null && nextPage > page))
-    )
-      throw new CodeupError('invalid_response');
-    if (nextPage !== null && nextPage <= page && (totalPages === null || totalPages > page))
-      throw new CodeupError('invalid_response');
-    return { repositories: data.map(repository), nextPage: nextPage !== null && nextPage > page ? nextPage : null };
+    return { repositories: data.map(repository), nextPage: nextResultPage(headers, page, data.length) };
   }
 
   async getRepository(token: string, repoId: string): Promise<CodeupRepository> {
@@ -169,5 +181,32 @@ export class CodeupClient {
     const repo = repository(data);
     if (repo.id !== repoId) throw new CodeupError('invalid_response');
     return repo;
+  }
+
+  async listBranches(
+    token: string,
+    repoId: string,
+    page: number,
+    search = '',
+  ): Promise<{ branches: CodeupBranch[]; nextPage: number | null }> {
+    if (!/^\d+$/.test(repoId)) throw new Error('Invalid repository ID');
+    const query = new URLSearchParams({ page: String(page), perPage: '30', sort: 'name_asc' });
+    if (search) query.set('search', search);
+    const { data, headers } = await this.get(`${this.repositoryRoot}/repositories/${repoId}/branches?${query}`, token);
+    if (!Array.isArray(data)) throw new CodeupError('invalid_response');
+    return { branches: data.map(branch), nextPage: nextResultPage(headers, page, data.length) };
+  }
+
+  async getBranch(token: string, repoId: string, name: string): Promise<CodeupBranch> {
+    if (!/^\d+$/.test(repoId)) throw new Error('Invalid repository ID');
+    // URL normalizes dot path segments, independent of percent-encoding.
+    if (name === '.' || name === '..' || !name) throw new CodeupError('not_found');
+    const { data } = await this.get(
+      `${this.repositoryRoot}/repositories/${repoId}/branches/${encodeURIComponent(name)}`,
+      token,
+    );
+    const result = branch(data);
+    if (result.name !== name) throw new CodeupError('invalid_response');
+    return result;
   }
 }

@@ -155,3 +155,30 @@ test('Codeup errors do not expose upstream details or token', async () => {
     (error) => error.kind === 'unavailable' && !error.message.includes('secret'),
   );
 });
+
+test('branches use PAT-authenticated search and pagination and return only branch metadata', async () => {
+  const calls = [];
+  const api = new CodeupClient({
+    endpoint: 'https://devops.example',
+    fetch: async (url, opts) => {
+      calls.push(url);
+      assert.equal(opts.headers['x-yunxiao-token'], 'branch-reader');
+      const data = { name: 'release/2026', defaultBranch: false, commit: { authorEmail: 'private@example.com' } };
+      if (url.pathname.endsWith('release%2F2026')) return Response.json(data);
+      return Response.json([data], { headers: { 'x-next-page': '2', 'x-total-pages': '2' } });
+    },
+  });
+  assert.deepEqual(await api.listBranches('branch-reader', '7', 1, 'release/'), {
+    branches: [{ name: 'release/2026', is_default: false }],
+    nextPage: 2,
+  });
+  assert.equal(calls[0].pathname, '/oapi/v1/codeup/repositories/7/branches');
+  assert.equal(calls[0].searchParams.get('search'), 'release/');
+  assert.equal(calls[0].searchParams.get('sort'), 'name_asc');
+  assert.deepEqual(await api.getBranch('branch-reader', '7', 'release/2026'), {
+    name: 'release/2026',
+    is_default: false,
+  });
+  await assert.rejects(api.getBranch('branch-reader', '7', '..'), (error) => error.kind === 'not_found');
+  assert.equal(calls.length, 2);
+});

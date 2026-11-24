@@ -3,6 +3,7 @@ import {
   GitBranch,
   Key,
   List,
+  LockKey,
   Moon,
   Plugs,
   ShieldCheck,
@@ -29,6 +30,7 @@ interface NavItem {
 const PRIMARY: NavItem[] = [
   { to: '/repositories', label: '仓库', icon: GitBranch },
   { to: '/keys', label: 'Key', icon: Key },
+  { to: '/onboarding', label: '云效凭证', icon: LockKey },
   { to: '/mcp', label: 'MCP 接入', icon: Plugs },
 ];
 
@@ -69,7 +71,7 @@ function NavGroup({ title, items, collapsed }: { title?: string; items: NavItem[
 }
 
 export function AppShell() {
-  const { session, signOut } = useSession();
+  const { me, signOut } = useSession();
   const { isAdmin } = useAbility();
   const { theme, toggle } = useTheme();
   const location = useLocation();
@@ -77,7 +79,6 @@ export function AppShell() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: close the mobile drawer on every navigation
   useEffect(() => setDrawerOpen(false), [location.pathname]);
 
-  const me = session?.me;
   const sidebar = (collapsed: boolean) => (
     <nav aria-label="主导航" className="flex flex-1 flex-col gap-6">
       <NavGroup items={PRIMARY} collapsed={collapsed} />
@@ -138,10 +139,7 @@ export function AppShell() {
           {me ? (
             <div className="flex min-w-0 items-center gap-2 text-sm">
               <span className="hidden truncate font-medium sm:inline">{me.username}</span>
-              <code className="hidden rounded-sm bg-muted px-1.5 py-0.5 text-xs md:inline">{me.key_prefix}</code>
-              <Badge tone={me.is_admin ? 'accent' : me.can_write ? 'progress' : 'neutral'}>
-                {me.is_admin ? '管理员' : me.key_scope === 'write' ? 'write' : 'read'}
-              </Badge>
+              <Badge tone={isAdmin ? 'accent' : 'neutral'}>{isAdmin ? '超级管理员' : '成员'}</Badge>
             </div>
           ) : null}
           <Button
@@ -152,7 +150,7 @@ export function AppShell() {
           >
             {theme === 'dark' ? <Sun /> : <Moon />}
           </Button>
-          <Button variant="ghost" size="sm" onClick={() => signOut('manual')}>
+          <Button variant="ghost" size="sm" onClick={() => void signOut()}>
             <SignOut aria-hidden="true" />
             退出
           </Button>

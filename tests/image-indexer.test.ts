@@ -35,18 +35,22 @@ const graph: GraphClient = {
 
 test('image indexing publishes only an image reference and removes the temporary checkout', async () => {
   let temp = '';
+  const phases: string[] = [];
   let reconciled: { repositoryId: string; imageIds: string[] } | undefined;
   const pipeline = new ImageIndexPipeline(
     digest,
     graph,
     async (input) => {
       temp = input.dataDir;
+      await input.onProgress?.('cloning');
+      await input.onProgress?.('indexing');
       const path = join(temp, 'worktree');
       await mkdir(path);
       await writeFile(join(path, 'source'), 'sample');
       return { path, commit, generation: 'generation-1' };
     },
     async (input) => {
+      assert.deepEqual(phases, ['cloning', 'indexing', 'packaging']);
       assert.equal(input.dataDir, temp);
       assert.equal(input.repositoryId, request.repositoryId);
       assert.equal(input.candidate.commit, commit);
@@ -58,7 +62,15 @@ test('image indexing publishes only an image reference and removes the temporary
       },
     },
   );
-  assert.deepEqual(await pipeline.build(request), { path: image, commit, generation: 'generation-1' });
+  assert.deepEqual(
+    await pipeline.build({
+      ...request,
+      async onProgress(phase) {
+        phases.push(phase);
+      },
+    }),
+    { path: image, commit, generation: 'generation-1' },
+  );
   await assert.rejects(access(temp));
   assert.equal(await pipeline.healthy(request, image, commit), true);
   assert.equal(await pipeline.healthy(request, '/old/worktree', commit), false);
