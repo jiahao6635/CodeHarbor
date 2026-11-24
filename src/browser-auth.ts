@@ -8,7 +8,8 @@ import { singleQuery, text } from './http/validation.js';
 import type { AccountRecord, StoreAccess, StoreBackend } from './store.js';
 
 const AUTHORIZATION_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
-const TOKEN_URL = 'https://accounts.feishu.cn/oauth/v3/token';
+// shortcut: Feishu v3 rejected valid S256 challenges in live testing. Recheck v3 when the provider fixes it.
+const TOKEN_URL = 'https://open.feishu.cn/open-apis/authen/v2/oauth/token';
 const USER_INFO_URL = 'https://open.feishu.cn/open-apis/authen/v1/user_info';
 const CALLBACK_PATH = '/api/v1/auth/feishu/callback';
 const LOGIN_PATH = '/ui/login';
@@ -115,7 +116,7 @@ export class BrowserSessionService {
     try {
       const token = await this.fetcher(TOKEN_URL, {
         method: 'POST',
-        body: new URLSearchParams({
+        body: JSON.stringify({
           grant_type: 'authorization_code',
           client_id: this.config.appId,
           client_secret: this.config.appSecret,
@@ -123,7 +124,7 @@ export class BrowserSessionService {
           redirect_uri: this.redirectUri,
           code_verifier: verifier,
         }),
-        headers: { accept: 'application/json' },
+        headers: { accept: 'application/json', 'content-type': 'application/json; charset=utf-8' },
         redirect: 'error',
         signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
       });

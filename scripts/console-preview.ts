@@ -43,19 +43,21 @@ const memberName = (value: unknown): value is keyof typeof previewMembers =>
 
 const feishuFetch: typeof fetch = async (input, init) => {
   const url = new URL(input instanceof Request ? input.url : String(input));
-  if (url.href === 'https://accounts.feishu.cn/oauth/v3/token' && init?.body instanceof URLSearchParams) {
-    const code = init.body.get('code');
-    const verifier = init.body.get('code_verifier');
-    const issued = code ? previewCodes.get(code) : undefined;
-    if (code) previewCodes.delete(code);
+  if (url.href === 'https://open.feishu.cn/open-apis/authen/v2/oauth/token' && typeof init?.body === 'string') {
+    const body = JSON.parse(init.body) as Record<string, unknown>;
+    const { code, code_verifier: verifier } = body;
+    const issued = oauthValue(code) ? previewCodes.get(code) : undefined;
+    if (oauthValue(code)) previewCodes.delete(code);
     if (
       !issued ||
-      !verifier ||
+      !oauthValue(verifier) ||
       issued.challenge !== codeChallenge(verifier) ||
       issued.expiresAt <= Date.now() ||
-      init.body.get('client_id') !== feishuAppId ||
-      init.body.get('client_secret') !== feishuAppSecret ||
-      init.body.get('redirect_uri') !== callbackUrl.href
+      new Headers(init.headers).get('content-type') !== 'application/json; charset=utf-8' ||
+      body.grant_type !== 'authorization_code' ||
+      body.client_id !== feishuAppId ||
+      body.client_secret !== feishuAppSecret ||
+      body.redirect_uri !== callbackUrl.href
     ) {
       return Response.json({ code: 1 }, { status: 400 });
     }

@@ -37,16 +37,20 @@ test('Feishu verifies the browser, authorization code and tenant before creating
   let providerCalls = 0;
   const feishuFetch: typeof fetch = async (input, options) => {
     providerCalls++;
-    if (String(input) === 'https://accounts.feishu.cn/oauth/v3/token') {
+    if (String(input) === 'https://open.feishu.cn/open-apis/authen/v2/oauth/token') {
       assert.equal(options?.method, 'POST');
       assert.equal(options.redirect, 'error');
-      assert.ok(options.body instanceof URLSearchParams);
-      assert.equal(options.body.get('client_secret'), SECRET);
-      assert.equal(options.body.get('redirect_uri'), `${ORIGIN}/api/v1/auth/feishu/callback`);
-      const verifier = options.body.get('code_verifier');
-      assert.ok(verifier);
+      assert.equal(new Headers(options.headers).get('content-type'), 'application/json; charset=utf-8');
+      assert.ok(typeof options.body === 'string');
+      const body = JSON.parse(options.body) as Record<string, unknown>;
+      assert.equal(body.grant_type, 'authorization_code');
+      assert.equal(body.client_id, 'cli_codeharbor_test');
+      assert.equal(body.client_secret, SECRET);
+      assert.equal(body.redirect_uri, `${ORIGIN}/api/v1/auth/feishu/callback`);
+      const verifier = body.code_verifier;
+      assert.ok(typeof verifier === 'string');
       assert.equal(createHash('sha256').update(verifier).digest('base64url'), pendingChallenge);
-      return Response.json({ code: 0, access_token: options.body.get('code') });
+      return Response.json({ code: 0, access_token: body.code });
     }
     assert.equal(String(input), 'https://open.feishu.cn/open-apis/authen/v1/user_info');
     const bearer = new Headers(options?.headers).get('authorization')?.slice('Bearer '.length);
