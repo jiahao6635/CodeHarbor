@@ -14,7 +14,7 @@
 
 ## 前提
 
-1. PostgreSQL 17 可以使用远端现有实例，也可以按下文启动本机 Docker 实例。应用账户须能建表和使用 advisory lock。生产默认使用 `sslmode=verify-full`，需要服务端证书和可信 CA。数据库必须持久化、备份并限制访问。
+1. PostgreSQL 17 可以使用远端现有实例，也可以按下文启动本机 Docker 实例。应用账户须能建表和使用 advisory lock。生产连接需显式指定 SSL 模式。使用 `sslmode=verify-full` 时需配置服务端证书和可信 CA。数据库必须持久化、备份并限制访问。
 2. 可用 HTTPS Vault、Transit AES 密钥、只具备 decrypt 权限的短期 token 文件，以及已包装的主密钥文件。全新数据使用 `--new`，迁移必须用 `--wrap-existing` 包装**原主密钥**，否则历史 PAT 无法解密。
 3. 云效 API endpoint、组织 ID、可信 Git HTTPS 主机名、服务域名和企业飞书自建应用。配置 DNS、防火墙和出网，使 CodeHarbor 可访问飞书授权及 API、云效、Vault 和数据库。Webhook 的反向代理必须可由云效访问。
 4. 按 [镜像模式部署准备](image-deployment.md) 创建控制器目录、三个独立令牌和只读运行时镜像。Git 凭证助手所在的限额 tmpfs 必须允许执行文件。实际 Docker Compose 本地 secrets 可能保留宿主文件的 UID/权限，需确保应用 UID 可读，避免将密钥对无关用户开放。
@@ -33,7 +33,7 @@
 - `CODEHARBOR_TRUST_PROXY`：模板固定为 `true`，Nginx 传递 `X-Forwarded-For`，应用按真实客户端地址做认证失败限流；Nginx 层另有 `/mcp` 20r/s、`/api/v1/auth/` 1r/s 的每地址限流。
 - `CODEHARBOR_DOCS_ENABLED`：默认 `false`；Nginx 模板同时对 `/docs`、`/openapi.json` 返回 404。
 - `CODEHARBOR_ACCESS_TTL_MS` 控制云效权限缓存，实际最长 5 分钟。持久化审计由 `CODEHARBOR_AUDIT_RETENTION_DAYS` 控制，默认保留 180 天。
-- `CODEHARBOR_DATABASE_URL_FILE`：保存 PostgreSQL URL 的文件路径；也支持 `DATABASE_URL`，但不要同时配置。生产 URL 允许一个 `sslmode` 参数和可选的 `application_name` 参数。
+- `CODEHARBOR_DATABASE_URL_FILE`：保存 PostgreSQL URL 的文件路径。也支持直接使用 `DATABASE_URL`，两者任选其一。生产 URL 须指定一次 `sslmode=verify-full` 或 `sslmode=disable`，可另外指定 `application_name`。
 - `CODEHARBOR_VAULT_ADDR`、`CODEHARBOR_VAULT_TRANSIT_KEY`、`CODEHARBOR_VAULT_TOKEN_FILE`、`CODEHARBOR_VAULT_WRAPPED_KEY_FILE`：参见 [Vault Transit 指南](vault-transit.md)。
 - `CODEHARBOR_METRICS_TOKEN_FILE`、`CODEHARBOR_TLS_CERT`、`CODEHARBOR_TLS_KEY`：分别指向监控 token、TLS 证书和私钥文件。
 - `CODEHARBOR_NGINX_IMAGE`：经过批准的 Nginx 镜像完整引用；`CODEHARBOR_LISTEN_ADDR` 默认 `127.0.0.1`，只有配好企业访问策略后才应调整。
@@ -48,7 +48,7 @@
 
 将 `CODEHARBOR_DATABASE_URL_FILE` 指向保存远端 PostgreSQL URL 的宿主机文件。使用 `sslmode=verify-full` 时，URL 主机名须与数据库证书一致。使用公认 CA 时可直接使用默认信任链；使用企业私有 CA 时通过受控的 Compose override 将 CA 文件挂载到应用容器，并设置 `NODE_EXTRA_CA_CERTS` 指向该容器内文件。
 
-可信私网内的数据库需要使用明文连接时，将 `CODEHARBOR_POSTGRES_PLAINTEXT_ENDPOINT` 设为该数据库的确切 `主机名:端口`，并在数据库 URL 中显式写出同一主机名、端口和 `sslmode=disable`。此配置仅允许这一个端点使用明文，传输中的数据库数据不受 TLS 保护。
+数据库使用私网明文连接时，在 URL 中设置 `sslmode=disable`。阿里云 RDS 等云数据库仍按实例的网络访问规则接受连接。
 
 将变量中的路径设置为宿主机上的实际文件，确认应用用户能读取。可先使用以下命令检查模板，不必启动服务：
 

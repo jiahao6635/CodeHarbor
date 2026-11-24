@@ -86,15 +86,13 @@ export function validateDatabaseTls(env: NodeJS.ProcessEnv, dbUrl: string): void
   const url = new URL(dbUrl);
   const sslModes = url.searchParams.getAll('sslmode');
   const sslMode = sslModes[0];
-  const plaintextAllowed =
-    sslMode === 'disable' && url.port !== '' && url.host === env.CODEHARBOR_POSTGRES_PLAINTEXT_ENDPOINT;
   if (
     sslModes.length !== 1 ||
-    (sslMode !== 'verify-full' && !plaintextAllowed) ||
+    (sslMode !== 'verify-full' && sslMode !== 'disable') ||
     [...url.searchParams.keys()].some((name) => name !== 'sslmode' && name !== 'application_name') ||
     env.NODE_TLS_REJECT_UNAUTHORIZED === '0'
   ) {
-    throw new Error('Production PostgreSQL requires verified TLS or an explicitly configured plaintext endpoint');
+    throw new Error('Invalid production PostgreSQL connection options (use sslmode=verify-full or sslmode=disable)');
   }
 }
 
