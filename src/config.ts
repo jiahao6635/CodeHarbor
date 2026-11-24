@@ -84,13 +84,15 @@ export function indexBackend(env: NodeJS.ProcessEnv): 'filesystem' | 'image' {
 export function validateDatabaseTls(env: NodeJS.ProcessEnv, dbUrl: string): void {
   if (env.NODE_ENV !== 'production') return;
   const url = new URL(dbUrl);
+  const sslModes = url.searchParams.getAll('sslmode');
+  const sslMode = sslModes[0];
   if (
-    url.searchParams.getAll('sslmode').length !== 1 ||
-    url.searchParams.get('sslmode') !== 'verify-full' ||
+    sslModes.length !== 1 ||
+    (sslMode !== 'verify-full' && sslMode !== 'disable') ||
     [...url.searchParams.keys()].some((name) => name !== 'sslmode' && name !== 'application_name') ||
     env.NODE_TLS_REJECT_UNAUTHORIZED === '0'
   ) {
-    throw new Error('Production PostgreSQL requires verified TLS');
+    throw new Error('Invalid production PostgreSQL connection options (use sslmode=verify-full or sslmode=disable)');
   }
 }
 

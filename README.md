@@ -41,7 +41,7 @@ export DATABASE_URL='postgres://codeharbor_test:codeharbor_test@127.0.0.1:54329/
 | 变量 | 说明 |
 |---|---|
 | `CODEHARBOR_MASTER_KEY` | 本地开发模式使用的 Base64 编码 32 字节密钥；与数据目录分开保存；生产不使用此模式 |
-| `DATABASE_URL` 或 `CODEHARBOR_DATABASE_URL_FILE` | 必填，PostgreSQL 连接串或受保护的连接串文件，二者只能设置一个；生产必须启用 `sslmode=verify-full` |
+| `DATABASE_URL` 或 `CODEHARBOR_DATABASE_URL_FILE` | 必填，PostgreSQL 连接串或受保护的连接串文件，二者任选其一。生产连接串须指定 `sslmode=verify-full` 或 `sslmode=disable` |
 | `CODEHARBOR_KEY_PROVIDER` | 生产设为 `vault-transit`；Vault 配置见 [Vault Transit 文档](docs/vault-transit.md) |
 | `CODEHARBOR_INDEX_BACKEND` | 生产必须为 `image`；默认的 `filesystem` 仅用于开发和测试 |
 | `CODEHARBOR_METRICS_TOKEN_FILE` | 可选，独立监控 Bearer 密钥文件；未配置时 `/metrics` 不开放 |
@@ -155,4 +155,4 @@ npm run test:db:down
 docker build -t codeharbor:dev .
 ```
 
-容器以非 root 用户运行。生产部署必须叠加 [镜像 Compose 配置](deploy/compose.image.yaml)，并可选择外部 PostgreSQL 或再叠加 [本地 PostgreSQL Compose 配置](deploy/compose.postgres.yaml)；两种数据库方式均要求经验证的 PostgreSQL TLS、Vault Transit、飞书应用和 HTTPS 反向代理。配置及启动步骤见 [部署指南](docs/production-deployment.md)。模板不会创建企业凭证或自动部署服务；生产使用前仍须验证实际云效权限、备份恢复和运行隔离。
+容器以非 root 用户运行。生产部署必须叠加 [镜像 Compose 配置](deploy/compose.image.yaml)，并可选择外部 PostgreSQL 或再叠加 [本地 PostgreSQL Compose 配置](deploy/compose.postgres.yaml)。本地模板使用经验证的 PostgreSQL TLS，外部实例的连接模式由 URL 指定。生产部署需配置 Vault Transit、飞书应用和 HTTPS 反向代理，参见 [部署指南](docs/production-deployment.md)。生产使用前须验证实际云效权限、备份恢复和运行隔离。

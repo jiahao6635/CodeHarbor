@@ -18,7 +18,7 @@
 
 - 编译 `codegraph-readonly/Dockerfile`，固定该镜像的本机 `sha256:...` image ID，配到 `CODEHARBOR_REPOSITORY_RUNTIME_IMAGE`。该镜像不包含仓库，源码和一致的 SQLite 索引由受控构建器加入。构建说明和只读测试见 [只读运行时](../codegraph-readonly/README.md)。
 - CodeHarbor 设置 `CODEHARBOR_INDEX_BACKEND=image`，并配置 `CODEHARBOR_IMAGE_QUERY_SOCKET`、`CODEHARBOR_IMAGE_BUILD_SOCKET`、`CODEHARBOR_IMAGE_AUTH_SOCKET`，以及各自的 `CODEHARBOR_IMAGE_QUERY_TOKEN_FILE`、`CODEHARBOR_IMAGE_BUILD_TOKEN_FILE`、`CODEHARBOR_IMAGE_AUTH_TOKEN_FILE`。三个 token 必须分别保存在受保护文件中，且至少 32 字节；不要放入源码、镜像或命令参数。
-- 平台元数据在所有环境都使用 PostgreSQL。生产环境仍要求验证数据库 TLS 和 Vault Transit。
+- 平台元数据在所有环境都使用 PostgreSQL。生产环境按数据库连接串中的 `sslmode` 连接，并使用 Vault Transit。
 - 单独运行 `node dist/image-controller.js`；它负责固定的镜像构建和只读查询，是唯一需要 Docker daemon 访问的进程。配置相同的 runtime image、socket 和 token 文件，以及控制器独有的 `CODEHARBOR_IMAGE_ALLOWLIST`、`CODEHARBOR_IMAGE_FENCE_DIR`、`CODEHARBOR_IMAGE_BUILD_WORK_DIR`、`CODEHARBOR_IMAGE_MAX_IMAGES`、`CODEHARBOR_IMAGE_STORAGE_BUDGET_BYTES` 和稳定唯一的 `CODEHARBOR_IMAGE_CONTROLLER_ID`。控制器工作目录必须放在受限、容量足够的临时文件系统；可信清单和 fence 目录必须持久化并只允许控制器写入。存储预算应小于专用 Docker 存储的实际容量并预留运行时镜像和运维余量。
 - 查询、构建和控制面授权是三个不同的 Unix socket。它们的父目录必须分别由对应服务的 UID 拥有且不允许组或其他用户写入。控制器的 socket 可设为组可访问，但目录的组只应包含 CodeHarbor 服务用户。Docker socket 不得交给网关、仓库容器或其他用户。
 - 每个候选镜像先经仓库 ID、commit、可信构建记录及当前发布/候选状态验证，再启动容器做真实 MCP 查询；切换前再次检查远端分支。构建失败、授权失效或分支更新时不会发布候选版本。
